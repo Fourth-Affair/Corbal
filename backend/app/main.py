@@ -20,6 +20,8 @@ app = FastAPI(title="Junc API", version="0.1.0")
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
+# "llm" = Gemini agent with tools over the plan (falls back to "template" without GEMINI_API_KEY or on API errors).
+ANSWERER = os.environ.get("ANSWERER", "llm")
 
 
 def _check_path(path: str):
@@ -114,19 +116,28 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
 
 
+def _template_answer(question: str, graph) -> Answer:
+    """Regex router + template counter: the offline path, and the fallback when Gemini is unavailable."""
+    template = route(question)
+    if template is None:
+        return Answer(answer=None, confidence="not_found", explanation="This question type is not supported yet.")
+    return count(graph, template)
+
+
 @app.post("/api/ask")
 def ask(req: AskRequest) -> Answer:
     _check_path(req.path)
-    template = route(req.question)
-    if template is None:
-        return Answer(answer=None, confidence="not_found",
-                      explanation="This question type is not supported yet.")
     try:
         graph = get_graph(req.path, PLAN_SOURCE)
     except FileNotFoundError as error:  # e.g. model weights or original labels missing
-        return Answer(answer=None, template=template, confidence="not_found",
+        return Answer(answer=None, template=route(req.question), confidence="not_found",
                       explanation=f"Parser unavailable: {error}")
-    return count(graph, template)
+    if ANSWERER == "llm":
+        from app.answering.agent import answer
+
+        if (result := answer(req.question, graph)) is not None:
+            return result
+    return _template_answer(req.question, graph)
 
 
 @app.get("/api/image")
