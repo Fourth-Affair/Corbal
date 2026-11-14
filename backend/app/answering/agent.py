@@ -35,6 +35,8 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
+MAX_HISTORY_TURNS = 8
+MAX_HISTORY_CHARS = 6000
 PROMPT_VERSION = "19"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
@@ -439,7 +441,18 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     use_cache=False skips reading the answer cache (fresh Gemini run, e.g. to measure run-to-run noise)."""
     if not os.environ.get("GEMINI_API_KEY"):
         return None
-    history = history or []
+    # History is only for resolving follow-up references, not a second prompt.
+    # Bound both turns and text so long chats cannot drown out the latest request.
+    history = list(history or [])[-MAX_HISTORY_TURNS:]
+    bounded_history = []
+    remaining_chars = MAX_HISTORY_CHARS
+    for turn in reversed(history):
+        if remaining_chars <= 0:
+            break
+        text = turn.text[-min(1200, remaining_chars):]
+        bounded_history.append((turn.role, text))
+        remaining_chars -= len(text)
+    bounded_history.reverse()
     cache = _cache_path(question, graph, scale, geometry) if not history else None
     if use_cache and cache and cache.is_file():
         try:
@@ -451,7 +464,7 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
         return None
     tools = PlanTools(graph, geometry)
     try:
-        final, traces = run_loop(question, tools, history, scale)
+        final, traces = run_loop(question, tools, [ChatTurn(role=role, text=text) for role, text in bounded_history], scale)
     except Exception as error:  # network, quota, timeout, malformed output: caller falls back
         log.warning("Gemini agent failed: %s", error)
         return None

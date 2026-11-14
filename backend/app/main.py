@@ -873,11 +873,10 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     area_question = any(term in question for term in ("size", "how large", "how big", "square metre", "square meter", "square foot", "square feet", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter", "area estimate", "area of", "calculate area", "what is the area"))
     if not req.references and re.search(r"\barea\b", question) and not re.search(r"\bhow many\b", question):
         area_question = True
-    # Short follow-ups inherit a room-area context from the most recent user turn.
-    # Keep this deliberately narrow so an old topic in a long conversation cannot
-    # turn a new, unrelated size question into an area calculation.
+    # Short measurement follow-ups inherit the most recent explicit room reference.
+    # Ignore intervening assistant turns and generic user turns such as "what is it?".
     if not area_question and not req.references and re.search(r"\b(it|that|this|there|its|their)\b", question):
-        for turn in reversed(req.history):
+        for turn in reversed(req.history[-8:]):
             if turn.role == "user":
                 earlier = turn.text.casefold()
                 area_question = any(term in earlier for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²"))
@@ -893,22 +892,25 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
             area_question = False
     if area_question:
         confirmed_scale = _saved_detected_scale_for_plan(plan_id)
-        if req.scale is None and not confirmed_scale:
-            return Answer(answer=None, confidence="not_found", explanation="I need a known distance to establish the drawing scale before estimating floor area.")
         room_terms = (("living room", "living"), ("livingroom", "living"), ("kitchen", "kitchen"), ("bedroom", "bedroom"),
                       ("bathroom", "bathroom"), ("washroom", "bathroom"), ("bath", "bathroom"), ("balcony", "balcony"),
                       ("sauna", "sauna"), ("garage", "garage"), ("storage", "storage"), ("entry", "entry"),
                       ("hallway", "entry"), ("wc room", "wc"), ("toilet room", "wc"), ("wc", "wc"))
         subject = question
-        if re.search(r"\b(it|that|this|there|its|their)\b", question):
-            for turn in reversed(req.history):
-                if turn.role == "user":
-                    subject = turn.text.casefold()
-                    break
         requested_room = next((room_type for term, room_type in room_terms if term in subject), None)
+        if not requested_room and re.search(r"\b(it|that|this|there|its|their)\b", question):
+            for turn in reversed(req.history[-8:]):
+                if turn.role != "user":
+                    continue
+                earlier = turn.text.casefold()
+                requested_room = next((room_type for term, room_type in room_terms if term in earlier), None)
+                if requested_room:
+                    break
         if not requested_room and not re.search(r"\b(floor|whole plan|entire plan|building|apartment)\b", question):
             return Answer(answer=None, confidence="not_found", clarification_needed=True,
-                          explanation="Do you mean the room’s floor area or the toilet fixture’s dimensions?")
+                          explanation="Which room’s floor area do you mean, or are you asking about the whole floor?")
+        if req.scale is None and not confirmed_scale:
+            return Answer(answer=None, confidence="not_found", explanation="I need a known distance to establish the drawing scale before estimating floor area.")
         if requested_room:
             geometry = _plan_geometry(plan_id, graph)
             room_candidates = [room for room in geometry.rooms if room.type == requested_room]

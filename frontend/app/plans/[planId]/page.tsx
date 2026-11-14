@@ -696,7 +696,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setMessages(current => [...current, { role: "user", text: submitted }]);
     setSending(true);
     try {
-      const requestBody = JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale, references: drawingReferences,
+      const recentHistory = messages.slice(-8).map(({ role, text }) => ({ role, text }));
+      const requestBody = JSON.stringify({ question: submitted, history: recentHistory, scale, references: drawingReferences,
         floor_outlines: savedOutlines.filter(outline => outline.scope !== "room" || geometry?.rooms.some(room => room.id === outline.id) || outline.id.endsWith("-user")) });
       let response: Response;
       for (let attempt = 0; ; attempt++) {
@@ -710,20 +711,25 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
       const explanation = typeof result.explanation === "string" ? result.explanation : "";
       const detectedScaleAvailable = Boolean(geometry?.scale && ["dimensions", "written_areas"].includes(geometry.scale.source));
-      const needsScale = !scale && !detectedScaleAvailable && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
-      const needsOutline = Boolean(scale) && /boundary|outline/i.test(explanation) && !hasRequiredOutline(submitted);
+      const measurementIntent = /\b(area|size|how big|how large|square metres?|square meters?|m²|measure|measurement|dimensions?)\b/i.test(submitted);
+      const requestedRoom = getRequestedRoomType(submitted) ?? (/\b(it|that|this|its|their)\b/i.test(submitted)
+        ? [...recentHistory].reverse().filter(turn => turn.role === "user").map(turn => getRequestedRoomType(turn.text)).find(Boolean) ?? null
+        : null);
+      const areaQuestionForUI = requestedRoom ? `${submitted} ${requestedRoom.label}` : submitted;
+      const needsScale = measurementIntent && !scale && !detectedScaleAvailable && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
+      const needsOutline = measurementIntent && Boolean(scale) && /boundary|outline/i.test(explanation) && !hasRequiredOutline(areaQuestionForUI);
       const needsMeasurement = Boolean(scale) && /\b(measure|measurement|distance|length|width|wide|long)\b/i.test(submitted);
-      const answer = !scale && detectedScaleAvailable && result.answer === null
+      const answer = measurementIntent && !scale && detectedScaleAvailable && result.answer === null
         ? `I found a possible scale of ${geometry!.scale!.m_per_px.toFixed(5)} metres per pixel. Confirm it in the scale prompt before I use it for measurements.`
         : needsMeasurement
         ? "I can measure that on the plan. Choose the two points you want to measure, and I’ll calculate the distance."
         : needsScale
         ? "Let’s set the drawing scale first. Click the two ends of a distance you know on the plan, such as a wall with a printed measurement. Then enter that real distance and unit to calibrate the drawing."
         : needsOutline
-          ? getRequestedRoomType(submitted)
-            ? floorOutlines.some(outline => outline.scope === "room" && outline.room_type === getRequestedRoomType(submitted)?.roomType)
-              ? `I found a suggested ${getRequestedRoomType(submitted)?.label.toLowerCase()} outline. Review it, adjust it if needed, and accept it to calculate an area estimate.`
-              : `I couldn’t detect a clear ${getRequestedRoomType(submitted)?.label.toLowerCase()} boundary. Draw or edit the outline, then accept it to calculate an area estimate.`
+          ? requestedRoom
+            ? floorOutlines.some(outline => outline.scope === "room" && outline.room_type === requestedRoom.roomType)
+              ? `I found a suggested ${requestedRoom.label.toLowerCase()} outline. Review it, adjust it if needed, and accept it to calculate an area estimate.`
+              : `I couldn’t detect a clear ${requestedRoom.label.toLowerCase()} boundary. Draw or edit the outline, then accept it to calculate an area estimate.`
             : floorOutlines.some(outline => outline.scope !== "room")
               ? "I found a suggested floor outline. Review it, adjust it if needed, and accept it to calculate an area estimate."
               : "I couldn’t detect a clear floor boundary. Draw or edit the outline, then accept it to calculate an area estimate."
@@ -733,10 +739,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       setMessages(current => [...current, { role: "assistant", text: provisional ? `Possible answer: ${answer}` : answer, ...(provisional ? { originalText: answer } : {}), evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id), evidence: result.citations ?? [], confidence: result.confidence }]);
       setDrawingReferences([]);
       if (needsScale) {
-        setPendingAreaQuestion(submitted);
+        setPendingAreaQuestion(areaQuestionForUI);
         startScaleCalibration();
       } else if (needsOutline) {
-        setPendingAreaQuestion(submitted);
+        setPendingAreaQuestion(areaQuestionForUI);
       } else if (needsMeasurement) {
         setMeasurementRequested(true);
       }
@@ -1298,14 +1304,14 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   : item.raw?.replaceAll("_", " ") || "Evidence";
                 const confidence = fullItem?.user_verified || item.user_verified ? "reviewed" : item.score != null ? `${Math.round(item.score * 100)}%` : null;
                 const visibleLabel = confidence ? `${label} · ${confidence}` : label;
-                const labelWidth = Math.max(62, Math.min(220, visibleLabel.length * 8 + 22));
+                const labelWidth = Math.max(48, Math.min(160, visibleLabel.length * 5.5 + 14));
                 const labelX = Math.max(labelWidth / 2 + 3, Math.min(imageSize?.width ?? x0, (x0 + x1) / 2));
-                const labelY = Math.max(18, Math.min(imageSize?.height ?? y0, (y0 + y1) / 2));
+                const labelY = Math.max(11, Math.min(imageSize?.height ?? y0, y0 - 12));
                 return <g className={`citation-mark${item.user_verified ? " user-corrected" : ""}`} key={`${item.id}-${index}`}>
                   {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(1, x1 - x0)} height={Math.max(1, y1 - y0)} />}
                   <g className="citation-label" aria-label={label}>
-                    <rect x={labelX - labelWidth / 2} y={labelY - 15} width={labelWidth} height="30" rx="8" />
-                    <text x={labelX} y={labelY + 1}>{visibleLabel.length > 28 ? `${visibleLabel.slice(0, 26)}…` : visibleLabel}</text>
+                    <rect x={labelX - labelWidth / 2} y={labelY - 9} width={labelWidth} height="18" rx="5" />
+                    <text x={labelX} y={labelY + 1}>{visibleLabel.length > 25 ? `${visibleLabel.slice(0, 23)}…` : visibleLabel}</text>
                     <title>{visibleLabel}</title>
                   </g>
                 </g>;
