@@ -19,7 +19,7 @@ import time
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
-from app.models import Answer, PlanGraph
+from app.models import Answer, ChatTurn, PlanGraph
 from app.router import route
 
 log = logging.getLogger(__name__)
@@ -32,6 +32,9 @@ PROMPT_VERSION = "7"  # bump when prompt or tools change, so cached answers are 
 
 SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools are your only source of
 facts about the plan; you cannot see the drawing.
+
+Use the prior conversation to resolve follow-up references (for example, "what about the kitchen?"). Treat the
+latest question as the request to answer. Prior assistant replies are context only; verify plan facts with tools.
 
 Rules:
 - Never count, add, subtract or estimate yourself. A numeric answer must be exactly a number a tool returned.
@@ -81,7 +84,7 @@ def _get_client():
     return _client
 
 
-def run_loop(question: str, tools: PlanTools) -> tuple[dict, list[ToolTrace]]:
+def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = None) -> tuple[dict, list[ToolTrace]]:
     """Gemini tool loop -> (final_answer args, traces of the tool calls). Raises on API problems / no answer."""
     from google.genai import types
 
@@ -96,8 +99,11 @@ def run_loop(question: str, tools: PlanTools) -> tuple[dict, list[ToolTrace]]:
     )
     # the plan summary is always needed: send it with the question instead of spending a tool round trip on it
     summary, _ = tools.plan_summary()
-    prompt = f"Question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}"
-    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+    history = history or []
+    contents = [types.Content(role="model" if turn.role == "assistant" else "user", parts=[types.Part(text=turn.text)])
+                for turn in history]
+    prompt = f"Latest question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}"
+    contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
     traces: list[ToolTrace] = []
     for step in range(MAX_STEPS):
         t0 = time.perf_counter()
@@ -217,22 +223,24 @@ def _cache_path(question: str, graph: PlanGraph):
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
 
-def answer(question: str, graph: PlanGraph) -> Answer | None:
+def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None) -> Answer | None:
     if not os.environ.get("GEMINI_API_KEY"):
         return None
-    cache = _cache_path(question, graph)
-    if cache.is_file():
+    history = history or []
+    cache = _cache_path(question, graph) if not history else None
+    if cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text())
     tools = PlanTools(graph)
     try:
-        final, traces = run_loop(question, tools)
+        final, traces = run_loop(question, tools, history)
     except Exception as error:  # network, quota, timeout, malformed output: caller falls back
         log.warning("Gemini agent failed: %s", error)
         return None
     result = validate(question, final, traces, tools)
     try:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(result.model_dump_json())
+        if cache:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(result.model_dump_json())
     except OSError:
         pass
     return result

@@ -41,6 +41,12 @@ class AskRequest(BaseModel):
 
 class PlanQuestionRequest(BaseModel):
     question: str
+    history: list["ChatTurn"] = Field(default_factory=list, max_length=40)
+
+
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(max_length=4000)
 
 
 class Answer(BaseModel):

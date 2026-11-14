@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
 type PlanRecord = {
@@ -28,6 +28,12 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
   const [citations, setCitations] = useState<PlanCitation[]>([]);
+  const conversationRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const conversation = conversationRef.current;
+    if (conversation) conversation.scrollTo({ top: conversation.scrollHeight, behavior: "smooth" });
+  }, [messages]);
 
   useEffect(() => {
     let objectUrl: string | null = null;
@@ -102,7 +108,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setSending(true);
     try {
       const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/ask`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: submitted }),
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })) }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
@@ -149,7 +156,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
-          <div className="conversation" aria-live="polite">{messages.length === 0 ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p></div>)}</div>
+          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p></div>)}</div>
           <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
         </aside>
       </div>

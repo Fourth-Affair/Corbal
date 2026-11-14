@@ -187,7 +187,7 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
-        if (result := answer(req.question, graph)) is not None:
+        if (result := answer(req.question, graph, req.history)) is not None:
             return result
     return _template_answer(req.question, graph)
 
