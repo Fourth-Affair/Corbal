@@ -1,17 +1,16 @@
-"""Plan geometry: rooms as polygons enclosed by walls, with the OCR text inside each room, plus walls and openings.
+"""Plan geometry: rooms as polygons enclosed by walls, typed from combined evidence, plus walls, wall segments,
+openings and a scale derived from areas written in the rooms.
 
   python -m app.cubicasa.rooms data/cubicasa5k/colorful-10052.png      # print a summary (writes no cache)
 
-Confidence: a room is `labeled` only when a clear purpose label (rooms_dict.room_purpose, OCR score >= LABEL_MIN_SCORE)
-lies inside it; every other enclosed space is `rough` (its shape may be a closet, shaft or segmentation artefact, its
-type at best a segmentation guess). Overlays show labeled rooms; rough ones only on request.
-
 Rooms are the connected free-space regions of the wall map (layers.wall_classes: wall segmenter, else the CubiCasa
 net). Openings count as wall, so a doorway separates two rooms; gaps narrower than half a wall are closed first.
-Regions touching the image border are outside. A room's type comes from the room labels read inside it (OCR +
-rooms_dict, e.g. "MH" -> bedroom); without a label, from the CubiCasa room segmentation if it is cached.
+Regions touching the image border are outside. A room's type combines (app.cubicasa.room_types) the OCR labels
+inside it (strong), the fixtures inside it (strong when decisive: toilet, shower, sauna stove, ...) and the 2019 net's
+room-class pixels (weak), with a tier: strong / weak / unknown. Wall segments come from app.cubicasa.wallvec.
 Openings (or detected doors/windows when the wall model has no opening class) link the rooms they touch.
-Everything is in image pixels; areas in m² need the plan's scale and are computed by the caller.
+Everything is in image pixels; the scale (m/px) is derived from written room areas when they agree, and the user's
+calibration replaces it when the geometry is served.
 """
 
 import re
@@ -23,17 +22,19 @@ from scipy import ndimage
 from shapely.geometry import Polygon
 from skimage.measure import find_contours
 
+from app.cubicasa.room_types import Fixture, classify
 from app.cubicasa.rooms_dict import room_purpose
-from app.models import PlanGeometry, PlanGraph, RoomLabel, RoomShape, WallShape
+from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallShape
 
-# CubiCasa net room classes -> our room types (fuse.ROOM order); others carry no type
-_SEG_TYPES = {1: "balcony", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bathroom", 7: "entry", 9: "storage",
-              10: "garage"}
+# CubiCasa net classes by index (fuse.ROOM / fuse.ICON order)
+_SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
+_ICON_KINDS = {3: "closet", 4: "appliance", 8: "fireplace"}  # icon classes the detector / graph do not carry
+_FIXTURE_KINDS = {"toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench"}
+SCALE_AGREE = 0.15  # written areas must agree within this (relative m/px) to set the plan scale
 _AREA_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:m2|m²|m\^2|sqm|㎡)", re.IGNORECASE)
 MIN_ROOM_FRAC = 1e-3  # of the image area
 MAX_ROOM_FRAC = 0.5
 MAX_POINTS = 400
-LABEL_MIN_SCORE = 0.7  # OCR confidence for a label to make a room `labeled`
 
 
 def _rings(mask: np.ndarray, x0: int, y0: int) -> list[Polygon]:
@@ -90,20 +91,6 @@ def _touching(lab: np.ndarray, mask: np.ndarray, sl, r: int) -> list[int]:
     return [int(v) for v in np.unique(lab[g][near]) if v]
 
 
-def _room_type(labels: list[RoomLabel]) -> tuple[str | None, str | None, list[str]]:
-    """(type, name, purposes) from the clear purpose labels inside a room. Several purposes (open plan: "OH" + "K")
-    keep the room's type as the most frequent one and list them all."""
-    typed = [lb for lb in labels if lb.room_type and (lb.score or 0) >= LABEL_MIN_SCORE]
-    if not typed:
-        return None, None, []
-    counts: dict[str, int] = {}
-    for lb in typed:
-        counts[lb.room_type] = counts.get(lb.room_type, 0) + 1
-    purposes = list(dict.fromkeys(lb.room_type for lb in typed))
-    best = max(purposes, key=lambda t: (counts[t], -purposes.index(t)))
-    return best, " / ".join(dict.fromkeys(lb.text for lb in typed)), purposes
-
-
 def _labeled_area(labels: list[RoomLabel]) -> float | None:
     m = _AREA_RE.search(" ".join(lb.text for lb in labels))
     return float(m.group(1).replace(",", ".")) if m else None
@@ -152,7 +139,8 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
             labels_of[k].append(RoomLabel(text=tok.text, bbox=tok.bbox, score=round(tok.score, 3),
                                           room_type=room_purpose(tok.text)))
 
-    seg = _room_segmentation(rel, (H, W))
+    seg, icons = _net_maps(rel, (H, W))
+    fixtures_of = _fixtures_by_room(lab, graph, icons)
     tol = max(1.0, 0.002 * max(H, W))
     rooms: list[RoomShape] = []
     for k in keep:
@@ -161,17 +149,18 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
         if shape is None:
             continue
         labels = labels_of[k]
-        rtype, name, purposes = _room_type(labels)
-        source = "label" if rtype else "unknown"
-        confidence = "labeled" if rtype else "rough"
-        if rtype is None and seg is not None:
+        fractions = {}
+        if seg is not None:
             vals = seg[sl][lab[sl] == k]
-            vals = vals[np.isin(vals, list(_SEG_TYPES))]
-            if vals.size >= 0.3 * sizes[k - 1]:
-                rtype, source = _SEG_TYPES[int(np.bincount(vals).argmax())], "segmentation"
+            for idx, name in _SEG_NAMES.items():
+                frac = float(np.mean(vals == idx)) if vals.size else 0.0
+                if frac > 0:
+                    fractions[name] = frac
+        c = classify(labels, fixtures_of.get(k, []), fractions, float(sizes[k - 1]) / (H * W))
+        name = " / ".join(dict.fromkeys(lb.text for lb in labels if lb.room_type and lb.room_type in c.purposes)) or None
         neighbours = [room_id[v] for v in _touching(lab, lab[sl] == k, sl, round(1.5 * t) + 2) if v in room_id]
-        rooms.append(RoomShape(id=room_id[k], type=rtype or "unknown", type_source=source, confidence=confidence,
-                               purposes=purposes, name=name, labels=labels,
+        rooms.append(RoomShape(id=room_id[k], type=c.type, tier=c.tier, purposes=c.purposes, scores=c.scores,
+                               evidence=c.evidence, conflicts=c.conflicts, name=name, labels=labels,
                                polygon=shape[0], bbox=_box(sl), area_px=float(sizes[k - 1]),
                                labeled_area_m2=_labeled_area(labels), neighbours=neighbours))
 
@@ -182,22 +171,78 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
         for rid in op.rooms:
             if rid in by_id:
                 by_id[rid].connections.append(op.id)
+
+    from app.cubicasa.wallvec import vectorise
+
+    def to_id(v: int) -> str | None:
+        return room_id.get(v) or ("outside" if v in outside else None)
+
+    segments = vectorise(cls, lab, to_id, t, openings)
+    for sg in segments:
+        for rid in set(sg.rooms_left) | set(sg.rooms_right):
+            if rid in by_id:
+                by_id[rid].walls.append(sg.id)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
-                        walls=walls, openings=openings)
+                        walls=walls, openings=openings, wall_segments=segments, scale=scale_from_written_areas(rooms))
 
 
-def _room_segmentation(rel: str, shape: tuple[int, int]) -> np.ndarray | None:
-    """CubiCasa net room classes at image resolution, if the perception features are cached."""
+def scale_from_written_areas(rooms: list[RoomShape]) -> PlanScale | None:
+    """m/px from rooms whose area is written inside them: sqrt(m² / px) per room, the median when >= 2 rooms agree
+    within SCALE_AGREE. One room alone is not trusted (an OCR misread would silently scale everything)."""
+    est = [(rm.id, (rm.labeled_area_m2 / rm.area_px) ** 0.5) for rm in rooms
+           if rm.labeled_area_m2 and rm.labeled_area_m2 > 0 and rm.area_px > 0]
+    if len(est) < 2:
+        return None
+    med = float(np.median([v for _, v in est]))
+    agree = [(rid, v) for rid, v in est if abs(v - med) <= SCALE_AGREE * med]
+    if len(agree) < 2:
+        return None
+    return PlanScale(m_per_px=float(np.median([v for _, v in agree])), source="written_areas",
+                     rooms=[rid for rid, _ in agree])
+
+
+def _fixtures_by_room(lab: np.ndarray, graph: PlanGraph | None, icons: np.ndarray | None) -> dict[int, list[Fixture]]:
+    """Fixtures per free-space label: graph fixture items (detector / icon blobs) by their box centre, plus the net's
+    appliance / closet / fireplace icon blobs (not in the graph) by their centroid."""
+    H, W = lab.shape
+    out: dict[int, list[Fixture]] = {}
+
+    def at(x: float, y: float) -> int:
+        u, v = int(x), int(y)
+        return int(lab[v, u]) if 0 <= u < W and 0 <= v < H else 0
+
+    for it in (graph.items if graph else []):
+        if it.category == "fixture" and it.cls in _FIXTURE_KINDS and (it.score is None or it.score >= 0.4):
+            k = at((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2)
+            if k:
+                out.setdefault(k, []).append(Fixture(it.cls, it.id))
+    if icons is not None:
+        for idx, kind in _ICON_KINDS.items():
+            blobs, n = ndimage.label(icons == idx)
+            if not n:
+                continue
+            sizes = ndimage.sum(np.ones_like(blobs, dtype=np.int32), blobs, np.arange(1, n + 1))
+            for (cy, cx), size in zip(ndimage.center_of_mass(blobs > 0, blobs, np.arange(1, n + 1)), sizes):
+                if size >= 20:
+                    k = at(cx, cy)
+                    if k:
+                        out.setdefault(k, []).append(Fixture(kind))
+    return out
+
+
+def _net_maps(rel: str, shape: tuple[int, int]) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """CubiCasa net room and icon class maps at image resolution, if the perception features are cached."""
     try:
         from app.cubicasa.features import feature_paths
 
         npz = feature_paths(rel)[0]
         if not npz.is_file():
-            return None
-        rooms = np.load(npz)["rooms"]
-        return rooms if rooms.shape == shape else None
+            return None, None
+        z = np.load(npz)
+        rooms, icons = z["rooms"], z["icons"]
+        return (rooms if rooms.shape == shape else None), (icons if icons.shape == shape else None)
     except Exception:  # noqa: BLE001  optional evidence
-        return None
+        return None, None
 
 
 def _walls(mask: np.ndarray, kind: str, tol: float, min_px: int = 50) -> list[WallShape]:
@@ -266,12 +311,14 @@ def geometry_from_graph(graph: PlanGraph) -> PlanGeometry:
         labels = [RoomLabel(text=it.text, bbox=it.bbox, room_type=room_purpose(it.text.split()[0]) if it.text else None)]             if it.text else []
         purpose = labels[0].room_type if labels else None
         rtype = purpose or (it.cls if it.cls not in ("", "room", "other") else None)
-        rooms.append(RoomShape(id=it.id, type=rtype or "unknown", type_source="drawing",
-                               confidence="labeled" if rtype or it.text else "rough",
-                               purposes=[rtype] if rtype else [], name=it.text,
+        evidence = [RoomEvidence(source="drawing", type=rtype, weight=6.0, detail=f'drawing text "{it.text}"')] \
+            if rtype and it.text else []
+        rooms.append(RoomShape(id=it.id, type=rtype or "unknown", tier="strong" if rtype else "unknown",
+                               purposes=[rtype] if rtype else [], evidence=evidence, name=it.text,
                                labels=labels, polygon=list(it.polygon), bbox=it.bbox, area_px=area,
                                labeled_area_m2=_labeled_area(labels)))
-    return PlanGeometry(image=graph.image, width=graph.width, height=graph.height, model="pdf", rooms=rooms)
+    return PlanGeometry(image=graph.image, width=graph.width, height=graph.height, model="pdf", rooms=rooms,
+                        scale=scale_from_written_areas(rooms))
 
 
 def main() -> None:
@@ -279,9 +326,11 @@ def main() -> None:
 
     rel = sys.argv[1]
     g = geometry_from_image(rel, image_path(rel))
-    print(f"{g.model}: {len(g.rooms)} rooms, {len(g.walls)} walls, {len(g.openings)} openings, wall {g.wall_thickness_px} px")
+    print(f"{g.model}: {len(g.rooms)} rooms, {len(g.wall_segments)} wall segments, {len(g.openings)} openings, "
+          f"wall {g.wall_thickness_px} px, scale {g.scale}")
     for rm in g.rooms:
-        print(f"  {rm.id:<10}{rm.confidence:<9}{rm.type:<10}{rm.type_source:<13}{rm.area_px:>9.0f} px  name={rm.name!r} "
+        print(f"  {rm.id:<10}{rm.tier:<8}{rm.type:<10}{rm.scores}  evidence={[e.detail for e in rm.evidence]}  "
+              f"conflicts={rm.conflicts}  {rm.area_px:>9.0f} px  name={rm.name!r} "
               f"labels={[lb.text for lb in rm.labels]} m2={rm.labeled_area_m2} nb={rm.neighbours} via={rm.connections}")
 
 

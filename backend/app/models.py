@@ -133,6 +133,16 @@ class RoomLabel(BaseModel):
     room_type: str | None = None  # the purpose the text names (e.g. "MH" -> bedroom, "OH" -> living), if any
 
 
+class RoomEvidence(BaseModel):
+    """One piece of evidence for a room's type (see app.cubicasa.room_types for the weights)."""
+
+    source: Literal["ocr", "fixture", "segmentation", "geometry", "drawing"]
+    type: str  # the room type it supports
+    weight: float  # score points it adds (hand-set: ocr label +6, decisive fixture +4..5, segmentation <= +1.5)
+    detail: str  # human-readable, e.g. 'label "WC"', "toilet inside", "net: 62% bath pixels"
+    item_id: str | None = None  # citable plan item (fixture) behind it, if any
+
+
 class RoomShape(BaseModel):
     """One enclosed space. Coordinates in pixels of the plan image (PDF: points of page 1), origin top-left."""
 
@@ -140,20 +150,24 @@ class RoomShape(BaseModel):
     # bedroom, bathroom, wc, sauna, kitchen, balcony, living, dining, entry, closet, storage, utility, study,
     # technical, terrace, garage, stairs, basement, or unknown
     type: str
-    type_source: Literal["label", "segmentation", "drawing", "unknown"]  # label = OCR text inside the room
-    # labeled = a clear purpose label was read inside the room (show it, state it); rough = a wall-enclosed space with
-    # no readable label: shape and type are guesses (hidden from the overlay by default, never stated as fact)
-    confidence: Literal["labeled", "rough"]
+    # strong = a readable purpose label or decisive fixtures, clear lead, no conflict (state it as fact);
+    # weak = only weak evidence (2019 net pixels, ambiguous fixtures) or a conflict ("probably X");
+    # unknown = no evidence (never state a purpose)
+    tier: Literal["strong", "weak", "unknown"]
     purposes: list[str] = Field(default_factory=list)  # every purpose labelled inside (open plan: living + kitchen)
+    scores: dict[str, float] = Field(default_factory=dict)  # top-3 type scores
+    evidence: list[RoomEvidence] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)  # strong evidence pointing to another type
     name: str | None = None  # the room's own label as written, e.g. "MH" or "KEITTIÖ"
     labels: list[RoomLabel] = Field(default_factory=list)  # all text inside the room
     polygon: list[tuple[float, float]]
     bbox: tuple[float, float, float, float]
     area_px: float
     labeled_area_m2: float | None = None  # an area written in the room ("12,5 m²"), if any
-    area_m2: float | None = None  # area_px through the user's scale calibration (filled when served, not stored)
+    area_m2: float | None = None  # area_px through the plan scale (filled when served, not stored)
     neighbours: list[str] = Field(default_factory=list)  # rooms across a wall
     connections: list[str] = Field(default_factory=list)  # opening ids leading out of this room
+    walls: list[str] = Field(default_factory=list)  # wall segment ids bounding the room
 
 
 class WallShape(BaseModel):
@@ -167,10 +181,36 @@ class WallShape(BaseModel):
     symbol: str | None = None  # opening: "door" / "window" when a detected symbol overlaps it
 
 
+class WallSegment(BaseModel):
+    """A straight piece of wall centreline (vectorised from the wall map)."""
+
+    id: str  # seg-N
+    p0: tuple[float, float]
+    p1: tuple[float, float]
+    length_px: float
+    thickness_px: float
+    angle_deg: float  # 0 = horizontal (left to right), 90 = vertical, in image coordinates (y down)
+    orientation: Literal["horizontal", "vertical", "diagonal"]
+    rooms_left: list[str] = Field(default_factory=list)  # rooms on the left of p0 -> p1 ("outside" = exterior)
+    rooms_right: list[str] = Field(default_factory=list)
+    exterior: bool = False  # one side is outside the building
+    openings: list[str] = Field(default_factory=list)  # opening ids crossing this segment
+    length_m: float | None = None  # with a plan scale (filled when served)
+    thickness_m: float | None = None
+
+
+class PlanScale(BaseModel):
+    """Metres per image pixel (PDF point) and where that number comes from."""
+
+    m_per_px: float
+    source: Literal["calibration", "written_areas"]  # user's two-point calibration, or areas written in rooms
+    rooms: list[str] = Field(default_factory=list)  # written_areas: the rooms whose areas agreed
+
+
 class PlanGeometry(BaseModel):
     """Rooms and walls of one plan, stored in Supabase (plan_geometry) for overlays and the answering agent."""
 
-    version: int = 1
+    version: int = 2  # bump when the content changes: older stored rows are recomputed
     image: str
     width: int
     height: int
@@ -179,3 +219,5 @@ class PlanGeometry(BaseModel):
     rooms: list[RoomShape] = Field(default_factory=list)
     walls: list[WallShape] = Field(default_factory=list)
     openings: list[WallShape] = Field(default_factory=list)
+    wall_segments: list[WallSegment] = Field(default_factory=list)
+    scale: PlanScale | None = None  # derived from written areas when stored; the user's calibration wins when served

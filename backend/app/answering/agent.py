@@ -74,12 +74,14 @@ Rules:
 
 # Appended to SYSTEM when the plan has room geometry (list_rooms / room_details are offered).
 ROOM_RULES = """
-Room geometry is available:
-- For questions about which rooms exist, what a room is for, room sizes or which rooms connect, use list_rooms and
-  room_details. Rooms with confidence "labeled" have their purpose read from the drawing: state those plainly.
-  "rough" spaces have no readable label: never state their purpose or count them as rooms of a type; if relevant,
-  say there are N further unlabelled spaces whose purpose could not be read.
-- A room area may be stated only as a number a tool returned (area_m2, or area_m2_written_on_drawing, saying which).
+Room and wall geometry is available:
+- For which rooms exist, what a room is for, room sizes, which rooms connect, or where something is, use list_rooms
+  and room_details; for wall lengths, thicknesses and exterior walls use list_walls (or the walls in room_details).
+- Room types carry a tier. strong: state the type plainly. weak: say "probably <type>" and give the reason from the
+  tool ("because ..."). unknown: the purpose was not determined; never guess it; if relevant say there are N further
+  spaces whose purpose could not be determined. Report conflicting evidence when a tool lists it.
+- Sizes and lengths may be stated only as numbers a tool returned. Say where a metric number comes from: the user's
+  scale calibration, a scale derived from areas written on the drawing, or an area written in the room itself.
 - For whole-plan counts that count_template covers, count_template still takes precedence."""
 
 FINAL = {

@@ -15,7 +15,8 @@ from fastapi.responses import FileResponse, Response
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
 from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
-                        PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest, PlanScaleCalibration)
+                        PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest, PlanScale,
+                        PlanScaleCalibration)
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
@@ -526,9 +527,12 @@ def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
 
 def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
     _geometry_request(plan_id, "POST", {
-        "plan_id": str(plan_id), "geometry": geometry.model_dump(mode="json", exclude={"rooms": {"__all__": {"area_m2"}}}),
-        "model": geometry.model, "labeled_rooms": sum(r.confidence == "labeled" for r in geometry.rooms),
-        "rough_rooms": sum(r.confidence == "rough" for r in geometry.rooms)})
+        "plan_id": str(plan_id),
+        # metric values depend on the user's calibration at read time: stored in pixels only
+        "geometry": geometry.model_dump(mode="json", exclude={"rooms": {"__all__": {"area_m2"}},
+                                                              "wall_segments": {"__all__": {"length_m", "thickness_m"}}}),
+        "model": geometry.model, "strong_rooms": sum(r.tier == "strong" for r in geometry.rooms),
+        "weak_rooms": sum(r.tier == "weak" for r in geometry.rooms)})
 
 
 def _store_geometry_safely(plan_id: UUID, graph: PlanGraph) -> None:
@@ -549,17 +553,25 @@ def _metres_per_unit(scale: PlanScaleCalibration) -> float | None:
     return scale.distance * unit_m / span
 
 
-def with_areas(geometry: PlanGeometry, scale: PlanScaleCalibration | None) -> PlanGeometry:
-    if scale and (m := _metres_per_unit(scale)):
+def with_metrics(geometry: PlanGeometry, calibration: PlanScaleCalibration | None) -> PlanGeometry:
+    """Fill room areas (m²) and wall lengths / thicknesses (m). The user's calibration wins over the scale derived from
+    written room areas; geometry.scale says which one was used."""
+    if calibration and (m := _metres_per_unit(calibration)):
+        geometry.scale = PlanScale(m_per_px=m, source="calibration")
+    if geometry.scale:
+        m = geometry.scale.m_per_px
         for room in geometry.rooms:
             room.area_m2 = round(room.area_px * m * m, 2)
+        for seg in geometry.wall_segments:
+            seg.length_m = round(seg.length_px * m, 2)
+            seg.thickness_m = round(seg.thickness_px * m, 3)
     return geometry
 
 
 def _plan_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
     """Stored geometry, computed and stored on first use for plans analysed before it existed."""
     stored = _geometry_request(plan_id)
-    if stored is not None:
+    if stored is not None and stored.get("version", 1) >= PlanGeometry.model_fields["version"].default:
         try:
             return PlanGeometry.model_validate(stored)
         except ValueError:
@@ -578,10 +590,10 @@ def _saved_scale(plan_id: UUID) -> PlanScaleCalibration | None:
 
 
 @app.get("/api/plans/{plan_id}/geometry", response_model=PlanGeometry)
-def get_plan_geometry(plan_id: UUID, rough: bool = Query(True, description="include rough (unlabelled) rooms")
+def get_plan_geometry(plan_id: UUID, uncertain: bool = Query(True, description="include weak / unknown rooms")
                       ) -> PlanGeometry:
-    """Rooms (polygons, purpose read from the drawing, labeled vs rough), walls and openings of an analysed plan.
-    Room areas in m² are filled in when the plan has a scale calibration."""
+    """Rooms (polygons, type from combined evidence with a strong / weak / unknown tier), wall segments, walls and
+    openings of an analysed plan. Metric areas and lengths use the user's calibration, else written room areas."""
     graph = _saved_graph(plan_id)
     if graph is None:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
@@ -589,9 +601,9 @@ def get_plan_geometry(plan_id: UUID, rough: bool = Query(True, description="incl
         geometry = _plan_geometry(plan_id, graph)
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Wall model unavailable: {error}") from error
-    if not rough:
-        geometry.rooms = [r for r in geometry.rooms if r.confidence == "labeled"]
-    return with_areas(geometry, _saved_scale(plan_id))
+    if not uncertain:
+        geometry.rooms = [r for r in geometry.rooms if r.tier == "strong"]
+    return with_metrics(geometry, _saved_scale(plan_id))
 
 
 @app.post("/api/plans/{plan_id}/ask", response_model=Answer)
@@ -642,7 +654,7 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
 
         geometry = None
         try:  # room tools for the agent; without geometry it answers with the item tools only
-            geometry = with_areas(_plan_geometry(plan_id, graph), req.scale)
+            geometry = with_metrics(_plan_geometry(plan_id, graph), req.scale)
         except Exception as error:  # noqa: BLE001
             log.warning("plan %s: no geometry for the agent (%s)", plan_id, error)
         if (result := answer(req.question, graph, req.history, req.scale, geometry=geometry)) is not None:

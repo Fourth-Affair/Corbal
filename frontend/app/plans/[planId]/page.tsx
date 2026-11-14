@@ -18,20 +18,47 @@ type PlanCitation = {
   user_verified?: boolean;
 };
 type EvidenceItem = PlanCitation & { category: string; cls: string; text?: string | null; score?: number | null; raw?: string | null; user_verified?: boolean };
+type RoomEvidence = { source: string; type: string; weight: number; detail: string; item_id?: string | null };
 type RoomShape = {
   id: string;
   type: string;
-  confidence: "labeled" | "rough";
+  // strong: a readable label or decisive fixtures; weak: only weak evidence or a conflict; unknown: no evidence
+  tier: "strong" | "weak" | "unknown";
   purposes: string[];
+  evidence: RoomEvidence[];
+  conflicts: string[];
   name?: string | null;
   polygon: Array<[number, number]>;
   bbox: [number, number, number, number];
   area_m2?: number | null;
   labeled_area_m2?: number | null;
 };
-type PlanGeometry = { width: number; height: number; model: string; rooms: RoomShape[] };
+type WallSegment = {
+  id: string;
+  p0: [number, number];
+  p1: [number, number];
+  length_px: number;
+  thickness_px: number;
+  exterior: boolean;
+  length_m?: number | null;
+  thickness_m?: number | null;
+};
+type PlanGeometry = {
+  width: number;
+  height: number;
+  model: string;
+  rooms: RoomShape[];
+  wall_segments: WallSegment[];
+  scale?: { m_per_px: number; source: "calibration" | "written_areas" } | null;
+};
 
-// One colour per purpose; rough (unlabelled) spaces are drawn dashed and unfilled
+function roomWhy(room: RoomShape): string {
+  const reasons = room.evidence.filter(e => e.type === room.type && e.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3).map(e => e.detail);
+  const conflict = room.conflicts.length ? ` · conflicting evidence: ${room.conflicts.join(", ")}` : "";
+  return reasons.length ? `${reasons.join("; ")}${conflict}` : "no evidence";
+}
+
+// One colour per purpose; weak rooms are dashed, unknown spaces grey and dashed
 const ROOM_COLOURS: Record<string, string> = {
   bedroom: "#5b8def", living: "#e0a43b", kitchen: "#e0613b", bathroom: "#3bb3c9", wc: "#3b8fc9", sauna: "#c9733b",
   balcony: "#6dbb5f", terrace: "#6dbb5f", entry: "#9b8bd6", closet: "#b07fc0", storage: "#a0a0a0", utility: "#5fb3a0",
@@ -104,7 +131,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [geometry, setGeometry] = useState<PlanGeometry | null>(null);
   const [geometryError, setGeometryError] = useState<string | null>(null);
   const [showRooms, setShowRooms] = useState(true);
-  const [showRough, setShowRough] = useState(false);
+  const [showUncertain, setShowUncertain] = useState(false);
+  const [showWalls, setShowWalls] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
 
   // Room geometry once the analysis is ready; refetched when the scale changes (areas in m² depend on it)
@@ -569,8 +597,9 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
-          {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose purpose was read from the drawing">Rooms ({geometry.rooms.filter(room => room.confidence === "labeled").length})</button>}
-          {geometry && showRooms && geometry.rooms.some(room => room.confidence === "rough") && <button className={`toolbar-button${showRough ? " is-on" : ""}`} type="button" aria-pressed={showRough} onClick={() => setShowRough(on => !on)} title="Enclosed spaces without a readable label: shape and purpose are rough guesses">Unlabelled spaces ({geometry.rooms.filter(room => room.confidence === "rough").length})</button>}
+          {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose type is backed by a readable label or decisive fixtures">Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>}
+          {geometry && showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button className={`toolbar-button${showUncertain ? " is-on" : ""}`} type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)} title="Spaces whose type is only a weak guess (dashed) or unknown (grey)">Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
+          {geometry && geometry.wall_segments.length > 0 && <button className={`toolbar-button${showWalls ? " is-on" : ""}`} type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)} title="Wall centrelines: exterior walls thick">Walls ({geometry.wall_segments.length})</button>}
           {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
           {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
@@ -595,17 +624,24 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 </g>;
               })}
               {geometry && showRooms && <g className="room-layer">
-                {geometry.rooms.filter(room => room.confidence === "labeled" || showRough).map(room => {
-                  const colour = room.confidence === "labeled" ? (ROOM_COLOURS[room.type] ?? "#7a8a80") : "#7a8a80";
+                {geometry.rooms.filter(room => room.tier === "strong" || showUncertain).map(room => {
+                  const colour = room.tier === "unknown" ? "#7a8a80" : (ROOM_COLOURS[room.type] ?? "#7a8a80");
                   const [x0, y0, x1, y1] = room.bbox;
                   const fontSize = Math.max(11, Math.min(imageSize.width, imageSize.height) / 45);
-                  return <g key={room.id} className={`room-shape ${room.confidence}`}>
-                    <polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.confidence === "labeled" ? colour : "none" }}>
-                      <title>{room.confidence === "labeled" ? `${room.name ?? room.type}: ${roomCaption(room)}` : "Unlabelled space (rough: purpose unknown)"}</title>
+                  const caption = room.tier === "strong" ? roomCaption(room) : room.tier === "weak" ? `${room.type}?` : "?";
+                  const tooltip = room.tier === "unknown" ? "Space with unknown purpose" : `${room.tier === "weak" ? "Probably " : ""}${room.name ?? room.type}: ${roomCaption(room)} (${roomWhy(room)})`;
+                  return <g key={room.id} className={`room-shape ${room.tier}`}>
+                    <polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.tier === "unknown" ? "none" : colour }}>
+                      <title>{tooltip}</title>
                     </polygon>
-                    <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{room.confidence === "labeled" ? roomCaption(room) : "?"}</text>
+                    <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{caption}</text>
                   </g>;
                 })}
+              </g>}
+              {geometry && showWalls && <g className="wall-layer">
+                {geometry.wall_segments.map(segment => <line key={segment.id} className={segment.exterior ? "exterior" : "interior"} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]}>
+                  <title>{`${segment.exterior ? "Exterior" : "Interior"} wall · ${segment.length_m != null ? `${segment.length_m.toFixed(2)} m long, ${((segment.thickness_m ?? 0) * 100).toFixed(0)} cm thick` : `${Math.round(segment.length_px)} px long, ${Math.round(segment.thickness_px)} px thick`}`}</title>
+                </line>)}
               </g>}
               {citations.map((item, index) => {
                 const [x0, y0, x1, y1] = item.bbox;
