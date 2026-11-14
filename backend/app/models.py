@@ -46,6 +46,7 @@ class Answer(BaseModel):
     confidence: Literal["high", "medium", "low", "not_found"]
     explanation: str
     citations: list[PlanItem] = Field(default_factory=list)
+    answered_by: Literal["template", "llm"] = "template"  # who wrote the explanation; the value is always computed
 
 
 class TextToken(BaseModel):

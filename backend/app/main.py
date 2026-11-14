@@ -20,6 +20,8 @@ app = FastAPI(title="Junc API", version="0.1.0")
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
+# "llm" = Gemini writes the explanation of template answers (falls back to "template" without GEMINI_API_KEY).
+ANSWERER = os.environ.get("ANSWERER", "llm")
 
 
 def _check_path(path: str):
@@ -80,7 +82,12 @@ def ask(req: AskRequest) -> Answer:
     except FileNotFoundError as error:  # e.g. model weights or original labels missing
         return Answer(answer=None, template=template, confidence="not_found",
                       explanation=f"Parser unavailable: {error}")
-    return count(graph, template)
+    answer = count(graph, template)
+    if ANSWERER == "llm":
+        from app.answering.llm import compose
+
+        answer = compose(req.question, answer, graph)
+    return answer
 
 
 @app.get("/api/image")
