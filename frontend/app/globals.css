@@ -76,6 +76,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .chat-message.assistant { margin-right: auto; background: #f4f5f3; color: #46534a; }
 .chat-message span { display: block; margin-bottom: 4px; color: #829087; font-size: 10px; font-weight: 700; }
 .chat-message p { margin: 0; }
+.thinking-message { min-width: 190px; border: 1px solid #dce8df; background: #f3f8f4 !important; box-shadow: 0 2px 8px rgba(37, 72, 48, .06); }
+.thinking-message p { display: flex; align-items: center; gap: 9px; color: #385b43; font-weight: 600; }
+.thinking-spinner { width: 15px; height: 15px; flex: none; border: 2px solid #c6dccb; border-top-color: #34764e; border-radius: 50%; animation: spin .8s linear infinite; }
 .composer { margin: 0 14px 14px; padding: 9px; border: 1px solid #e2e8e2; border-radius: 8px; background: #fbfcfb; }
 .composer textarea { width: 100%; min-height: 88px; padding: 5px; resize: vertical; border: 0; outline: 0; background: transparent; color: #536157; font-size: 12px; line-height: 1.5; }
 .composer textarea::placeholder { color: #a0aaa2; }
