@@ -76,13 +76,16 @@ def raster_symbols(rel: str) -> tuple[Symbol, ...]:
 
     if not symdet.available():
         return ()
-    pdf = pdfium.PdfDocument(str(resolve_pdf(rel)))
-    try:
-        page = pdf[0]
-        k = pdf_render_scale(*page.get_size())  # 2x, less for very large pages
-        img = page.render(scale=k).to_pil().convert("RGB")
-    finally:
-        pdf.close()
+    from app.pdfplan.text import PDFIUM_LOCK
+
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(str(resolve_pdf(rel)))
+        try:
+            page = pdf[0]
+            k = pdf_render_scale(*page.get_size())  # 2x, less for very large pages
+            img = page.render(scale=k).to_pil().convert("RGB")
+        finally:
+            pdf.close()
     out = []
     for d in symdet.predict_image(img, conf=symdet.ITEM_CONF):
         kind = _DET_KIND.get(d["cls"])
@@ -135,12 +138,26 @@ def plan_graph(rel: str, image: str | None = None) -> PlanGraph:
     return PlanGraph(image=image or rel, width=round(w), height=round(h), source="pdf", items=items)
 
 
+TEMPLATES = ["count:apartments", "count:doors", "count:windows", "count:toilets", "count:washbasins", "count:bathtubs",
+             "count:showers", "label_count", "label_area", "room_area", "apartment_area", "floor_area"]
+NEEDS_ARG = {"label_count", "label_area", "room_area", "apartment_area"}
+
+
 def answer_question(rel: str, question: str, use_dxf: bool = True) -> Answer:
     parsed = parse_question(question)
     if parsed is None:
         return Answer(answer=None, confidence="not_found", explanation="This question type is not supported for PDF plans yet.")
     template, arg = parsed
-    plan: Plan = parse_plan(rel, use_dxf)
+    return answer_template(parse_plan(rel, use_dxf), rel, template, arg)
+
+
+def answer_template(plan: Plan, rel: str, template: str, arg: str | None = None) -> Answer:
+    """One template (see the module docstring) over a parsed plan. arg: the room label, room number or apartment
+    letter for the templates that need one."""
+    if template not in TEMPLATES:
+        raise ValueError(f"unknown template {template!r}; one of {TEMPLATES}")
+    if template in NEEDS_ARG and not arg:
+        raise ValueError(f"template {template} needs an argument")
     tid = f"pdf_{template.replace(':', '_')}"
 
     if template == "count:apartments":

@@ -77,6 +77,7 @@ _analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
 _jobs = AnalysisJobs(lambda plan_id: _analyze_plan(plan_id), workers=MAX_CONCURRENT_ANALYSES, ready=_models_ready)
 
 # Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser, .ifc -> app.ifc.
+# All three answer through the agent when ANSWERER=llm, each with its own toolset.
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
 
@@ -563,12 +564,15 @@ def _upload_pdf(plan_id: UUID, content: bytes | None = None):
 def _render_pdf_page(path_or_bytes, scale: float = 2.0):
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(path_or_bytes)
-    try:
-        page = pdf[0]
-        return page.render(scale=pdf_render_scale(*page.get_size(), scale)).to_pil().convert("RGB")
-    finally:
-        pdf.close()
+    from app.pdfplan.text import PDFIUM_LOCK
+
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(path_or_bytes)
+        try:
+            page = pdf[0]
+            return page.render(scale=pdf_render_scale(*page.get_size(), scale)).to_pil().convert("RGB")
+        finally:
+            pdf.close()
 
 
 @app.get("/api/plans/{plan_id}/image")
@@ -936,9 +940,9 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
                       explanation=f"Estimated {outlines[0].label.lower()} area from the saved scale and user-accepted outline. Check the highlighted boundary before relying on this area.",
                       answered_by="template")
     if graph.source == "pdf":
-        from app.pdfplan.answer import answer_question
+        from app.pdfplan.tools import PdfTools
 
-        return answer_question(str(_upload_pdf(plan_id)), req.question)
+        return _agent_or_fallback(req.question, PdfTools(str(_upload_pdf(plan_id))), req.history)
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
@@ -950,6 +954,17 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
         if (result := answer(req.question, graph, req.history, req.scale, geometry=geometry)) is not None:
             return result
     return _template_answer(req.question, graph)
+
+
+def _agent_or_fallback(question: str, tools, history=None, scale=None) -> Answer:
+    """PDF / IFC: the Gemini agent over the toolset; its deterministic answerer when Gemini is unavailable (or
+    ANSWERER=template). An agent that runs out of steps answers not_found and is not replaced by the fallback."""
+    if ANSWERER == "llm":
+        from app.answering.agent import answer_with
+
+        if (result := answer_with(question, tools, history, scale)) is not None:
+            return result
+    return tools.fallback(question)
 
 
 def _template_answer(question: str, graph) -> Answer:
@@ -1000,20 +1015,26 @@ def ask(req: AskRequest) -> Answer:
             resolve_dataset_path(req.path)
         except FileNotFoundError:
             raise HTTPException(404, f"File not found: {req.path}") from None
-        from app.ifc.answer import answer_question as ifc_answer
+        from app.ifc.agent_tools import IfcTools
+        from app.ifc.model import load_model
 
         try:
-            return ifc_answer(req.path, req.question)
+            model = load_model(req.path)
         except FileNotFoundError as error:
             return Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {error}")
+        except Exception as error:  # noqa: BLE001  unreadable / unsupported IFC
+            return Answer(answer=None, confidence="not_found",
+                          explanation=f"Could not read the IFC model: {type(error).__name__}: {error}")
+        return _agent_or_fallback(req.question, IfcTools(model, req.path))
     _check_path(req.path, pdf_ok=True)
-    if _is_pdf(req.path):  # vector plan: deterministic parser, citations in PDF points
-        from app.pdfplan.answer import answer_question
+    if _is_pdf(req.path):  # vector plan: parsed text + DXF, citations in PDF points
+        from app.pdfplan.tools import PdfTools
 
         try:
-            return answer_question(req.path, req.question)
+            tools = PdfTools(req.path)
         except FileNotFoundError as error:
             return Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {error}")
+        return _agent_or_fallback(req.question, tools)
     try:
         graph = get_graph(req.path, PLAN_SOURCE)
     except FileNotFoundError as error:  # e.g. model weights or original labels missing
@@ -1076,12 +1097,8 @@ def render(path: str = Query(...), question: str | None = Query(None),
         answer = ask(AskRequest(path=path, question=question))
         k = 1.0
         if _is_pdf(path):  # citations are PDF points: render page 1 at 2x
-            import pypdfium2 as pdfium
-
             k = 2.0
-            pdf = pdfium.PdfDocument(str(p))
-            img = pdf[0].render(scale=k).to_pil().convert("RGB")
-            pdf.close()
+            img = _render_pdf_page(str(p), scale=k)
         else:
             img = Image.open(p).convert("RGB")
         draw = ImageDraw.Draw(img)

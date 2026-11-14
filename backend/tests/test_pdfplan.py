@@ -117,3 +117,21 @@ def test_uploaded_pdf_flow(tmp_path, monkeypatch):
     assert c.get(f"/api/plans/{pid}/image").headers["content-type"] == "image/png"
     a = c.post(f"/api/plans/{pid}/ask", json={"question": "How many rooms labelled 'Zimmer' are there on this floor?"}).json()
     assert a["answer"] == 12 and len(a["citations"]) == 12
+
+
+@needs_data
+def test_agent_tools():
+    from app.pdfplan.tools import PdfTools
+
+    t = PdfTools(PLAN)
+    out, trace = t.call("pdf_lookup", {"template": "label_count", "argument": "Zimmer"})
+    assert out["value"] == answer_question(PLAN, "How many rooms labelled 'Zimmer' are there?").answer == 12
+    assert trace.template_answer is not None and all(t.item(i) for i in trace.item_ids)
+    assert "error" in t.call("pdf_lookup", {"template": "room_area"})[0]  # needs a room number
+    out, trace = t.call("list_rooms", {"apartment": "A"})
+    areas = [r["area_m2"] for r in out["rooms"] if "area_m2" in r]
+    assert out["count"] == 9 and areas and all(a in trace.numbers for a in areas)
+    out, trace = t.call("list_symbols", {"kind": "door"})
+    assert out["count"] == len(trace.item_ids) > 0 and t.item(trace.item_ids[0]).category == "door"
+    _, total = t.call("calculate", {"operation": "add", "operands": areas[:2]})
+    assert total.numbers == [round(areas[0] + areas[1], 6)]
