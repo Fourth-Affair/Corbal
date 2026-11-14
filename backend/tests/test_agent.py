@@ -156,3 +156,27 @@ def test_answer_returns_none_on_failure(fake, monkeypatch):
 ])
 def test_explanation_refs(text, ok):
     assert (agent.explanation_problem(text, 2, 2) is None) == ok
+
+
+def test_list_rooms_merges_label_into_region(tools):
+    out, trace = tools.list_items("room", "bathroom")
+    assert out["count"] == 1 and out["items"][0]["id"] == "room-bath-0" and out["items"][0]["labels"] == ["KPH"]
+    assert set(trace.item_ids) == {"room-bath-0", "label-1"} and trace.numbers == [1]
+
+
+def test_yes_no_linked_to_count(tools):
+    _, trace = tools.count_template("kitchens")
+    a = agent.validate("Is there a kitchen?", _final(text="Yes", explanation="Yes, there is 1 kitchen [1]."),
+                       [trace], tools)
+    assert (a.answer, a.template, [c.id for c in a.citations]) == ("Yes", "kitchens", ["room-kitchen-0"])
+    _, trace = tools.count_template("saunas")
+    a = agent.validate("Onko asunnossa saunaa?", _final(text="Kyllä", explanation="Kyllä."), [trace], tools)
+    assert a.answer is None and a.confidence == "not_found"  # saunas = 0 contradicts "yes"
+    a = agent.validate("Onko asunnossa saunaa?", _final(text="Ei", explanation="Saunaa ei löytynyt."), [trace], tools)
+    assert (a.answer, a.template) == ("Ei", "saunas")
+
+
+@pytest.mark.parametrize("text,pol", [("Yes", True), ("No.", False), ("Kyllä, yksi", True), ("Ei ole", False),
+                                      ("Nej", False), ("Ja", True), ("WC-istuin ja suihku", None)])
+def test_yes_no(text, pol):
+    assert agent.yes_no(text) is pol

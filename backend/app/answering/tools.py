@@ -107,14 +107,34 @@ class PlanTools:
 
     def list_items(self, category: str, type: str | None = None) -> tuple[dict, ToolTrace]:
         hits = [it for it in self.graph.items if _match(it, category, type)]
+        labels_of: dict[str, list[PlanItem]] = {}
+        if category == "room":  # a room read as a segmented region AND as a text label inside it = one room
+            regions = [it for it in hits if _kind(it) == "region"]
+            kept = []
+            for it in hits:
+                home = None if _kind(it) == "region" else next(
+                    (r for r in sorted(regions, key=lambda r: _area(r.bbox))
+                     if r.cls == it.cls and _inside(it.bbox, r.bbox)), None)
+                if home is None:
+                    kept.append(it)
+                else:
+                    labels_of.setdefault(home.id, []).append(it)
+            hits = kept
         shown = sorted(hits, key=lambda it: -(it.score or 1))[:MAX_LIST]
-        out = {"count": len(hits), "items": [_row(it) for it in shown]}
+        rows = []
+        for it in shown:
+            row = _row(it)
+            if it.id in labels_of:
+                row["labels"] = [lb.text for lb in labels_of[it.id]]
+            rows.append(row)
+        out = {"count": len(hits), "items": rows}
         if len(hits) > len(shown):
             out["truncated"] = f"showing {len(shown)} of {len(hits)}"
         if category == "room" and self.graph.source == "model":
-            out["note"] = ("Room 'region' = segmented room extent, 'label' = room name read from the drawing (OCR). "
-                           "The same room can appear as both; raw items are not deduplicated.")
-        return out, ToolTrace(item_ids=[it.id for it in shown], numbers=[len(hits)])
+            out["note"] = ("Room 'region' = segmented room extent, 'label' = room name read from the drawing (OCR) with "
+                           "no matching region around it. Raw detections: not a calibrated count.")
+        ids = [it.id for it in shown] + [lb.id for it in shown for lb in labels_of.get(it.id, [])]
+        return out, ToolTrace(item_ids=ids, numbers=[len(hits)])
 
     def items_in(self, container_id: str, category: str, type: str | None = None) -> tuple[dict, ToolTrace]:
         box = self.by_id.get(container_id)

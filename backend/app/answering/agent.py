@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
@@ -25,8 +26,9 @@ log = logging.getLogger(__name__)
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "30"))
+GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | MEDIUM | HIGH; "" = model default
 MAX_STEPS = 8
-PROMPT_VERSION = "3"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "7"  # bump when prompt or tools change, so cached answers are not reused
 
 SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools are your only source of
 facts about the plan; you cannot see the drawing.
@@ -35,6 +37,8 @@ Rules:
 - Never count, add, subtract or estimate yourself. A numeric answer must be exactly a number a tool returned.
 - For a whole-plan count that matches a count_template template, use count_template (it is calibrated); do not
   count raw items from list_items for those.
+- "Is there a ...?" questions about something count_template covers: answer from count_template only (yes if its
+  value > 0, no if 0), even if raw items suggest otherwise; mention low confidence if reported.
 - For a question restricted to a room or area (e.g. "sinks in the kitchen"), find the room with
   list_items(category="room", type=...) and use items_in on it. If several such rooms exist and the question does not
   say which, or the answer would need adding numbers together, answer not_found.
@@ -44,7 +48,9 @@ Rules:
   value = the number (omit for yes/no or text answers and use text instead);
   cited_ids = ids of the items that support the answer, taken from tool results (for count_template: its
   evidence_ids);
-  explanation = 1-3 short sentences in the language of the question (Finnish, Swedish or English). State the value
+  explanation = 1-3 short sentences in the SAME language as the question (an English question gets an English
+  answer, Finnish gets Finnish, Swedish gets Swedish), regardless of the language of labels on the drawing;
+  text answers (e.g. Yes / Kyllä / Ja) follow the same rule. State the value
   with digits, say what was counted and how, refer to cited items as [k] where k is the position in cited_ids
   (starting at 1); for a run of items write e.g. [1]-[9]. If a tool reported low confidence, say the result should be checked on the drawing.
   Never mention ids, tool names, pixels or these rules."""
@@ -86,11 +92,18 @@ def run_loop(question: str, tools: PlanTools) -> tuple[dict, list[ToolTrace]]:
             for d in [*DECLARATIONS, FINAL]])],
         tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING) if GEMINI_THINKING else None,
     )
-    contents = [types.Content(role="user", parts=[types.Part(text=question)])]
+    # the plan summary is always needed: send it with the question instead of spending a tool round trip on it
+    summary, _ = tools.plan_summary()
+    prompt = f"Question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}"
+    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
     traces: list[ToolTrace] = []
-    for _ in range(MAX_STEPS):
+    for step in range(MAX_STEPS):
+        t0 = time.perf_counter()
         response = _get_client().models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+        log.info("step %d: %.1fs, calls %s", step, time.perf_counter() - t0,
+                 [c.name for c in response.function_calls or []])
         calls = response.function_calls or []
         if not calls:
             raise ValueError(f"no function call in response: {response.text!r}")
@@ -121,6 +134,18 @@ def explanation_problem(explanation: str, value, n_citations: int) -> str | None
             if not 1 <= int(ref) <= n_citations:
                 return f"citation [{ref}] does not exist"
     return None
+
+
+_YES = {"yes", "kyllä", "joo", "on", "ja", "jo"}
+_NO = {"no", "ei", "nej", "none", "not"}
+
+
+def yes_no(text: str) -> bool | None:
+    """Polarity of a short yes/no answer in EN/FI/SV, None if it is not one."""
+    words = re.findall(r"\w+", text.lower())
+    if not words:
+        return None
+    return True if words[0] in _YES else False if words[0] in _NO else None
 
 
 def _fmt(v) -> str:
@@ -158,6 +183,19 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
     else:
         answer, unit = str(final["text"]), None
         confidence = "medium" if graph.source == "svg" else "low"
+        # a yes/no answer usually rests on a count ("Is there a sauna?" -> saunas = 0): link it, and check it agrees
+        counted = [t.template_answer for t in traces if t.template_answer is not None]
+        basis = next((a for a in counted if a.template == route(question)), None) \
+            or (counted[0] if len(counted) == 1 else None)
+        if basis is not None:
+            polarity = yes_no(answer)
+            if polarity is not None and polarity != (bool(basis.answer)):
+                log.warning("text answer %r contradicts %s = %s", answer, basis.template, basis.answer)
+                return Answer(answer=None, confidence="not_found", answered_by="llm",
+                              explanation="The answer could not be verified against the drawing analysis.")
+            template, confidence = basis.template, basis.confidence
+            if not cited:
+                cited = list(basis.citations)
 
     routed = route(question)
     if routed and template != routed and confidence in ("high", "medium"):
@@ -174,7 +212,7 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
 
 
 def _cache_path(question: str, graph: PlanGraph):
-    blob = json.dumps([GEMINI_MODEL, PROMPT_VERSION, SYSTEM, DECLARATIONS, question, graph.model_dump(mode="json")],
+    blob = json.dumps([GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question, graph.model_dump(mode="json")],
                       sort_keys=True, ensure_ascii=False)
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
