@@ -51,6 +51,7 @@ def test_api_ask_svg(monkeypatch):
     import app.main as main
 
     monkeypatch.setattr(main, "PLAN_SOURCE", "svg")
+    monkeypatch.setattr(main, "ANSWERER", "template")  # tests never call Gemini
     client = TestClient(main.app)
     r = client.post("/api/ask", json={"path": SAMPLE, "question": "Kuinka monta saunaa pohjapiirustuksessa on?"})
     assert r.status_code == 200

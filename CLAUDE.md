@@ -31,10 +31,15 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
 
 - `backend/` — FastAPI (Python 3.12, **uv-managed**: `pyproject.toml` + `uv.lock`). Entry: `backend/app/main.py`.
   - `app/router.py` — question (EN/FI) → template id.
-  - `app/answering/llm.py` — Gemini (`GEMINI_MODEL`, default `gemini-3.8-flash`) rewrites the explanation of a
-    template answer in the question's language with `[k]` citation refs. Value/confidence/citations stay computed;
-    output is checked (answer stated, refs exist) else the template answer is returned. Cached in `CACHE_DIR/llm`.
-    `ANSWERER=template` disables it; no `GEMINI_API_KEY` → template answers.
+  - `app/router.py` is no longer the gate when Gemini is on: it is the offline fallback and a cross-check.
+  - `app/answering/agent.py` — question → Gemini (`GEMINI_MODEL`, default `gemini-3.8-flash`) tool loop →
+    `final_answer` → `validate()`: value must equal a number a tool returned (else not_found), cited ids must come
+    from tool output, confidence from the producing tool (count_template → counting model; raw items → low; router
+    disagreement → low), explanation must state the value and use existing `[k]` refs. Answers cached in
+    `CACHE_DIR/agent`. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
+  - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
+    counts), `list_items`, `items_in` (bbox containment; a room label uses the room region around it).
+  - `scripts/routing_experiment.py` — Gemini tool choice vs router on dataset phrasings + paraphrases.
   - `app/cubicasa/` — cubicasa5k pipeline:
     - perception: `cubinet.py` (CubiCasa5K pretrained multi-task net, vendored in `vendor/floortrans`, CC BY-NC)
       + `ocr.py` (RapidOCR, detect once, recognise crops at 0/180 or 90/270°); cached by `features.py`.
