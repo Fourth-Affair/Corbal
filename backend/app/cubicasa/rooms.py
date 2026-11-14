@@ -25,6 +25,7 @@ from skimage.measure import find_contours
 from app.cubicasa.room_types import Fixture, classify
 from app.cubicasa.rooms_dict import room_purpose
 from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallShape
+from app.profiling import steps
 
 # CubiCasa net classes by index (fuse.ROOM / fuse.ICON order)
 _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
@@ -114,9 +115,16 @@ def _labeled_area(labels: list[RoomLabel]) -> float | None:
 
 def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) -> PlanGeometry:
     """Rooms, walls and openings of an image plan. `graph` (optional) supplies detected doors/windows."""
+    with steps() as step:  # stage timings for app.profiling (no-op without an active profile)
+        return _geometry_from_image(rel, path, graph, step)
+
+
+def _geometry_from_image(rel: str, path: Path, graph: PlanGraph | None, step) -> PlanGeometry:
     from app.cubicasa import layers
 
+    step("walls")
     cls, model = layers.wall_classes(rel, path)
+    step("thickness")
     H, W = cls.shape
     barrier = cls > 0
     # wall thickness: twice the median distance-to-background along the wall skeleton
@@ -127,7 +135,9 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     t = float(2 * np.median(edt[skel])) if skel.any() else 4.0
     t = min(max(t, 2.0), 0.05 * max(H, W))
     closed = ndimage.binary_closing(barrier, iterations=max(1, round(t / 4))) | barrier
+    step("text")
     text = layers.text(rel, path)
+    step("spaces")
     lab, n = ndimage.label(~closed)
     room_cuts = []
     if SPLIT_BY_LABELS:  # a bedroom open to the living room: cut between the two labels at the narrowest line
@@ -163,8 +173,10 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
             labels_of[k].append(RoomLabel(text=tok.text, bbox=tok.bbox, score=round(tok.score, 3),
                                           room_type=room_purpose(tok.text)))
 
+    step("fixtures")
     seg, icons = _net_maps(rel, (H, W))
     fixtures_of = _fixtures_by_room(lab, graph, icons)
+    step("rooms")
     tol = max(1.0, 0.002 * max(H, W))
     rooms: list[RoomShape] = []
     for k in keep:
@@ -188,6 +200,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
                                polygon=shape[0], bbox=_box(sl), area_px=float(sizes[k - 1]),
                                labeled_area_m2=_labeled_area(labels), neighbours=neighbours))
 
+    step("walls_openings")
     walls = _walls(cls == 1, "wall", tol)
     openings = _openings(cls, lab, room_id, outside, t, graph, tol)
     by_id = {rm.id: rm for rm in rooms}
@@ -201,6 +214,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     def to_id(v: int) -> str | None:
         return room_id.get(v) or ("outside" if v in outside else None)
 
+    step("wall_segments")
     segments = vectorise(cls, lab, to_id, t, openings)
     for sg in segments:
         for rid in set(sg.rooms_left) | set(sg.rooms_right):
@@ -208,6 +222,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
                 by_id[rid].walls.append(sg.id)
     from app.cubicasa.size_priors import symbol_scale
 
+    step("scale")
     sym = symbol_scale(graph)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
                         walls=walls, openings=openings, wall_segments=segments, room_cuts=room_cuts,

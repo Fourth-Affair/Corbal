@@ -52,9 +52,9 @@ def test_large_upload_is_downscaled_before_analysis(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_saved_graph", lambda plan_id: None)
     monkeypatch.setattr(main, "_download_source", lambda plan_id: buf.getvalue())
     monkeypatch.setattr(main, "_persist_graph", lambda plan_id, graph: None)
-    monkeypatch.setattr(main, "_store_geometry_safely", lambda plan_id, graph: None)
+    monkeypatch.setattr(main, "_store_geometry_safely", lambda plan_id, graph, **kw: None)
     monkeypatch.setattr(detect, "graph_from_image", fake_graph)
-    graph = main.analyze_plan(uuid4())
+    graph = main._analyze_plan(uuid4())  # the job body
     w, h = seen["size"]
     assert w * h <= 30_000 and abs(w / h - 4 / 3) < 0.02
     assert (graph.width, graph.height) == (w, h)

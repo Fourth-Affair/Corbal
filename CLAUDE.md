@@ -135,7 +135,14 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
   - `app/main.py` web-app endpoints `/api/plans/{id}/...` (analyze, image, ask, geometry, scale, outline, corrections,
     feedback): source file from Supabase Storage, analysis saved in Supabase `plan_knowledge` (+ a local copy in
     `CACHE_DIR/plan-graphs/`), geometry in `plan_geometry`. Room-area questions are answered in `ask_plan` from the
-    user's scale + accepted outlines before the agent is called.
+    user's scale + accepted outlines before the agent is called. Analysis is a background job (`app/jobs.py`):
+    `POST /analyze` -> 200 graph if saved, else 202; the page polls `GET /analysis` (state, stage, queue position).
+  - `app/profiling.py` — `Profile` + `stage("name")` (nested, dotted names, contextvar: a no-op without an active
+    profile, so library code marks its own stages) + `steps()` for long sequential functions; peak RSS per stage via
+    psutil. Jobs log one `analysis_profile` JSON line each. `app/warmup.py` loads every model at startup (`WARMUP`).
+  - `scripts/profile_analysis.py` — the upload path (pipeline + geometry) on preview plans with an empty cache: stage
+    table, `--save-outputs` / `--diff` (prove a speed-up changes nothing), `--cpus N` (emulate a smaller server),
+    `--parallel-walls`, `--cprofile`.
   - `scripts/inspect_plans.py` — inspection sheets (rooms, walls, detections, ground truth side by side; `--uploads N`
     for uploaded plans). `scripts/fetch_questions.py` — `questions.jsonl` out of the dataset zip (HTTP range reads).
 - `frontend/` — Next.js 16 / React 19 / TypeScript. The browser calls only Next.js API routes
@@ -149,6 +156,7 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
   (Zenodo 2613548, labels + official split for training/eval only), `cache/`, `yolo-cubicasa-det/`, `runs/`,
   `models/` is now at the repo root (see below).
 - `models/` (`MODELS_DIR`, tracked in git, all files < 50 MB): `cubicasa-fusion.joblib`, `ocr_token_table.json`, `symbol-det.pt` + `.json` sidecar, `wallseg.pt` (fp16); checksums in `models/MANIFEST.json`. Not committed: `cubicasa-net.pkl` (208 MB CubiCasa net; the share bundle's `dataset/cubicasa-pretrained/` path also works). The detector fingerprint is a content hash, so retraining the detector requires refitting the fusion models.
+- `docs/pipeline.md` — how the whole system works, stage by stage (for the team; keep it current when a stage changes).
 - `docs/literature-review.md` — floor-plan recognition since CubiCasa5K and the roadmap.
 
 ## Commands
@@ -177,6 +185,9 @@ uv run python -m app.bench run --set fast --answerer template   # no Gemini: rou
 uv run python -m app.bench run --set fast --kind open           # breadth only: the open questions (~4 min)
 uv run python -m app.bench run --set fast --kind open --source svg --answerer agent   # same with perfect perception:
                                                             # what is left is question understanding and tools
+uv run python scripts/profile_analysis.py                  # where an upload's analysis spends time (6 preview plans)
+uv run python scripts/profile_analysis.py --save-outputs ../dataset/runs/profile/before   # then after a change:
+uv run python scripts/profile_analysis.py --diff ../dataset/runs/profile/before ../dataset/runs/profile/after
 uv run python -m app.bench perception --set fast [--walls]  # no questions at all: evidence boxes/rooms/counts vs SVG
                                                             # labels (diff works on these runs too)
 
@@ -227,6 +238,11 @@ balconies 85, sinks 84, bedrooms 78, doors 66, windows 44. Previous detector 81.
 door 0.957, window 0.917; 93 test windows are still "merged" (one box over a mullioned run; the ground truth itself
 labels such runs inconsistently, see `windows_eval.py`).
 
+The 81.8% was measured with three `var_*` features parsed from the dataset **file name** (the CubiCasa variant), which
+an upload never has. Removed 2026-11-15 (`fuse.image_features`; `fit.py` excludes `var_*`): on the 241 preview plans,
+zeroing them changes 2 of 2892 counts and leaves accuracy at 80.5%. Re-report the test score at the next refit (VM).
+No feature may come from a file name or path.
+
 History: majority baseline 52.8% → pipeline **77.2%** without the detector (same number via the runtime path, `app.eval --method model`). Per template: kitchens 95, bathrooms 94, floors 93, saunas 93,
 WC seats 89, WC rooms 85, balconies 84, bedrooms 77, showers+baths 75, sinks 74, doors 51, windows 38.
 Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: adjacent symbols merge in the
@@ -248,6 +264,28 @@ of free-text reference answers); all 64.9%, coverage 91.2%, precision 67.6%. Pre
 99.0% (692), counts 48% / lengths 50% / volumes 50% (the misses are Danish / Estonian phrasings the word lists do not
 cover, answered not_found), text ≈54%; all 82.2%, coverage 90.8%, precision 88.5%.
 
+## Analysis speed (`scripts/profile_analysis.py`, 6 preview plans 0.03–12 MP, laptop, models loaded)
+
+Upload path = image pipeline + room / wall geometry. Before (2026-11-14): 12 MP plan **70.6 s**, 6.5 GB peak; plans
+up to 1 MP 3–9 s. Biggest stages at 12 MP: wall segmenter 27 s (native-resolution 512 px tiles), `fuse` features
+16 s, CubiCasa net 5 s + full-resolution maps 4 s, OCR 5 s (detection 4 s), evidence 3 s. On 4 pinned cores the 12 MP
+plan takes 92 s and small plans 10–16 s.
+
+- Done: `fuse.components` counts only labelled pixels (ndimage.sum/mean bincounted every pixel 4x per call):
+  features 16.2 -> 7.3 s, evidence 3.4 -> 1.4 s at 12 MP; 12 MP total 61 s. Outputs byte-identical (6 plans
+  graph + geometry, `image_features` on 253 cached plans).
+- Done: model warm-up at startup (`app/warmup.py`, `WARMUP`): 7–18 s per process no longer lands on the first upload.
+- Measured, off by default: `WALLSEG_MAX_PIXELS` (wall segmenter on a downscaled copy). On the 13 preview plans
+  over 4 MP: wall-seg time 251 s -> 180 s (6 MP cap) / 120 s (4 MP); agreement with the native map wall F1 mean
+  0.984 / 0.974, worst plan 0.936 / 0.902, openings worst 0.83. Agreement is not accuracy: turn it on only after
+  `app.cubicasa.walls --model wallseg` (ground-truth wall F1, needs the original CubiCasa5K) shows no drop.
+- Measured, off by default: `PARALLEL_WALLS` (wall segmenter in a thread during the pipeline). On 4 cores: 160.8 ->
+  157.5 s over the 6 plans, the 12 MP plan slower (91.5 -> 94.8 s) and +0.5 GB peak: both networks compete for
+  the same cores. Worth re-measuring only on a bigger server.
+- Not done (needs a counting-model refit): full-resolution softmax / argmax / quantisation in `features.compute`
+  (`maps`, 4–5 s at 12 MP) and full-resolution morphology in `image_features` / `_evidence`. Other candidates:
+  ONNX Runtime for the wall U-Net, OCR detection on a downscaled copy.
+
 ## Production (`deploy/README.md` has the operator's version)
 
 Every push to `main` runs the backend tests and then deploys to the single server (`.github/workflows/deploy.yml` ->
@@ -259,9 +297,10 @@ Every push to `main` runs the backend tests and then deploys to the single serve
   the commit.
 - `models/` is mounted read-only and `dataset/` too (only `dataset/cache` is writable): runtime code must not write
   next to the weights or the dataset.
-- One uvicorn process (`--workers 1`). Heavy work (`graph_from_image`, `_compute_geometry`) goes through
-  `_bounded_analysis` (`MAX_CONCURRENT_ANALYSES` slots, 503 "busy" after `ANALYSIS_QUEUE_TIMEOUT`); keep new heavy
-  paths inside it. Memory peaks at ~1.7 GB + 0.27 GB per megapixel, so uploads are downscaled to
+- One uvicorn process (`--workers 1`). Uploads are analysed by the in-process job queue (`app/jobs.py`, one worker
+  per slot; a restart forgets it and the page resubmits). Heavy work (`graph_from_image`, `_compute_geometry`) goes
+  through `_bounded_analysis` (`MAX_CONCURRENT_ANALYSES` slots; jobs wait, request handlers get a 503 "busy" after
+  `ANALYSIS_QUEUE_TIMEOUT`); keep new heavy paths inside it, and mark their stages with `app.profiling.stage`. Memory peaks at ~1.7 GB + 0.27 GB per megapixel, so uploads are downscaled to
   `MAX_ANALYSIS_PIXELS` (`config.py`, default 16 MP) and PDF pages render at most that large (`pdf_render_scale`).
   Downscaling is safe because the viewer draws the graph in its own `width`/`height` over the original image.
 - Unhandled backend errors return JSON `{"detail": ...}` (exception handler in `main.py`). The Next.js proxies show a

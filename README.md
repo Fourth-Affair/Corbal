@@ -8,6 +8,8 @@ The design rule is **evidence first, LLM second**: deterministic parsers and sma
 addressable evidence (rooms, walls, doors, windows, fixtures, text). The LLM (Gemini) only plans and calls tools that
 count, measure and do the arithmetic in code. Answers it cannot back with tool output are flagged or become "not found".
 
+**How it all works, stage by stage: [docs/pipeline.md](docs/pipeline.md).**
+
 ## What it handles
 
 | Input | Pipeline | How it reads the drawing |

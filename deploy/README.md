@@ -65,27 +65,28 @@ the first request, which takes a few seconds.
 | `GEMINI_MAX_PER_HOUR`   | 300     | Uncached Gemini questions per rolling hour; beyond it the template answerer replies (no Gemini cost). Cached answers don't count. Counted in the backend process, so it resets on restart. |
 | `RATE_ASK_PER_MIN`      | 20      | Questions per client IP per minute (Caddy returns 429 beyond). |
 | `RATE_ANALYZE_PER_MIN`  | 6       | Uploads + analyses per client IP per minute (CPU-heavy). |
-| `MAX_CONCURRENT_ANALYSES` | 1     | Heavy jobs (analysis, room / wall geometry) running at once in the backend. Each takes the memory above: raise it only with RAM to spare. |
-| `ANALYSIS_QUEUE_TIMEOUT` | 45     | Seconds a heavy job waits for a slot before returning a retryable 503 "busy". |
+| `MAX_CONCURRENT_ANALYSES` | 1     | Analyses (and room / wall geometry) running at once in the backend; further uploads queue. Each takes the memory above: raise it only with RAM to spare. |
+| `ANALYSIS_QUEUE_TIMEOUT` | 45     | Seconds a *request* (rooms or an area question for a plan whose geometry is missing) waits for a slot before a retryable 503 "busy". Queued analyses wait as long as needed. |
+| `WARMUP`                | 1       | Load all models in the background at startup, so the first upload after a deploy doesn't pay ~10–20 s for it. |
 | `MAX_ANALYSIS_PIXELS`   | 16000000 | Uploads above this are downscaled before analysis, and PDF pages are rendered at most this large. Citations still line up with the original image. |
 
 Also set a **budget alert / spending cap** for the Gemini key in Google AI Studio / Cloud Billing.
 
 ## Things that can go wrong
 
-- **Slow first analysis.** Loading the models plus analysing a large plan takes 1–3 minutes on a 4 vCPU server
-  (85 s for a 12 MP plan on a laptop). Node's `fetch` from the Next.js proxy gives up after 300 s and the user sees
-  "Could not reach the analysis backend". The backend still finishes and saves the result, so opening the plan
-  again loads it.
-- **Busy server.** With `MAX_CONCURRENT_ANALYSES=1`, a second upload waits up to `ANALYSIS_QUEUE_TIMEOUT` and then
-  gets a retryable 503. The page shows the message.
+- **Slow analysis.** Uploads are analysed by background jobs: `POST /analyze` returns at once and the page polls
+  `GET /analysis`, showing the queue position and the current step. A large plan takes about a minute on a laptop
+  (see "Analysis speed" in CLAUDE.md), more on a 4 vCPU server. Each finished job logs one `analysis_profile` line
+  with the time and peak memory of every stage: `deploy/deploy.sh logs backend | grep analysis_profile`.
+- **Queued uploads.** With `MAX_CONCURRENT_ANALYSES=1`, uploads are analysed one after another; the page says how
+  many are ahead. A backend restart forgets the queue; open pages notice and submit again.
 - **Disk.** `dataset/cache/` on the server keeps every uploaded plan's PNG / PDF, features (~0.2 MB per plan),
   analysis graphs and cached Gemini answers, without any eviction. Everything in it can be rebuilt from Supabase,
   so pruning old files is safe. Container logs are rotated (5 × 20 MB per service).
 - **Supabase outage.** Analyses are also saved locally (`dataset/cache/plan-graphs/`), and questions keep working
   from there. Corrections, scale, outlines and new uploads need Supabase.
-- **Backend replicas.** The analysis lock, the job limit and the Gemini cap live in one process. Add a shared queue,
-  lock and cache before running more than one backend container or uvicorn worker.
+- **Backend replicas.** The job queue, the slot limit and the Gemini cap live in one process. Add a shared queue
+  and cache before running more than one backend container or uvicorn worker.
 - **No accounts.** Anyone with a plan's URL can view, ask, correct and recalibrate it. Plan ids are random UUIDs, but
   links are shareable. Add Supabase Auth and per-user policies before handling private plans.
 - **Public IP.** It lives as long as the instance. If it changes, update `SITE_ADDRESS` in `.env`, the

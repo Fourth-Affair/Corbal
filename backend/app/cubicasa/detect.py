@@ -9,7 +9,6 @@ counting:    per-template fusion models (app.cubicasa.fit) over the evidence fea
 
 import json
 import logging
-import time
 from functools import lru_cache
 
 import joblib
@@ -25,6 +24,8 @@ from app.cubicasa.fit import FEATURE_VERSION, FUSION_PATH, _predict
 from app.cubicasa.fuse import ICON, ROOM, components, image_features
 from app.cubicasa.rooms_dict import room_type
 from app.models import PlanGraph, PlanItem, PlanOutline
+from app import profiling
+from app.profiling import stage
 
 ICON_ITEMS = {"window": ("window", ""), "door": ("door", ""), "toilet": ("fixture", "toilet"),
               "sink": ("fixture", "sink"), "bathtub": ("fixture", "bathtub"), "sauna_bench": ("fixture", "sauna_bench")}
@@ -236,35 +237,37 @@ def room_outline_candidates(rel: str) -> list[PlanOutline]:
 
 
 def graph_from_image(rel: str, path) -> PlanGraph:
-    started = time.perf_counter()
-    stages: dict[str, float] = {}
+    """PlanGraph of an image plan. Stages are recorded into the active profile (app.profiling); without one, the
+    timings are logged here."""
+    if profiling.active() is None:
+        with profiling.Profile(sample_rss=False) as prof:
+            graph = _graph_from_image(rel, path)
+        log.info("image analysis profile image=%s %s", rel, prof.to_json())
+        return graph
+    return _graph_from_image(rel, path)
 
-    def timed(stage, operation):
-        stage_started = time.perf_counter()
-        try:
-            return operation()
-        finally:
-            stages[stage] = time.perf_counter() - stage_started
 
-    img = timed("image_load", lambda: Image.open(path).convert("RGB"))
-    timed("perception", lambda: compute(rel, img))  # cached perception outputs
-    f = timed("feature_extraction", lambda: image_features(rel))
-    dets = timed("symbol_detection", lambda: symdet.detect(rel, img) if symdet.available() else None)
+def _graph_from_image(rel: str, path) -> PlanGraph:
+    with stage("image_load"):
+        img = Image.open(path).convert("RGB")
+    with stage("perception"):
+        compute(rel, img)  # cached perception outputs
+    with stage("features"):
+        f = image_features(rel)
+    with stage("symbols"):
+        dets = symdet.detect(rel, img) if symdet.available() else None
     if dets is not None:
         f.update(symdet.det_features(dets))
     elif _bundle().get("symdet"):
         raise FileNotFoundError("fusion models need the symbol detector (models/symbol-det.onnx)")
     counts = {}
-    def predict_counts():
+    with stage("counts"):
         for t, spec in _fusion().items():
             X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
             counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
-    timed("count_prediction", predict_counts)
-
-    def find_outlines():
+    with stage("floor_outlines"):
         with np.load(feature_paths(rel)[0]) as z:
-            return _floor_outline_candidates(z["rooms"], z["rooms_conf"])
-    floor_outlines = timed("floor_outlines", find_outlines)
+            floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
     floor_items = []
     for outline in floor_outlines:
         xs, ys = zip(*outline.polygon)
@@ -275,9 +278,7 @@ def graph_from_image(rel: str, path) -> PlanGraph:
             polygon=outline.polygon,
             score=outline.score,
         ))
-    items = timed("evidence_assembly", lambda: _evidence(rel, dets) + floor_items)
-    graph = timed("graph_build", lambda: PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
-                                                    counts=counts, floor_outlines=floor_outlines))
-    log.info("image analysis timing image=%s stages_s=%s total_s=%.3f", rel,
-             {name: round(seconds, 3) for name, seconds in stages.items()}, time.perf_counter() - started)
-    return graph
+    with stage("evidence"):
+        items = _evidence(rel, dets) + floor_items
+    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
+                     counts=counts, floor_outlines=floor_outlines)

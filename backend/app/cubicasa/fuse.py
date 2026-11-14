@@ -20,7 +20,6 @@ ICON = {"window": 1, "door": 2, "closet": 3, "appliance": 4, "toilet": 5, "sink"
 ROOM = {"background": 0, "outdoor": 1, "wall": 2, "kitchen": 3, "living": 4, "bedroom": 5, "bath": 6,
         "entry": 7, "railing": 8, "storage": 9, "garage": 10, "undefined": 11}
 ICON_PROB = (1, 2, 5, 6, 7, 9)  # same order as features.ICON_PROB_CLASSES
-VARIANTS = ["colorful", "high_quality", "high_quality_architectural"]
 OCR_TYPES = ["bedroom", "bathroom", "wc", "sauna", "kitchen", "living", "balcony", "other"]
 
 
@@ -35,9 +34,18 @@ def components(mask: np.ndarray, conf: np.ndarray | None = None):
     lab, n = ndimage.label(mask)
     if n == 0:
         return lab, np.zeros(0), np.zeros(0), []
-    idx = np.arange(1, n + 1)
-    sizes = ndimage.sum(np.ones_like(lab, dtype=np.float32), lab, idx)
-    mconf = ndimage.mean(conf.astype(np.float32), lab, idx) / 255 if conf is not None else np.ones(n)
+    # Same numbers as ndimage.sum / ndimage.mean over labels 1..n (which bincount every pixel of the map, four passes
+    # per call: ~11 s on a 12 MP plan), counting only the labelled pixels. Each label's sum still accumulates its own
+    # pixels in the same order, so the means are bit-identical (the fusion models depend on these features).
+    flat = lab.ravel()
+    on = flat > 0
+    labs = flat[on]
+    counts = np.bincount(labs, minlength=n + 1)[1:]
+    sizes = counts.astype(np.float64)
+    if conf is not None:
+        mconf = np.bincount(labs, weights=conf.ravel()[on].astype(np.float32), minlength=n + 1)[1:] / counts / 255
+    else:
+        mconf = np.ones(n)
     boxes = ndimage.find_objects(lab)
     return lab, sizes, mconf, boxes
 
@@ -49,9 +57,9 @@ def image_features(rel: str) -> dict:
     H, W = icons.shape
     area = float(H * W)
     f: dict[str, float] = {"W": W, "H": H, "log_area": np.log(area), "aspect": W / H}
-    variant = rel.rsplit("/", 1)[-1].rsplit("-", 1)[0]
-    for v in VARIANTS:
-        f[f"var_{v}"] = float(variant == v)
+    # No features from the file name: the dataset names encode the CubiCasa variant ("high_quality-8033.png"), an
+    # upload's name does not. The fusion models fitted before 2026-11-15 still list var_* keys; they now always read 0,
+    # as they did for uploads (measured on the 241 preview plans: 2 of 2892 counts change, accuracy equal).
 
     # ---- icons
     for name, k in ICON.items():

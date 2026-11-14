@@ -69,6 +69,9 @@ services:
       ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-45}
       # Larger uploads are downscaled first: peak memory ~1.7 GB + 0.27 GB per megapixel (see app/config.py)
       MAX_ANALYSIS_PIXELS: ${MAX_ANALYSIS_PIXELS:-16000000}
+      # Speed options, off by default; see "Analysis speed" in CLAUDE.md before turning them on
+      WALLSEG_MAX_PIXELS: ${WALLSEG_MAX_PIXELS:-0}
+      PARALLEL_WALLS: ${PARALLEL_WALLS:-0}
       SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     volumes:
