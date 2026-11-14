@@ -5,6 +5,8 @@
   uv run python -m app.bench run --set fast --answerer template      # offline: router + template counter
   uv run python -m app.bench run --set fast --source svg --answerer template  # oracle (labels; upper bound)
   uv run python -m app.bench run --set fast --no-cache --label rerun  # fresh Gemini answers (run-to-run noise)
+  uv run python -m app.bench run --set fast --kind open              # breadth only: the open questions
+  uv run python -m app.bench run --set fast --kind open --source svg --answerer agent  # same, perfect perception
   uv run python -m app.bench report dataset/runs/bench/<run>.jsonl
   uv run python -m app.bench diff <runA>.jsonl <runB>.jsonl --show 20  # paired delta, 95% CI, flipped questions
   uv run python -m app.bench perception --set fast                   # no questions, no LLM: evidence vs SVG labels
@@ -17,10 +19,15 @@ Sets (deterministic from --seed; stored under dataset/, never committed):
   types without a parser (.ifc) show up as 0% coverage, so the blind spot stays visible.
 - paraphrases (app.answering.paraphrases) on test images: unseen wordings and languages. Ground truth = the SVG
   label count for the expected template; trap / out-of-scope questions expect not_found.
+- open questions (app.answering.openq) on test images: questions no count template covers (items in one room, rooms
+  that have something, yes/no, comparisons, sums, adjacency, relative size) in EN / FI / SV, with the answer computed
+  from the SVG labels. This is the breadth measure: the report has a table per question family, and
+  `--source svg --answerer agent` shows how far the agent gets with perfect perception.
 
 Scoring: counts exact, other numbers within --tol relative error (areas, lengths, volumes; default 2%, the
 challenge rule), short text answers
-normalised string match (yes/no in any language), long free-text answers are not scored (coverage only).
+normalised string match, long free-text answers are not scored (coverage only). When yes or no is expected, the
+answer's first word decides ("Kyllä, keittiössä on ikkuna" = yes).
 A not_found is never correct unless the expected answer is "not answerable". Accuracy = correct / scored;
 precision = correct / answered, so a tweak that trades honest misses for wrong answers shows up.
 The first headline weights each dataset's accuracy by its share of questions.jsonl (the samples here are not
@@ -49,8 +56,9 @@ BENCH_DIR = Path(os.environ.get("BENCH_DIR", CACHE_DIR.parent / "bench"))
 RUNS_DIR = Path(os.environ.get("BENCH_RUNS_DIR", CACHE_DIR.parent / "runs" / "bench"))
 
 SETS = {  # cubicasa test images, paraphrase rounds (one image per paraphrase per round), per other dataset
-    "fast": {"cubicasa_images": 16, "paraphrase_rounds": 1, "per_dataset": 10},
-    "full": {"cubicasa_images": 0, "paraphrase_rounds": 5, "per_dataset": 100},  # 0 = all test images
+    # open_per_family: open questions (app.answering.openq) per question family
+    "fast": {"cubicasa_images": 16, "paraphrase_rounds": 1, "per_dataset": 10, "open_per_family": 9},
+    "full": {"cubicasa_images": 0, "paraphrase_rounds": 5, "per_dataset": 100, "open_per_family": 60},  # 0 = all test images
 }
 CONFIDENCES = ["high", "medium", "low", "not_found"]
 
@@ -77,6 +85,15 @@ def lang_of(question: str) -> str:
 
 _YES = {"yes", "kyllä", "ja", "joo", "oui", "sí", "si", "true"}
 _NO = {"no", "ei", "nej", "nein", "non", "false"}
+_YES_LEAD = _YES | {"on", "jo", "finns"}  # "On." / "Jo, det finns ..." open a yes; only checked on a first word
+
+
+def _polarity(v) -> str | None:
+    """yes / no from the first word of an answer sentence, None if it does not start with either."""
+    words = re.findall(r"\w+", str(v).lower())
+    if not words:
+        return None
+    return "yes" if words[0] in _YES_LEAD else "no" if words[0] in _NO else None
 
 
 def _norm_text(v) -> str:
@@ -116,6 +133,8 @@ def score(item: dict, pred, tol: float) -> bool | None:
         return abs(p - e) <= tol * max(abs(e), 1e-9)
     if len(str(exp)) > 40 or "\n" in str(exp):
         return None
+    if _norm_text(exp) in ("yes", "no"):
+        return _polarity(pred) == _norm_text(exp)
     return _norm_text(pred) == _norm_text(exp)
 
 
@@ -175,7 +194,8 @@ def build(seed: int) -> None:
     def item(q, kind, dataset, template=None):
         return {"id": _qid(q["path"], q["question"]), "kind": kind, "dataset": dataset, "path": q["path"],
                 "question": q["question"], "answer": q["answer"], "unit": q.get("unit"), "type": q.get("type"),
-                "lang": lang_of(q["question"]), "template": template}
+                "lang": q.get("lang") or lang_of(q["question"]), "template": template,
+                **({"family": q["family"], "asks": q["asks"]} if "family" in q else {})}
 
     BENCH_DIR.mkdir(parents=True, exist_ok=True)
     for name, cfg in SETS.items():
@@ -210,6 +230,19 @@ def build(seed: int) -> None:
             qs = sorted(by_ds[ds], key=lambda q: _qid(q["path"], q["question"]))
             rng.shuffle(qs)
             items += [item(q, "dataset", ds) for q in qs[: cfg["per_dataset"]]]
+
+        if cfg.get("open_per_family"):  # open questions: truth from the SVG labels of the test images
+            from app.answering import openq
+
+            labelled = {}
+            for p in cubi_test:
+                try:
+                    labelled[p] = get_graph(p, "svg")
+                except FileNotFoundError:
+                    pass
+            # own generator: adding or changing open questions leaves the rest of the set as it was
+            open_rng = random.Random(f"{seed}-{name}-open")
+            items += [item(q, "open", "open") for q in openq.sample(labelled, cfg["open_per_family"], open_rng)]
 
         out = BENCH_DIR / f"{name}.jsonl"
         out.write_text("".join(json.dumps(it, ensure_ascii=False) + "\n" for it in items))
@@ -277,7 +310,7 @@ def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dic
 
     num = _num(res.answer)
     rec.update(pred=res.answer, unit=res.unit, template=res.template, confidence=res.confidence,
-               answered_by=res.answered_by, n_citations=len(res.citations),
+               answered_by=res.answered_by, n_citations=len(res.citations), clarification=res.clarification_needed,
                # cited evidence exists in the plan, and a non-zero count has at least one cited item
                citations_ok=(ids is None or all(c.id in ids for c in res.citations))
                and not (num and not res.citations))
@@ -285,7 +318,7 @@ def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dic
 
 
 def run(set_name: str, answerer: str, source: str, use_cache: bool, workers: int, tol: float, label: str,
-        limit: int) -> Path:
+        limit: int, kind: str = "") -> Path:
     from app.cubicasa import graph as graph_mod
     from app.cubicasa.graph import get_graph
 
@@ -294,6 +327,8 @@ def run(set_name: str, answerer: str, source: str, use_cache: bool, workers: int
     if not set_path.is_file():
         raise SystemExit(f"{set_path} missing: run `python -m app.bench build` first")
     items = _read_jsonl(set_path)
+    if kind:
+        items = [it for it in items if it["kind"] == kind]
     if limit:
         items = items[:limit]
     set_hash = hashlib.sha1(set_path.read_bytes()).hexdigest()[:12]
@@ -443,6 +478,12 @@ def report(path: Path) -> None:
         else:  # other datasets have no expected template: group by the one the parser chose
             tmpl[f"{it['dataset'][:5]}:{r.get('template') or '(none)'}"[:28]].append((it, r))
     _table("template", tmpl)
+    fam = defaultdict(list)
+    for it, r in rs:
+        if it["kind"] == "open":
+            fam[it["family"]].append((it, r))
+    if fam:
+        _table("open question family", fam)
     _table("language", {k: [x for x in rs if x[0]["lang"] == k] for k in {it["lang"] for it, _ in rs}})
 
     print(f"\n{'confidence':<16}{'n':>6}{'acc':>8}   (calibration: high should be ~always right)")
@@ -469,6 +510,9 @@ def report(path: Path) -> None:
     if lat:
         print(f"  latency p50/p95          {lat[len(lat) // 2]:.2f}s / {lat[int(len(lat) * 0.95) - 1]:.2f}s   "
               f"wall {m.get('duration_s')}s")
+    asked_back = sum(bool(r.get("clarification")) for _, r in rs)
+    if asked_back:
+        print(f"  asked a follow-up instead  {asked_back}  (counted as not answered)")
     unscored = sum(r["correct"] is None for _, r in rs)
     if unscored:
         print(f"  unscored (free text)     {unscored}")
@@ -507,6 +551,8 @@ def diff(path_a: Path, path_b: Path, show: int) -> None:
     print()
     for t in sorted({items[i]["template"] for i in ids if items[i]["template"]}):
         line(t, [i for i in ids if items[i]["template"] == t])
+    for f in sorted({items[i]["family"] for i in ids if items[i].get("family")}):
+        line(f, [i for i in ids if items[i].get("family") == f])
 
     cov = lambda rs, sel: sum(rs[i]["pred"] is not None for i in sel) / max(1, len(sel))  # noqa: E731
     print(f"\ncoverage {cov(a, ids):.1%} -> {cov(b, ids):.1%}")
@@ -536,6 +582,8 @@ def main() -> None:
     p.add_argument("--tol", type=float, default=0.02, help="relative tolerance for non-count numbers")
     p.add_argument("--label", default="")
     p.add_argument("--limit", type=int, default=0, help="first N questions only (smoke test)")
+    p.add_argument("--kind", choices=["dataset", "paraphrase", "open"], default="",
+                   help="only this kind of question, e.g. open = the breadth questions")
     p = sub.add_parser("perception", help="deterministic: model evidence vs SVG labels (no questions, no LLM)")
     p.add_argument("--set", default="fast", help="images of this set (cubicasa test split)")
     p.add_argument("--limit", type=int, default=0, help="first N images only")
@@ -552,7 +600,8 @@ def main() -> None:
     if args.cmd == "build":
         build(args.seed)
     elif args.cmd == "run":
-        run(args.set, args.answerer, args.source, not args.no_cache, args.workers, args.tol, args.label, args.limit)
+        run(args.set, args.answerer, args.source, not args.no_cache, args.workers, args.tol, args.label, args.limit,
+            args.kind)
     elif args.cmd == "perception":
         from app import bench_perception
 

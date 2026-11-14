@@ -1,7 +1,9 @@
 """Hand-written question paraphrases with expected templates (EN slang, FI, SV, traps, out of scope).
 
-Used by scripts/routing_experiment.py and the benchmark (app.bench). "none" = unsupported: the answer must be
-not_found.
+Used by scripts/routing_experiment.py and the benchmark (app.bench). "none" = the answer must be not_found: only
+questions a plan image cannot answer belong here (areas and widths without a scale, things that are not drawn).
+Questions that are merely outside the count templates ("how many sinks are in the kitchen?") are answerable and
+are scored against the labels in app.answering.openq instead.
 """
 
 # (question, accepted labels). "none" = must not call the tool.
@@ -47,25 +49,16 @@ PARAPHRASES: list[tuple[str, set[str]]] = [
     ("Hur många badrum finns det, separata WC ej medräknade?", {"bathrooms"}),
     ("Hur många separata WC finns det?", {"wc_rooms"}),
     ("Hur många balkonger finns det?", {"balconies"}),
-    # traps: keywords of one template, but asking another / a composition / something unsupported
+    # traps: keywords of one template, but asking for something a plan without a scale cannot answer
     ("What is the area of the kitchen?", {"none"}),
     ("How wide is the front door?", {"none"}),
-    ("Are there windows in the bedroom?", {"none"}),
-    ("How many sinks are there in the bathroom?", {"none"}),
-    ("How many bathrooms have a shower?", {"none"}),
-    ("Is the sauna next to the bathroom?", {"none"}),
-    ("How many doors open onto the balcony?", {"none"}),
     ("Mikä on keittiön pinta-ala?", {"none"}),
     ("Hur stor är balkongen i kvadratmeter?", {"none"}),
-    ("How many sinks are in the kitchen?", {"none"}),
-    ("Kuinka monta ikkunaa makuuhuoneessa on?", {"none"}),
     # out of scope
     ("What is the total floor area?", {"none"}),
     ("What scale is this drawing?", {"none"}),
     ("How many radiators are shown?", {"none"}),
-    ("How many rooms are there in total?", {"none"}),
     ("Kuinka monta neliötä asunnossa on?", {"none"}),
     ("Who drew this plan?", {"none"}),
     ("How many parking spaces are there?", {"none"}),
-    ("Hur många rum finns det?", {"none"}),
 ]

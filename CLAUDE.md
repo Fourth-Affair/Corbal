@@ -12,6 +12,15 @@ from** (file, sheet/page, region, or BIM element) so a human can verify it in se
 approaches that won't be obsoleted by next year's frontier models: hybrids of LLMs + deterministic
 parsing, computer vision, geometry/3D, or small fine-tuned models.
 
+## What we are optimising for
+
+**The goal is to handle a wide variety of natural-language questions, not to get the best possible
+score on the dataset.** The dataset questions come from a handful of templates; real users will
+phrase things differently and ask things no template covers. When the two pull apart, prefer the
+change that makes the system answer more kinds of questions (general tools, robust question
+understanding, honest "not found") over one that squeezes out dataset accuracy with template- or
+dataset-specific rules. The benchmark is a regression check, not the objective.
+
 ## Design principles (apply these when making decisions)
 
 1. **Evidence first, LLM second.** Extract everything we can deterministically (vector text with
@@ -25,7 +34,10 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
 4. **Vision on crops, not pages.** When raster/VLM analysis is needed, send zoomed regions with
    known coordinates, so the result maps back to a bbox.
 5. **Say "not found."** A confident wrong answer is worse than an honest miss.
-6. **Measure.** The example questions are the eval set; every pipeline change gets run against it.
+6. **Measure, but don't overfit.** The example questions are the eval set and every pipeline change
+   gets run against it to catch regressions. A higher score is not the aim in itself: also test
+   paraphrases and question types outside the dataset templates, and don't add rules that only
+   serve the dataset's phrasings.
 
 ## Repo layout
 
@@ -41,7 +53,12 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     (`GEMINI_TIMEOUT_S` per call, default 30). Yes/no answers are linked to, and checked against, a count_template
     result. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
   - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
-    counts), `list_items`, `items_in` (bbox containment; a room label uses the room region around it).
+    counts), `list_items`, `items_in` (containment by the room's outline when it has one: fixtures by centre, doors
+    and windows when they run along it; bounding box otherwise; a room label uses the room region around it),
+    `calculate` (add / subtract; every operand must be a number an earlier tool call returned, the answer takes the
+    confidence of its least reliable operand and cites the operands' items). Room regions of the image pipeline
+    carry their segmentation outline (`GRAPH_VERSION` in `graph.py` is part of the graph cache key: bump it when
+    `graph_from_image` changes what it stores).
   - `scripts/routing_experiment.py` — Gemini tool choice vs router on dataset phrasings + paraphrases.
   - `app/cubicasa/` — cubicasa5k pipeline:
     - perception: `cubinet.py` (CubiCasa5K pretrained multi-task net, vendored in `vendor/floortrans`, CC BY-NC)
@@ -78,6 +95,20 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     image-bootstrap CI, coverage, precision, calibration per confidence, citation validity, EN/FI consistency,
     latency. Numbers within 2% (`--tol`, the challenge rule). First headline = dataset accuracies weighted by their
     share of `questions.jsonl`. `diff` gives paired deltas with CIs and the flipped questions.
+  - `app/answering/openq.py` — the breadth measure: "open" questions no count template covers, written for a
+    labelled plan in EN / FI / SV with the answer computed from the SVG labels. Nine families: `in_room_count`
+    (sinks in the kitchen), `in_room_yesno`, `rooms_with` (bathrooms that have a window), `plan_yesno`,
+    `compare_yesno` (more windows than doors?), `arithmetic` (sum / difference of two counts), `subtype_count`
+    (bathtubs only), `adjacent_yesno`, `size_yesno`. A question is only generated where the labels give one
+    defensible answer (one room of that type, no corner-clipping windows, clear wall / clear gap, 1.5x area).
+    In the bench sets as kind `open` (fast 81, full 540), reported per family. Baseline on fast (2026-11-14):
+    offline template path 5%, agent 58% (coverage 72%, precision 81%), agent on SVG labels 79% (precision 97%).
+    After adding `calculate` and outline containment: agent on SVG labels 93% (`arithmetic` 22% -> 100%,
+    `in_room_count` 56% -> 89%); agent on the real pipeline 59% (coverage 78%), within noise of before: what is
+    left there is perception (door / window counts, rough room regions) and Gemini runs that end without a final
+    answer and fall back to the template counter. With 9 questions per family the fast set only shows large
+    effects; use `--set full --kind open` to compare small ones. `paraphrases.py` keeps only traps that a plan
+    without a scale cannot answer.
   - `app/bench_perception.py` — `bench perception`: deterministic, no questions / router / LLM. Model PlanGraph vs
     SVG labels on the set's cubicasa test images: symbol boxes (one-to-one IoU matching -> precision/recall/F1 per
     class), rooms (centre-in-room), fusion counts exact per template, `--walls` wall F1. Seconds on cached graphs.
@@ -107,12 +138,15 @@ uv run python -m app.cubicasa.fit --test --fit-on train+val          # CV on val
 uv run python -m app.cubicasa.fit --test --final --fit-on train+val  # + save fusion models -> models/
 uv run python -m app.eval --method model --split test       # end-to-end score through the runtime path
 
-# benchmark (every pipeline change): fast ≈ 390 q (~6 min with the agent, CI ±6 pts), full ≈ 7.4k q
+# benchmark (every pipeline change): fast ≈ 460 q (~6 min with the agent, CI ±6 pts), full ≈ 7.9k q
 uv run python -m app.bench build                            # once (deterministic)
 uv run python -m app.bench run --set fast                   # API path: agent + fallback (--answerer template = offline)
 uv run python -m app.bench run --set fast --no-cache --label rerun   # fresh Gemini answers: measures noise
 uv run python -m app.bench diff <runA.jsonl> <runB.jsonl>   # paired delta, 95% CI, broke/fixed questions
 uv run python -m app.bench run --set fast --answerer template   # no Gemini: router + counters + PDF parser (~10 s)
+uv run python -m app.bench run --set fast --kind open           # breadth only: the open questions (~4 min)
+uv run python -m app.bench run --set fast --kind open --source svg --answerer agent   # same with perfect perception:
+                                                            # what is left is question understanding and tools
 uv run python -m app.bench perception --set fast [--walls]  # no questions at all: evidence boxes/rooms/counts vs SVG
                                                             # labels (diff works on these runs too)
 
