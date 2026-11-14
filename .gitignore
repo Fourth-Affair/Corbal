@@ -18,3 +18,4 @@ dataset/
 # Model weights
 *.pt
 stoa-share.zip
+junction-dataset*.zip

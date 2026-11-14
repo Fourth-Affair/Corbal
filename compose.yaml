@@ -24,7 +24,7 @@ services:
       DATASET_DIR: /dataset/junction-dataset
       CUBICASA_ORIG_DIR: /dataset/cubicasa5k-original/cubicasa5k
       CACHE_DIR: /dataset/cache
-      CUBICASA_WEIGHTS: /dataset/models/cubicasa-seg.pt
+      MODELS_DIR: /dataset/models
       PLAN_SOURCE: ${PLAN_SOURCE:-model}
     volumes:
       - ./backend:/app

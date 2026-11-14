@@ -18,13 +18,13 @@ from concurrent.futures import ProcessPoolExecutor
 import joblib
 import numpy as np
 
-from app.config import CACHE_DIR, MODEL_WEIGHTS
+from app.config import CACHE_DIR, MODELS_DIR
 from app.cubicasa.features import feature_paths
 from app.router import route
 
 warnings.filterwarnings("ignore")
 TABLE = CACHE_DIR / "features_table.jsonl"
-FUSION_PATH = MODEL_WEIGHTS.parent / "cubicasa-fusion.joblib"
+FUSION_PATH = MODELS_DIR / "cubicasa-fusion.joblib"
 FEATURE_VERSION = 10
 TEMPLATES = ["windows", "doors", "floors", "wc_seats", "sinks", "showers_baths", "saunas", "kitchens",
              "bedrooms", "bathrooms", "wc_rooms", "balconies"]
@@ -57,7 +57,27 @@ def build_table(paths: list[str]) -> dict[str, dict]:
                     continue
                 table[rel] = f
                 out.write(json.dumps({"path": rel, "v": FEATURE_VERSION, "f": f}) + "\n")
+    _add_det_features(table)
     return table
+
+
+def _add_det_features(table: dict[str, dict]) -> None:
+    """Merge symbol-detector features (cached separately, see app.cubicasa.symdet) into every row.
+
+    All-or-nothing: rows without cached detections would read as zero counts and poison the fit."""
+    from app.cubicasa import symdet
+
+    if not symdet.available():
+        return
+    dets = {p: symdet.cached(p) for p in table}
+    missing = [p for p, d in dets.items() if d is None]
+    if missing:
+        print(f"symbol detector: {len(missing)}/{len(table)} images lack cached detections "
+              f"(run: python -m app.cubicasa.symdet); fitting WITHOUT det_* features")
+        return
+    for p, d in dets.items():
+        table[p] = {**table[p], **symdet.det_features(d)}
+    print(f"symbol detector: added det_* features for {len(table)} images ({symdet.fingerprint()})")
 
 
 def dataset(table, qs, paths, template):
@@ -235,7 +255,11 @@ def main() -> None:
         print(f"TEST overall exact: {sum(hit_t.values()) / sum(tot_t.values()):.1%} over {sum(tot_t.values())} questions")
     if args.final:
         FUSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"version": FEATURE_VERSION, "templates": saved}, FUSION_PATH)
+        from app.cubicasa import symdet
+
+        uses_det = any(k.startswith("det_") for spec in saved.values() for k in spec["keys"])
+        joblib.dump({"version": FEATURE_VERSION, "symdet": symdet.fingerprint() if uses_det else None,
+                     "templates": saved}, FUSION_PATH)
         print("saved", FUSION_PATH)
 
 

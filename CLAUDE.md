@@ -37,12 +37,25 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     - evidence → counts: `fuse.py` (component counts, probability-threshold counts, heatmap peaks, OCR labels via
       `rooms_dict.py`), `fit.py` (per-template rule / gradient-boosting models, fitted on val with K-fold CV,
       reported on test), `detect.py` (runtime: PlanGraph with evidence items + fusion counts).
-    - ground truth: `labels_from_svg.py`; YOLO tooling (`export_yolo.py`, `train.py`, `classes.py`) is unused for now.
+    - symbol detector: `symdet.py` (YOLO11s boxes for door, window, toilet, sink, double sink, shower, bathtub,
+      sauna stove; ONNX on CPU; cached per image, added as `det_*` fusion features and used as citations). Trained
+      via `export_yolo.py` + `train.py`, or `backend/scripts/verda_train.py` (+ `verda_remote.sh`, runs on the VM).
+      Val mAP50: door 0.95, window 0.90, all 0.87. Optional: everything runs without its weights.
+    - walls: `walls.py` (SVG wall polygons as ground truth, wall metrics with 3 px tolerance, scored only on floors
+      whose walls the SVG annotates) and `wallseg.py` (dedicated U-Net wall segmenter: background / solid wall /
+      opening at native resolution, sliding-window inference). CubiCasa net baseline on 60 test plans: wall F1 0.91
+      (median 0.96), weakest on scanned architectural drawings; it paints openings as wall.
+    - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
+      `Layer` response shape; cached per image and weights).
+    - ground truth: `labels_from_svg.py`.
   - `app/eval.py` — exact-match eval per template.
 - `frontend/` — Next.js 15 / React 19 / TypeScript. Calls backend via `BACKEND_URL`.
 - `compose.yaml` — runs both with hot reload; mounts `./dataset` at `/dataset`.
-- `dataset/` (gitignored, never commit) — `junction-dataset/` (challenge data + `questions.jsonl`),
-  `cubicasa5k-original/` (Zenodo 2613548, labels for training only), `cache/`, `yolo-cubicasa/`, `runs/`, `models/`.
+- `dataset/` (gitignored, never commit) — `junction-dataset/` (full challenge data + `questions.jsonl`),
+  `junction-dataset-preview/` (preview release = our test set, never trained on), `cubicasa5k-original/`
+  (Zenodo 2613548, labels + official split for training/eval only), `cache/`, `yolo-cubicasa-det/`, `runs/`,
+  `models/` (`MODELS_DIR`: fusion models, OCR table, `symbol-det.onnx`, `wallseg.pt`).
+- `docs/literature-review.md` — floor-plan recognition since CubiCasa5K and the roadmap.
 
 ## Commands
 
@@ -60,6 +73,21 @@ uv run python -m app.cubicasa.features --splits val test     # cache net maps + 
 uv run python -m app.cubicasa.fit --test --fit-on train+val          # CV on val, score on test
 uv run python -m app.cubicasa.fit --test --final --fit-on train+val  # + save fusion models -> dataset/models/
 uv run python -m app.eval --method model --split test       # end-to-end score through the runtime path
+
+# symbol detector on a Verda GPU VM (VERDA_CLIENT_ID/SECRET in .env). The VM downloads CubiCasa5K itself;
+# the challenge preview images (= test) are held out. VM is deleted at the end unless --keep.
+uv run python scripts/verda_train.py list                   # GPU types, prices, availability
+uv run python scripts/verda_train.py run                    # -> dataset/models/symbol-det.{pt,onnx}
+# local alternative (needs dataset/cubicasa5k-original):
+uv run python -m app.cubicasa.export_yolo --holdout ../dataset/junction-dataset-preview/questions.jsonl
+uv run python -m app.cubicasa.train --device 0 --onnx      # -> dataset/models/symbol-det.{pt,onnx}
+uv run python -m app.cubicasa.symdet --splits train val test # cache detections, then refit (fit --final)
+
+# walls (needs dataset/cubicasa5k-original). Local AMD GPU: ~/.venvs/stoa-rocm (torch rocm7.1), PYTHONPATH=. 
+uv run python -m app.cubicasa.walls --split test --limit 60                  # CubiCasa net wall accuracy
+uv run python -m app.cubicasa.wallseg prepare --holdout ../dataset/junction-dataset-preview/questions.jsonl
+~/.venvs/stoa-rocm/bin/python -m app.cubicasa.wallseg train --device cuda    # -> dataset/models/wallseg.pt
+uv run python -m app.cubicasa.walls --split test --limit 60 --model wallseg  # compare
 ```
 
 Rebuild the Docker image after changing `backend/pyproject.toml` or `frontend/package.json`.
@@ -83,8 +111,10 @@ Rebuild the Docker image after changing `backend/pyproject.toml` or `frontend/pa
 
 Majority baseline 52.8% → pipeline **77.2%** (same number via the runtime path, `app.eval --method model`). Per template: kitchens 95, bathrooms 94, floors 93, saunas 93,
 WC seats 89, WC rooms 85, balconies 84, bedrooms 77, showers+baths 75, sinks 74, doors 51, windows 38.
-Weakest = doors/windows: adjacent symbols merge in the segmentation; a CPU-trained YOLO was too slow to help
-(~100 min/epoch). Next steps: GPU-train an instance detector (door/window/shower) with `export_yolo.py --det`.
+Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: adjacent symbols merge in the
+segmentation. The symbol detector (`symdet.py`) is trained; refitting the counting models with its `det_*`
+features is the next step. 197 of the 241 preview plans are in the official *train* split, so preview scores of
+the counting models are optimistic: report on the official test split.
 
 ## Conventions
 

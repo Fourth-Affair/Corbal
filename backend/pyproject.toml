@@ -17,6 +17,8 @@ dependencies = [
     "scipy>=1.18.1",
     "scikit-image>=0.26.0",
     "scikit-learn>=1.9.1",
+    "onnx>=1.23.2",
+    "segmentation-models-pytorch>=0.6.0",
 ]
 
 # CPU-only torch wheels (no CUDA download). Switch the index to a cu12x one on a GPU box.
@@ -33,6 +35,7 @@ explicit = true
 dev = [
     "httpx>=0.28.1",
     "pytest>=9.2.0",
+    "verda>=1.25.0",
 ]
 
 [tool.uv]

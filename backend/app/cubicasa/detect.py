@@ -1,7 +1,9 @@
 """Image-only runtime parser.
 
-perception:  CubiCasa net (walls/rooms/icons segmentation + junction heatmaps) and rotation-aware OCR
-evidence:    connected components of icon/room classes and dictionary-matched OCR room labels -> PlanItems
+perception:  CubiCasa net (walls/rooms/icons segmentation + junction heatmaps), rotation-aware OCR and,
+             when trained, the symbol detector (app.cubicasa.symdet: doors, windows, fixtures as instances)
+evidence:    detector boxes, connected components of icon/room classes and dictionary-matched OCR room
+             labels -> PlanItems
 counting:    per-template fusion models (app.cubicasa.fit) over the evidence features -> PlanGraph.counts
 """
 
@@ -13,6 +15,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
+from app.cubicasa import symdet
 from app.cubicasa.features import compute, feature_paths
 from app.cubicasa.fit import FEATURE_VERSION, FUSION_PATH, _predict
 from app.cubicasa.fuse import ICON, ROOM, components, image_features
@@ -25,23 +28,46 @@ ROOM_ITEMS = {"bedroom": "bedroom", "bath": "bathroom", "kitchen": "kitchen", "o
 
 
 @lru_cache(maxsize=1)
-def _fusion() -> dict:
+def _bundle() -> dict:
     if not FUSION_PATH.is_file():
         raise FileNotFoundError(f"fusion models not found at {FUSION_PATH} (run: python -m app.cubicasa.fit --final)")
     bundle = joblib.load(FUSION_PATH)
     if bundle["version"] != FEATURE_VERSION:
         raise FileNotFoundError("fusion models are stale; re-run app.cubicasa.fit --final")
-    return bundle["templates"]
+    det = bundle.get("symdet")
+    if det and det != symdet.fingerprint():
+        # det_* features from different weights would silently shift every count
+        raise FileNotFoundError(f"fusion models were fitted with symbol detector {det}, found {symdet.fingerprint()}; "
+                                "restore those weights or re-run app.cubicasa.fit --final")
+    return bundle
 
 
-def _evidence(rel: str) -> list[PlanItem]:
+def _fusion() -> dict:
+    return _bundle()["templates"]
+
+
+def _det_items(dets: list[dict]) -> list[PlanItem]:
+    items = []
+    for k, d in enumerate(dets):
+        if d["conf"] >= symdet.ITEM_CONF and d["cls"] in symdet.DET_ITEMS:
+            cat, cls = symdet.DET_ITEMS[d["cls"]]
+            items.append(PlanItem(id=f"det-{d['cls']}-{k}", category=cat, cls=cls, score=d["conf"],
+                                  bbox=tuple(d["bbox"]), raw="detector"))
+    return items
+
+
+def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
     npz, js = feature_paths(rel)
     z = np.load(npz)
     meta = json.loads(js.read_text())
     icons, iconf, rooms, rconf = z["icons"], z["icons_conf"], z["rooms"], z["rooms_conf"]
     H, W = icons.shape
     items: list[PlanItem] = []
+    if dets is not None:  # detector instances replace segmentation blobs for the classes it knows
+        items += _det_items(dets)
     for name, (cat, cls) in ICON_ITEMS.items():
+        if dets is not None and name in symdet.DET_ITEMS:
+            continue
         _, sizes, mconf, boxes = components(icons == ICON[name], iconf)
         for k, (sz, c, sl) in enumerate(zip(sizes, mconf, boxes)):
             if sz >= 20 and c >= 0.5:
@@ -76,9 +102,14 @@ def graph_from_image(rel: str, path) -> PlanGraph:
     img = Image.open(path).convert("RGB")
     compute(rel, img)  # cached perception outputs
     f = image_features(rel)
+    dets = symdet.detect(rel, img) if symdet.available() else None
+    if dets is not None:
+        f.update(symdet.det_features(dets))
+    elif _bundle().get("symdet"):
+        raise FileNotFoundError("fusion models need the symbol detector (dataset/models/symbol-det.onnx)")
     counts = {}
     for t, spec in _fusion().items():
         X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
         counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
-    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=_evidence(rel),
+    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=_evidence(rel, dets),
                      counts=counts)
