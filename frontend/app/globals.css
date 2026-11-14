@@ -232,6 +232,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .floor-outline-mark { pointer-events: none; }
 .floor-outline-mark polygon { fill: rgba(56, 142, 90, .13); stroke: #348253; stroke-width: 6; vector-effect: non-scaling-stroke; }
 .floor-outline-mark.accepted polygon { fill: rgba(38, 127, 73, .2); stroke: #207541; }
+.floor-outline-mark.rejected polygon { fill: rgba(137, 76, 68, .08); stroke: #8a4c44; stroke-dasharray: 8 5; }
 .floor-outline-mark.editing polygon { fill: rgba(37, 114, 190, .16); stroke: #2474b8; }
 .floor-outline-mark circle { pointer-events: auto; cursor: move; fill: #fff; stroke: #247044; stroke-width: 4; vector-effect: non-scaling-stroke; }
 .room-outline-label rect { fill: #fff; stroke: #247044; stroke-width: 2; vector-effect: non-scaling-stroke; filter: drop-shadow(0 1px 3px rgba(0,0,0,.22)); }
@@ -257,6 +258,12 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .room-review-row .reject-button { color: #8a4c44; }
 .room-review-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .room-review-empty { margin: 0; }
+.room-review-placement { margin: 0; color: #738076; font-size: 11px; line-height: 1.45; }
+.room-review-overlay { overflow: visible; pointer-events: all; }
+.room-review-chip { width: 132px; height: 28px; padding: 2px; display: flex; align-items: center; border: 1px solid rgba(46, 93, 60, .75); border-radius: 6px; background: rgba(255, 255, 255, .96); box-shadow: 0 1px 4px rgba(20, 35, 24, .2); pointer-events: auto; }
+.room-review-chip-actions { width: 100%; display: flex; justify-content: center; gap: 3px; }
+.room-review-chip-actions .toolbar-button { flex: 1; min-width: 0; min-height: 22px; padding: 0 3px; font-size: 8px; white-space: nowrap; }
+.room-review-chip-actions .reject-button { color: #8a4c44; }
 .correction-panel { margin: 12px 14px; padding: 12px; display: flex; flex-direction: column; gap: 10px; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
 .correction-heading, .correction-editor { display: flex; flex-direction: column; gap: 5px; }
 .correction-heading strong, .correction-editor strong { color: #385b43; font-size: 12px; }
