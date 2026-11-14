@@ -60,6 +60,9 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
       `Layer` response shape; cached per image and weights).
     - ground truth: `labels_from_svg.py`.
+    - scale: `dimensions.py` (printed dimension figures + tick-to-tick span of their lines; >= 2 figures agreeing
+      within 4% and inside the door/fixture size band of `size_priors.py`), else written room areas (`rooms.py`,
+      bare decimals under a label count). Dimension lines win; a > 10% disagreement with written areas is a warning.
   - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
     `app/pdfplan/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
     saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.
