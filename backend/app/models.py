@@ -33,6 +33,7 @@ class PlanOutline(BaseModel):
     scope: Literal["floor", "room"] = "floor"
     room_type: str | None = None
     label: str = "Floor"
+    decision: Literal["accepted", "rejected"] | None = None
 
 
 class PlanGraph(BaseModel):

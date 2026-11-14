@@ -230,8 +230,14 @@ def add_plan_correction(plan_id: UUID, req: PlanCorrectionRequest) -> dict:
         if req.action == "update":
             if req.item.category not in ("room", "door", "window", "fixture"):
                 raise HTTPException(status_code=422, detail="Only rooms, doors, windows, and fixtures can be corrected")
-            # Preserve the detection's location and identity; let the reviewer correct its interpretation.
+            if (any(value < 0 for value in req.item.bbox) or req.item.bbox[2] > graph.width or req.item.bbox[3] > graph.height
+                    or req.item.bbox[0] >= req.item.bbox[2] or req.item.bbox[1] >= req.item.bbox[3]):
+                raise HTTPException(status_code=422, detail="Item bounds must be inside the plan image")
+            if req.item.polygon and any(x < 0 or y < 0 or x > graph.width or y > graph.height for x, y in req.item.polygon):
+                raise HTTPException(status_code=422, detail="Item outline must be inside the plan image")
+            # Keep identity and source fields while saving the reviewer's corrected type and geometry.
             after = current.model_copy(update={"category": req.item.category, "cls": req.item.cls,
+                                               "bbox": req.item.bbox, "polygon": req.item.polygon,
                                                "score": None, "user_verified": True}).model_dump(mode="json")
     event = {"plan_id": str(plan_id), "action": req.action, "item_id": item_id,
              "original_item": before, "corrected_item": after}
@@ -482,20 +488,29 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
     graph = _apply_corrections(graph, _corrections_request(plan_id) or [])
     question = req.question.casefold()
-    area_question = any(term in question for term in ("area", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
+    area_question = any(term in question for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
     if area_question:
         if req.scale is None:
             return Answer(answer=None, confidence="not_found", explanation="I need a known distance to establish the drawing scale before estimating floor area.")
-        room_terms = (("living room", "living"), ("kitchen", "kitchen"), ("bedroom", "bedroom"),
-                      ("bathroom", "bathroom"), ("bath", "bathroom"), ("balcony", "balcony"),
-                      ("sauna", "sauna"), ("garage", "garage"), ("storage", "storage"), ("entry", "entry"))
+        room_terms = (("living room", "living"), ("livingroom", "living"), ("kitchen", "kitchen"), ("bedroom", "bedroom"),
+                      ("bathroom", "bathroom"), ("washroom", "bathroom"), ("bath", "bathroom"), ("balcony", "balcony"),
+                      ("sauna", "sauna"), ("garage", "garage"), ("storage", "storage"), ("entry", "entry"),
+                      ("hallway", "entry"), ("wc", "wc"), ("toilet room", "wc"))
         requested_room = next((room_type for term, room_type in room_terms if term in question), None)
         if requested_room:
-            outlines = [outline for outline in req.floor_outlines if outline.scope == "room" and outline.room_type == requested_room]
+            outlines = [outline for outline in req.floor_outlines if outline.scope == "room" and outline.room_type == requested_room and outline.decision != "rejected"]
+            suggested_ids = {outline.id for outline in graph.room_outlines
+                             if outline.scope == "room" and outline.room_type == requested_room}
+            reviewed_ids = {outline.id for outline in req.floor_outlines
+                            if outline.scope == "room" and outline.room_type == requested_room
+                            and outline.decision in ("accepted", "rejected")}
+            if suggested_ids - reviewed_ids:
+                return Answer(answer=None, confidence="not_found",
+                              explanation=f"Some suggested {requested_room} boundaries still need to be reviewed before I can calculate their areas.")
             if not outlines:
                 return Answer(answer=None, confidence="not_found", explanation=f"The {requested_room} boundary still needs to be reviewed or drawn before I can estimate its area.")
         else:
-            outlines = [outline for outline in req.floor_outlines if outline.scope == "floor"]
+            outlines = [outline for outline in req.floor_outlines if outline.scope == "floor" and outline.decision != "rejected"]
             if not outlines:
                 return Answer(answer=None, confidence="not_found", explanation="The drawing scale is available, but a whole-floor boundary still needs to be reviewed or drawn before I can estimate floor area.")
         calibration_pixels = ((req.scale.points[1][0] - req.scale.points[0][0]) ** 2 +
@@ -504,12 +519,19 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
             return Answer(answer=None, confidence="not_found", explanation="The scale reference points are too close together. Please recalibrate using a longer known distance.")
         meters_per_unit = {"m": 1.0, "cm": 0.01, "ft": 0.3048, "in": 0.0254}[req.scale.unit]
         meters_per_pixel = req.scale.distance * meters_per_unit / calibration_pixels
-        pixel_area = 0.0
+        room_areas = []
         for outline in outlines:
             polygon = outline.polygon
-            pixel_area += abs(sum(x * polygon[(index + 1) % len(polygon)][1] - polygon[(index + 1) % len(polygon)][0] * y
-                                  for index, (x, y) in enumerate(polygon))) / 2
-        area = pixel_area * meters_per_pixel * meters_per_pixel
+            pixel_area = abs(sum(x * polygon[(index + 1) % len(polygon)][1] - polygon[(index + 1) % len(polygon)][0] * y
+                                 for index, (x, y) in enumerate(polygon))) / 2
+            room_areas.append((outline, pixel_area * meters_per_pixel * meters_per_pixel))
+        area = sum(value for _, value in room_areas)
+        if requested_room and len(room_areas) > 1:
+            details = "; ".join(f"{outline.label or requested_room} {index + 1}: {value:.1f} m²"
+                                 for index, (outline, value) in enumerate(room_areas))
+            return Answer(answer=details + f". Total: {area:.1f} m².", unit=None, confidence="low",
+                          explanation="Areas are calculated separately from the accepted room outlines and saved drawing scale. Check each highlighted boundary.",
+                          answered_by="template")
         return Answer(answer=round(area, 1), unit="m²", confidence="low",
                       explanation=f"Estimated {outlines[0].label.lower()} area from the saved scale and user-accepted outline. Check the highlighted boundary before relying on this area.",
                       answered_by="template")
