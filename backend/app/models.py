@@ -42,6 +42,13 @@ class AskRequest(BaseModel):
 class PlanQuestionRequest(BaseModel):
     question: str
     history: list["ChatTurn"] = Field(default_factory=list, max_length=40)
+    scale: "PlanScaleCalibration | None" = None
+
+
+class PlanScaleCalibration(BaseModel):
+    points: tuple[tuple[float, float], tuple[float, float]]
+    distance: float = Field(gt=0)
+    unit: Literal["m", "cm", "ft", "in"]
 
 
 class ChatTurn(BaseModel):

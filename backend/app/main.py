@@ -134,13 +134,15 @@ def _scale_request(plan_id: UUID, method: str = "GET", body: dict | None = None)
     headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
     if method == "PUT":
         headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_scales?{query}", data=json.dumps(body).encode() if body else None, headers=headers, method=method)
+    # PostgREST upserts use POST + on_conflict, even though our app endpoint is PUT.
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_scales?{query}", data=json.dumps(body).encode() if body else None, headers=headers, method="POST" if method == "PUT" else "GET")
     try:
         with urlopen(request, timeout=20) as response:
             rows = json.loads(response.read())
         return rows[0] if rows else None
     except HTTPError as error:
-        raise HTTPException(status_code=502, detail="Plan scale request failed") from error
+        reason = error.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Plan scale request failed: {reason or error.reason}") from error
     except (URLError, TimeoutError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
@@ -231,7 +233,7 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
-        if (result := answer(req.question, graph, req.history)) is not None:
+        if (result := answer(req.question, graph, req.history, req.scale)) is not None:
             return result
     return _template_answer(req.question, graph)
 

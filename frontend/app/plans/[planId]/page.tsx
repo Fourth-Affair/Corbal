@@ -133,9 +133,19 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
-      const answer = result.answer === null ? result.explanation : `${result.answer}${result.unit ? ` ${result.unit}` : ""}. ${result.explanation}`;
+      const explanation = typeof result.explanation === "string" ? result.explanation : "";
+      const needsScale = !scale && /(?:no|without|missing|lack(?:s|ing)?|unavailable|cannot|can't|unable to).{0,70}(?:scale|dimension|measurement)|(?:scale|dimension|measurement).{0,70}(?:not available|unavailable|missing|cannot be determined)/i.test(explanation);
+      const answer = needsScale
+        ? "Let’s set the drawing scale first. Click the two ends of a distance you know on the plan, such as a wall with a printed measurement. Then enter that real distance and unit to calibrate the drawing."
+        : result.answer === null ? result.explanation : `${result.answer}${result.unit ? ` ${result.unit}` : ""}. ${result.explanation}`;
       setCitations(Array.isArray(result.citations) ? result.citations : []);
       setMessages(current => [...current, { role: "assistant", text: answer }]);
+      if (needsScale) {
+        setScaleMode(true);
+        setMeasureMode(false);
+        setScalePoints([]);
+        setScaleError(null);
+      }
     } catch (askError) {
       setCitations([]);
       const message = askError instanceof Error ? askError.message : "Could not answer that question";
@@ -206,7 +216,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         </div>
       </header>
       <div className="work-area">
-        <section className="drawing-panel" aria-label="Plan drawing">
+        <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
             imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode ? " scale-selecting" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={markScalePoint} aria-label={scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
               {citations.map((item, index) => {
