@@ -55,3 +55,21 @@ def read_text(img: Image.Image, min_score: float = 0.5) -> list[tuple[str, tuple
         if score >= min_score and text.strip():
             out.append((text.strip(), (x0 / s, y0 / s, x1 / s, y1 / s), score))
     return out
+
+
+def recognise(img: Image.Image, box: tuple[float, float, float, float], vertical: bool,
+              text_height: int = 40) -> tuple[str, float]:
+    """Recognise one known text box (no detection): (text, score) of the better of the two orientations. Used to
+    re-read text the detector split into pieces, e.g. a vertical dimension "3 100" read as "3" and "100"."""
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    crop = img.convert("RGB").crop((max(0, x0), max(0, y0), min(img.width, x1), min(img.height, y1)))
+    if crop.width < 4 or crop.height < 4:
+        return "", 0.0
+    short = crop.width if vertical else crop.height
+    s = max(1.0, text_height / short)
+    if s > 1:
+        crop = crop.resize((round(crop.width * s), round(crop.height * s)), Image.BICUBIC)
+    crops = [np.asarray(crop.rotate(a, expand=True)) for a in ((90, 270) if vertical else (0, 180))]
+    rec, _ = _engine().text_rec(crops)
+    text, score = max(((t, float(sc)) for t, sc in rec), key=lambda r: r[1], default=("", 0.0))
+    return text.strip(), score

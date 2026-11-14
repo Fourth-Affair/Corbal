@@ -57,15 +57,22 @@ type PlanGeometry = {
   model: string;
   rooms: RoomShape[];
   wall_segments: WallSegment[];
-  scale?: { m_per_px: number; source: "calibration" | "written_areas" } | null;
+  // the plan's own scale: printed dimension figures (with the segments they label) or areas written in the rooms
+  scale?: {
+    m_per_px: number;
+    source: "calibration" | "written_areas" | "dimensions";
+    warning?: string | null;
+    dimensions?: Array<{ text: string; value_mm: number; p0: [number, number]; p1: [number, number] }>;
+  } | null;
 };
 
 function roomWhy(room: RoomShape): string {
   const reasons = room.evidence.filter(e => e.type === room.type && e.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3).map(e => e.detail);
   const conflict = room.conflicts.length ? ` · conflicting evidence: ${room.conflicts.join(", ")}` : "";
   const size = room.size_check ? ` · size: ${room.size_check}` : "";
-  const rough = room.area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
-  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + rough;
+  const written = room.labeled_area_m2 != null ? " · area as written on the drawing" : room.area_m2 != null ? " · area measured from the outline" : "";
+  const rough = room.area_m2 == null && room.labeled_area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
+  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + written + rough;
 }
 
 // One colour per purpose; weak rooms are dashed, unknown spaces grey and dashed
@@ -76,11 +83,21 @@ const ROOM_COLOURS: Record<string, string> = {
 };
 
 function roomCaption(room: RoomShape): string {
-  const area = room.area_m2 ?? room.labeled_area_m2;
+  // the area printed on the drawing wins over one measured from the outline
+  const area = room.labeled_area_m2 ?? room.area_m2;
   const what = room.purposes.length > 1 ? room.purposes.join(" + ") : room.type;
   if (area != null) return `${what} · ${area.toFixed(1)} m²`;
   if (room.area_m2_range) return `${what} · ~${Math.round(room.area_m2_range[0])}–${Math.round(room.area_m2_range[1])} m²`;
   return what;
+}
+
+function pointInPolygon(x: number, y: number, polygon: Array<[number, number]>): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i], [xj, yj] = polygon[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
 }
 
 type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };
@@ -961,6 +978,15 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const outlineLabelPoint = (polygon: Array<[number, number]>): [number, number] => polygon.reduce(
     ([sumX, sumY], [x, y]) => [sumX + x / polygon.length, sumY + y / polygon.length], [0, 0] as [number, number]);
   const selectedEvidence = evidenceItems.find(item => item.id === selectedEvidenceId) ?? null;
+  // OCR text boxes are tiny and read as noise: they stay evidence for the backend but are not shown or reviewed
+  const reviewItems = evidenceItems.filter(item => item.raw !== "ocr");
+  // a cited OCR label is shown as the room it names (the space containing the text), else as its text box
+  const shownCitation = (item: PlanCitation): PlanCitation => {
+    if (item.raw !== "ocr" || !geometry) return item;
+    const cx = (item.bbox[0] + item.bbox[2]) / 2, cy = (item.bbox[1] + item.bbox[3]) / 2;
+    const room = geometry.rooms.find(room => pointInPolygon(cx, cy, room.polygon));
+    return room ? { ...item, bbox: room.bbox, polygon: room.polygon } : item;
+  };
 
   const imageStatus = plan?.plan_images?.find(image => image.role === "source")?.upload_status;
   return (
@@ -978,9 +1004,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             {geometry.wall_segments.length > 0 && <button type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)}>{showWalls ? "✓ " : ""}Walls ({geometry.wall_segments.length})</button>}
           </div></details>}
           {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
-          {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale set</span>}
-          {ready && scaleLoaded && !scaleMode && !scale && <button className="toolbar-button primary-button" type="button" onClick={startScaleCalibration}>Set scale</button>}
-          {ready && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
+          {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
+          {ready && scaleLoaded && !scale && geometry?.scale && geometry.scale.source !== "calibration" && <span className="scale-status" title={`${(geometry.scale.m_per_px * 1000).toFixed(2)} mm per pixel${geometry.scale.warning ? ` · ${geometry.scale.warning}` : ""}`}>{geometry.scale.source === "dimensions" ? `Scale read from ${geometry.scale.dimensions?.length ?? 0} dimension lines` : "Scale from written room areas"}{geometry.scale.warning ? " (check)" : ""}</span>}
+          {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
+          {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
           {correctionMode && <button className="toolbar-button" type="button" onClick={() => { setCorrectionMode(false); setCorrectionAddMode(false); setSelectedEvidenceId(null); }}>Done reviewing</button>}
           {referenceMode && <button className="toolbar-button" type="button" onClick={() => { setReferenceMode(false); setReferenceDragStart(null); setReferenceDragEnd(null); }}>Cancel reference</button>}
           {outlineMode && <button className="toolbar-button" type="button" onClick={() => setOutlineMode(false)}>Cancel outline</button>}
@@ -999,6 +1026,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
             imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}${referenceMode ? " reference-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerDown={event => { if (referenceMode) { const point = planPoint(event); if (point) { setReferenceDragStart(point); setReferenceDragEnd(point); event.currentTarget.setPointerCapture(event.pointerId); } } }} onPointerMove={event => { if (referenceMode && referenceDragStart) { const point = planPoint(event); if (point) setReferenceDragEnd(point); } else if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={referenceMode ? "Click an item or drag to reference an area" : correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}${referenceMode ? " reference-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerDown={event => { if (referenceMode) { const point = planPoint(event); if (point) { setReferenceDragStart(point); setReferenceDragEnd(point); event.currentTarget.setPointerCapture(event.pointerId); } } }} onPointerMove={event => { if (referenceMode && referenceDragStart) { const point = planPoint(event); if (point) setReferenceDragEnd(point); } else if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={referenceMode ? "Click an item or drag to reference an area" : correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
               {drawingReferences.map((reference, index) => <g className="drawing-reference-mark" key={`reference-${index}`}><rect x={reference.bbox[0]} y={reference.bbox[1]} width={Math.max(1, reference.bbox[2] - reference.bbox[0])} height={Math.max(1, reference.bbox[3] - reference.bbox[1])} rx="3"/><text x={reference.bbox[0] + 4} y={reference.bbox[1] - 4}>{index + 1}</text></g>)}
               {animationStage !== null && geometry && <g className={`analysis-animation stage-${animationStage}`} aria-hidden="true">
                 {animationStage >= 0 && geometry.wall_segments.map((segment, index) => <line className="animated-wall" key={segment.id} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]} pathLength="1" style={{ animationDelay: `${Math.min(900, index * 18)}ms` }} />)}
@@ -1006,7 +1034,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 {animationStage >= 2 && evidenceItems.filter(item => item.category !== "room").map((item, index) => { const [x0, y0, x1, y1] = item.bbox; return <g className="animated-evidence" key={item.id} style={{ animationDelay: `${Math.min(1000, index * 35)}ms` }}><circle cx={(x0 + x1) / 2} cy={(y0 + y1) / 2} r={Math.max(7, Math.min(16, (x1 - x0 + y1 - y0) / 5))} /><text x={(x0 + x1) / 2} y={(y0 + y1) / 2}>{item.cls === "window" ? "W" : item.category === "door" ? "D" : "•"}</text></g>; })}
               </g>}
               {referenceMode && referenceDragStart && referenceDragEnd && <rect className="drawing-reference-preview" x={Math.min(referenceDragStart[0], referenceDragEnd[0])} y={Math.min(referenceDragStart[1], referenceDragEnd[1])} width={Math.abs(referenceDragEnd[0] - referenceDragStart[0])} height={Math.abs(referenceDragEnd[1] - referenceDragStart[1])}/>}
-              {correctionMode && evidenceItems.map(item => {
+              {correctionMode && reviewItems.map(item => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 return <g className={`correction-mark${selectedEvidenceId === item.id ? " selected" : ""}${item.user_verified ? " user-corrected" : ""}`} key={item.id} onClick={event => { event.stopPropagation(); beginCorrection(item); }} role="button" aria-label={`${item.category} ${item.cls}`}>
@@ -1044,12 +1072,19 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   </g>;
                 })}
               </g>}
+              {geometry && showRooms && geometry.scale?.source === "dimensions" && <g className="dimension-layer">
+                {(geometry.scale.dimensions ?? []).map((dim, index) => <g key={index}>
+                  <line x1={dim.p0[0]} y1={dim.p0[1]} x2={dim.p1[0]} y2={dim.p1[1]} />
+                  <circle cx={dim.p0[0]} cy={dim.p0[1]} r="4" /><circle cx={dim.p1[0]} cy={dim.p1[1]} r="4" />
+                </g>)}
+              </g>}
               {geometry && showWalls && !outlineMode && <g className="wall-layer">
                 {geometry.wall_segments.map(segment => <line key={segment.id} className={segment.exterior ? "exterior" : "interior"} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]}>
                   <title>{`${segment.exterior ? "Exterior" : "Interior"} wall · ${segment.length_m != null ? `${segment.length_m.toFixed(2)} m long, ${((segment.thickness_m ?? 0) * 100).toFixed(0)} cm thick` : `${Math.round(segment.length_px)} px long, ${Math.round(segment.thickness_px)} px thick`}`}</title>
                 </line>)}
               </g>}
-              {!outlineMode && citations.map((item, index) => {
+              {!outlineMode && citations.map((cited, index) => {
+                const item = shownCitation(cited);
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 const fullItem = evidenceItems.find(candidate => candidate.id === item.id);
@@ -1114,13 +1149,13 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           {correctionMode && <section className="correction-panel" aria-label="Review detected plan items">
             <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"} · used in this plan’s answers` : "Select a box, drag it to move, or drag its corner handle to resize it."}</span></div>
             {getAllRoomOutlines().length > 0 && <div className="correction-editor"><strong>Backend room boundaries</strong><span>These are the model’s suggested room shapes. Adjust a boundary to use your edit for both room answers and area estimates.</span>{getAllRoomOutlines().map((outline, index) => <div className="room-boundary-row" key={outline.id}><span>{outline.label || `Room ${index + 1}`}</span><button className="toolbar-button" type="button" onClick={() => startOutlineReview(undefined, outline.id)}>Adjust boundary</button></div>)}</div>}
-            <div className="correction-list">{evidenceItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{evidenceLabel(item, evidenceItems)}</span><small>{item.text ? `${item.category} · label “${item.text}”` : item.category}{item.user_verified ? " · reviewed by you" : item.score != null ? ` · ${Math.round(item.score * 100)}% confidence` : ""}</small></button>)}</div>
+            <div className="correction-list">{reviewItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{evidenceLabel(item, evidenceItems)}</span><small>{item.text ? `${item.category} · label “${item.text}”` : item.category}{item.user_verified ? " · reviewed by you" : item.score != null ? ` · ${Math.round(item.score * 100)}% confidence` : ""}</small></button>)}</div>
             {selectedEvidence && <div className="correction-editor"><strong>Correct selected item</strong><span>Drag the box to move it, or drag its lower-right handle to resize it. If this says “toilet” but is actually a kitchen, choose room and kitchen. Save to keep the geometry and label correction with this plan.</span><label>Kind<select value={editCategory} onChange={event => { const category = event.target.value; setEditCategory(category); setEditClass(itemTypes[category][0]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Room or object type<select value={editClass} onChange={event => setEditClass(event.target.value)}>{(itemTypes[editCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><div className="correction-actions"><button className="toolbar-button primary-button" type="button" disabled={correctionSaving || (selectedEvidence.category === editCategory && selectedEvidence.cls === editClass)} onClick={() => void saveCorrection("update", selectedEvidence.id, { ...selectedEvidence, category: editCategory, cls: editClass })}>{correctionSaving ? "Saving…" : "Save correction"}</button><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => void saveCorrection("delete", selectedEvidence.id)}>Remove detection</button></div></div>}
             <div className="correction-editor"><strong>Add a missed item</strong><label>Kind<select value={addCategory} onChange={event => { const category = event.target.value; setAddCategory(category); setAddClass(itemTypes[category]?.[0] ?? "other"); setCorrectionAddPoints([]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Type<select value={addClass} onChange={event => setAddClass(event.target.value)}>{(itemTypes[addCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => { setCorrectionAddPoints([]); setCorrectionAddMode(true); }}>{correctionAddMode ? addCategory === "room" ? correctionAddPoints.length === 0 ? "Click first room corner" : "Click opposite room corner" : "Click its location on the plan" : addCategory === "room" ? "Mark missing room" : "Place missing item"}</button></div>
             {correctionError && <p className="correction-error" role="alert">{correctionError}</p>}
           </section>}
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
-          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && message.confidence === "low" && <><small className="answer-confidence">Lower confidence · check the highlighted evidence on the drawing</small>{message.evidence?.length ? <section className="evidence-review" aria-label="Evidence to review"><strong>Evidence behind this answer</strong><button type="button" className="evidence-focus" onClick={() => showMessageEvidence(message)}>Show {message.evidence.length} item{message.evidence.length === 1 ? "" : "s"} on drawing</button><ul>{message.evidence.map((item, evidenceIndex) => <li key={`${item.id}-${evidenceIndex}`}>{itemLabel({ category: item.category ?? "item", cls: item.cls ?? "", text: item.text })}{item.text ? ` · “${item.text}”` : ""}{item.score != null ? ` · ${Math.round(item.score * 100)}% model confidence` : ""}</li>)}</ul>{message.evidenceDecision ? <small className={`evidence-decision ${message.evidenceDecision}`}>{message.evidenceDecision === "trusted" ? "You trust this evidence." : "You rejected this evidence."}</small> : <div className="evidence-actions"><button type="button" onClick={() => void submitFeedback(index, "trusted")}>Trust</button><button type="button" onClick={() => void submitFeedback(index, "rejected")}>Don’t trust</button></div>}</section> : null}</>}{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
+          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && message.confidence === "low" && <><small className="answer-confidence">Lower confidence · the answer may include uncertain details. Check the highlighted items on the drawing.</small>{message.evidence?.length ? <section className="evidence-review" aria-label="Evidence to review"><strong>Items used for this answer</strong><p className="evidence-explanation">Detection confidence describes how sure the system is about each item. Answer confidence also depends on how those items support the answer.</p><button type="button" className="evidence-focus" onClick={() => showMessageEvidence(message)}>Show {message.evidence.length} item{message.evidence.length === 1 ? "" : "s"} on drawing</button><ul>{message.evidence.map((item, evidenceIndex) => <li key={`${item.id}-${evidenceIndex}`}>{itemLabel({ category: item.category ?? "item", cls: item.cls ?? "", text: item.text })}{item.text ? ` · label “${item.text}”` : ""}{item.score != null ? ` · ${Math.round(item.score * 100)}% detection confidence` : ""}</li>)}</ul>{message.evidenceDecision ? <small className={`evidence-decision ${message.evidenceDecision}`}>{message.evidenceDecision === "trusted" ? "You confirmed these items support the answer." : "You said these items do not support the answer."}</small> : <div className="evidence-actions"><button type="button" onClick={() => void submitFeedback(index, "trusted")}>These items support the answer</button><button type="button" onClick={() => void submitFeedback(index, "rejected")}>They don’t support it</button></div>}<small className="evidence-feedback-note">Your response is saved as feedback for this answer.</small></section> : null}</>}{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
           {feedbackError && <p className="feedback-error" role="alert">{feedbackError}</p>}
           {measurementRequested && <section className="requested-action" aria-label="Requested measurement">
             <div><strong>Measure a distance</strong><span>Choose the two points you want measured on the plan.</span></div>

@@ -35,7 +35,7 @@ ROOM_AREA_M2 = {
 }
 MIN_SPACE_M2 = 0.5  # smaller than a door swing: a shaft or a detection artefact, not a room
 SCALE_DISAGREE = 2.0  # a calibration / written-area scale this far outside the symbol band gets a warning
-POINT_SCALE_TOL = {"calibration": 0.03, "written_areas": 0.10}  # relative uncertainty of the other scale sources
+POINT_SCALE_TOL = {"calibration": 0.03, "dimensions": 0.03, "written_areas": 0.10}  # relative uncertainty of the other scale sources
 
 
 def symbol_scale(graph: PlanGraph | None) -> PlanScale | None:

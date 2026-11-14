@@ -24,14 +24,19 @@ from skimage.measure import find_contours
 
 from app.cubicasa.room_types import Fixture, classify
 from app.cubicasa.rooms_dict import room_purpose
-from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallShape
+from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallSegment, WallShape
 
 # CubiCasa net classes by index (fuse.ROOM / fuse.ICON order)
 _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
 _ICON_KINDS = {3: "closet", 4: "appliance", 8: "fireplace"}  # icon classes the detector / graph do not carry
 _FIXTURE_KINDS = {"toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench"}
+SPLIT_BY_LABELS = True  # cut spaces holding two labels that should not share a space (app.cubicasa.room_split)
+CUT_MIN_ROOM_FRAC = 0.004  # each side of such a cut keeps at least this share of the image
 SCALE_AGREE = 0.15  # written areas must agree within this (relative m/px) to set the plan scale
+SCALE_CROSS_CHECK = 0.10  # dimension-line and written-area scales further apart than this get a warning
 _AREA_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:m2|m²|m\^2|sqm|㎡)", re.IGNORECASE)
+_BARE_AREA_RE = re.compile(r"^\s*(\d{1,3}[.,]\d{1,2})\s*$")
+BARE_AREA_MIN_SCORE = 0.8  # OCR confidence for a unit-less area (a misread digit would skew the scale)
 MIN_ROOM_FRAC = 1e-3  # of the image area
 MAX_ROOM_FRAC = 0.5
 MAX_POINTS = 400
@@ -92,8 +97,19 @@ def _touching(lab: np.ndarray, mask: np.ndarray, sl, r: int) -> list[int]:
 
 
 def _labeled_area(labels: list[RoomLabel]) -> float | None:
+    """Area written in the room: a number with a unit ("12,5 m2"), else bare decimals ("11.5" under "MH", the usual
+    Finnish convention) when the room also carries a purpose label. Bare decimals in one space are summed: an open
+    plan ("OH 26.5" + "KEITTIÖ 17.0") or two rooms the wall map merged. Integers are not areas ("20" is usually a
+    misread "2.0"); a wrong number is caught by the agreement test in scale_from_written_areas."""
     m = _AREA_RE.search(" ".join(lb.text for lb in labels))
-    return float(m.group(1).replace(",", ".")) if m else None
+    if m:
+        return float(m.group(1).replace(",", "."))
+    if not any(lb.room_type for lb in labels):
+        return None
+    vals = [float(b.group(1).replace(",", ".")) for lb in labels
+            if (lb.score is None or lb.score >= BARE_AREA_MIN_SCORE) and (b := _BARE_AREA_RE.match(lb.text))]
+    vals = [v for v in vals if 0.5 <= v <= 300]
+    return round(sum(vals), 2) if vals else None
 
 
 def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) -> PlanGeometry:
@@ -111,8 +127,17 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     t = float(2 * np.median(edt[skel])) if skel.any() else 4.0
     t = min(max(t, 2.0), 0.05 * max(H, W))
     closed = ndimage.binary_closing(barrier, iterations=max(1, round(t / 4))) | barrier
-
+    text = layers.text(rel, path)
     lab, n = ndimage.label(~closed)
+    room_cuts = []
+    if SPLIT_BY_LABELS:  # a bedroom open to the living room: cut between the two labels at the narrowest line
+        from app.cubicasa.room_split import split_by_labels
+        from app.cubicasa.room_types import LABEL_STRONG_SCORE
+
+        label_seeds = [((tk.bbox[0] + tk.bbox[2]) / 2, (tk.bbox[1] + tk.bbox[3]) / 2, purpose) for tk in text.tokens
+                       if tk.score >= LABEL_STRONG_SCORE and (purpose := room_purpose(tk.text))]
+        lab, room_cuts = split_by_labels(lab, label_seeds, t, CUT_MIN_ROOM_FRAC * H * W)
+        n = int(lab.max())
     outside = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
     sizes = ndimage.sum(np.ones_like(lab, dtype=np.int32), lab, np.arange(1, n + 1))
     slices = ndimage.find_objects(lab)
@@ -123,7 +148,6 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     room_id = {k: f"space-{j + 1}" for j, k in enumerate(keep)}
 
     # OCR tokens -> rooms (token centre, else the most common room within one wall thickness)
-    text = layers.text(rel, path)
     labels_of: dict[int, list[RoomLabel]] = {k: [] for k in keep}
     r = max(2, round(t))
     for tok in text.tokens:
@@ -177,16 +201,73 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     def to_id(v: int) -> str | None:
         return room_id.get(v) or ("outside" if v in outside else None)
 
-    segments = vectorise(cls, lab, to_id, t, openings)
+    segments = _building_segments(vectorise(cls, lab, to_id, t, openings), cls, lab, keep, t)
     for sg in segments:
         for rid in set(sg.rooms_left) | set(sg.rooms_right):
             if rid in by_id:
                 by_id[rid].walls.append(sg.id)
     from app.cubicasa.size_priors import symbol_scale
 
+    sym = symbol_scale(graph)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
-                        walls=walls, openings=openings, wall_segments=segments, scale=scale_from_written_areas(rooms),
-                        symbol_scale=symbol_scale(graph))
+                        walls=walls, openings=openings, wall_segments=segments, room_cuts=room_cuts,
+                        scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym)), symbol_scale=sym)
+
+
+def _building_segments(segments: list[WallSegment], cls: np.ndarray, lab: np.ndarray, keep: list[int],
+                       t: float) -> list[WallSegment]:
+    """Only the segments of wall components that bound a room. Sheet frames, title blocks, legends, scale bars and
+    dimension lines are line work the wall model also paints, but they are not connected to the building's walls (a
+    shaft too small to be a room still hangs off them, so it stays). Ids are renumbered."""
+    if not keep:
+        return []
+    comp, _ = ndimage.label(cls > 0, structure=np.ones((3, 3)))
+    near_room = ndimage.binary_dilation(np.isin(lab, keep), iterations=max(2, round(t / 2) + 2))
+    good = set(np.unique(comp[near_room & (comp > 0)]).tolist()) - {0}
+    H, W = comp.shape
+    r = max(2, round(t / 2) + 1)
+
+    def component(x: float, y: float) -> set[int]:
+        u, v = int(round(x)), int(round(y))
+        win = comp[max(0, v - r):min(H, v + r + 1), max(0, u - r):min(W, u + r + 1)]
+        return set(np.unique(win).tolist()) - {0}
+
+    out = []
+    for sg in segments:
+        mid = ((sg.p0[0] + sg.p1[0]) / 2, (sg.p0[1] + sg.p1[1]) / 2)
+        if (component(*mid) or component(*sg.p0) | component(*sg.p1)) & good:
+            out.append(sg)
+    for j, sg in enumerate(out):
+        sg.id = f"seg-{j + 1}"
+    return out
+
+
+def _dimension_scale(path: Path, tokens, sym: PlanScale | None) -> PlanScale | None:
+    """Scale from dimension lines, dropped when it is far outside the door / fixture size band (figures in cm or
+    inches, or a misread chain that happens to agree with itself)."""
+    from PIL import Image
+
+    from app.cubicasa.dimensions import dimension_scale
+    from app.cubicasa.size_priors import SCALE_DISAGREE
+
+    try:
+        dims = dimension_scale(Image.open(path), tokens)
+    except Exception:  # noqa: BLE001  optional evidence
+        return None
+    if dims and sym and sym.low and sym.high and not sym.low / SCALE_DISAGREE <= dims.m_per_px <= sym.high * SCALE_DISAGREE:
+        return None
+    return dims
+
+
+def plan_scale(rooms: list[RoomShape], dims: PlanScale | None) -> PlanScale | None:
+    """The plan's own scale: dimension lines (a direct length measurement) when they agree, else written room areas
+    (measured through the room outlines, so segmentation errors leak in). When both exist and differ by more than
+    SCALE_CROSS_CHECK, the chosen one carries a warning."""
+    areas = scale_from_written_areas(rooms)
+    if dims and areas and abs(dims.m_per_px - areas.m_per_px) > SCALE_CROSS_CHECK * areas.m_per_px:
+        dims.warning = (f"dimension lines give {dims.m_per_px * 1000:.2f} mm per pixel, the written room areas "
+                        f"{areas.m_per_px * 1000:.2f}: check the scale")
+    return dims or areas
 
 
 def scale_from_written_areas(rooms: list[RoomShape]) -> PlanScale | None:

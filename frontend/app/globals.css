@@ -169,6 +169,8 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .answer-feedback small, .feedback-error { color: #738076; font-size: 10px; }
 .evidence-review { margin-top: 10px; padding: 9px; border: 1px solid #ead8b7; border-radius: 7px; background: #fffaf1; }
 .evidence-review>strong { display: block; color: #735525; font-size: 10px; }
+.evidence-explanation { margin: 4px 0 0; color: #776c5d; font-size: 10px; line-height: 1.45; }
+.evidence-feedback-note { display: block; margin-top: 6px; color: #81796e; font-size: 9px; }
 .evidence-focus { margin-top: 5px; padding: 0; border: 0; background: none; color: #8b6120; font-size: 10px; text-decoration: underline; cursor: pointer; }
 .evidence-review ul { margin: 6px 0 0; padding-left: 17px; color: #6b6253; font-size: 10px; line-height: 1.5; }
 .evidence-actions { display: flex; gap: 6px; margin-top: 8px; }
@@ -317,3 +319,6 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 @keyframes evidence-pop { from { opacity: 0; transform: scale(.2); } to { opacity: 1; transform: scale(1); } }
 @keyframes caption-arrive { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 @media (prefers-reduced-motion: reduce) { .analysis-animation *, .analysis-animation-caption { animation-duration: .01ms !important; animation-delay: 0ms !important; } }
+.dimension-layer line { stroke: #d35400; stroke-width: 3; vector-effect: non-scaling-stroke; }
+.dimension-layer circle { fill: #d35400; }
+.dimension-layer { pointer-events: none; }

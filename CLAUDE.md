@@ -67,7 +67,7 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
       `rooms_dict.py`), `fit.py` (per-template rule / gradient-boosting models, fitted on val with K-fold CV,
       reported on test), `detect.py` (runtime: PlanGraph with evidence items + fusion counts).
     - symbol detector: `symdet.py` (YOLO11s boxes for door, window, toilet, sink, double sink, shower, bathtub,
-      sauna stove; ONNX on CPU; cached per image, added as `det_*` fusion features and used as citations). Trained
+      sauna stove; `symbol-det.pt` + `symbol-det.json` sidecar (imgsz 1600) on CPU (.onnx also accepted); cached per image, added as `det_*` fusion features and used as citations). Trained
       via `export_yolo.py` + `train.py`, or `backend/scripts/verda_train.py` (+ `verda_remote.sh`, runs on the VM).
       Val mAP50: door 0.95, window 0.90, all 0.87. Optional: everything runs without its weights.
     - walls: `walls.py` (SVG wall polygons as ground truth, wall metrics with 3 px tolerance, scored only on floors
@@ -77,6 +77,9 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
       `Layer` response shape; cached per image and weights).
     - ground truth: `labels_from_svg.py`.
+    - scale: `dimensions.py` (printed dimension figures + tick-to-tick span of their lines; >= 2 figures agreeing
+      within 4% and inside the door/fixture size band of `size_priors.py`), else written room areas (`rooms.py`,
+      bare decimals under a label count). Dimension lines win; a > 10% disagreement with written areas is a warning.
   - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
     `app/pdfplan/`, `.ifc` -> `app/ifc/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
     saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.
@@ -129,7 +132,7 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
   `junction-dataset-preview/` (preview release = our test set, never trained on), `cubicasa5k-original/`
   (Zenodo 2613548, labels + official split for training/eval only), `cache/`, `yolo-cubicasa-det/`, `runs/`,
   `models/` is now at the repo root (see below).
-- `models/` (`MODELS_DIR`, tracked in git, all files < 50 MB): `cubicasa-fusion.joblib`, `ocr_token_table.json`, `symbol-det.onnx`, `wallseg.pt` (fp16); checksums in `models/MANIFEST.json`. Not committed: `cubicasa-net.pkl` (208 MB CubiCasa net; the share bundle's `dataset/cubicasa-pretrained/` path also works). The detector fingerprint is a content hash, so retraining the detector requires refitting the fusion models.
+- `models/` (`MODELS_DIR`, tracked in git, all files < 50 MB): `cubicasa-fusion.joblib`, `ocr_token_table.json`, `symbol-det.pt` + `.json` sidecar, `wallseg.pt` (fp16); checksums in `models/MANIFEST.json`. Not committed: `cubicasa-net.pkl` (208 MB CubiCasa net; the share bundle's `dataset/cubicasa-pretrained/` path also works). The detector fingerprint is a content hash, so retraining the detector requires refitting the fusion models.
 - `docs/literature-review.md` — floor-plan recognition since CubiCasa5K and the roadmap.
 
 ## Commands
@@ -202,7 +205,13 @@ Rebuild the Docker image after changing `backend/pyproject.toml` or `frontend/pa
 
 ## Current cubicasa results (exact match, held-out test split, 387 images / 3398 questions)
 
-Majority baseline 52.8% → pipeline **77.2%** (same number via the runtime path, `app.eval --method model`). Per template: kitchens 95, bathrooms 94, floors 93, saunas 93,
+**Now (detector sweep preset B: YOLO11s at imgsz 1600 + rot90, counting models refit on train+val on the VM):
+81.8%**. Per template: floors 93, kitchens 95, saunas 94, bathrooms 93, WC seats 91, WC rooms 89, showers+baths 85,
+balconies 85, sinks 84, bedrooms 78, doors 66, windows 44. Previous detector 81.3% (same VM run). Detector test recall
+door 0.957, window 0.917; 93 test windows are still "merged" (one box over a mullioned run; the ground truth itself
+labels such runs inconsistently, see `windows_eval.py`).
+
+History: majority baseline 52.8% → pipeline **77.2%** without the detector (same number via the runtime path, `app.eval --method model`). Per template: kitchens 95, bathrooms 94, floors 93, saunas 93,
 WC seats 89, WC rooms 85, balconies 84, bedrooms 77, showers+baths 75, sinks 74, doors 51, windows 38.
 Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: adjacent symbols merge in the
 segmentation. The symbol detector (`symdet.py`) is trained; refitting the counting models with its `det_*`
