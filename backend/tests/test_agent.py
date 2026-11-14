@@ -119,7 +119,7 @@ def fake(monkeypatch, tmp_path):
     return install
 
 
-def _real_loop_with_plain_contents(question, tools, history=None):
+def _real_loop_with_plain_contents(question, tools, history=None, scale=None):
     """run_loop without google.genai types (the fake client does not need them)."""
     traces, contents = [], [question]
     for _ in range(agent.MAX_STEPS):

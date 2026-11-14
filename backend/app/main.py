@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, Response
 from app.config import DATASET_DIR
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import Answer, AskRequest, Layer, PlanGraph, PlanQuestionRequest
+from app.models import Answer, AskRequest, Layer, PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
@@ -96,9 +96,113 @@ def _saved_graph(plan_id: UUID) -> PlanGraph | None:
     if not rows:
         return None
     try:
-        return PlanGraph.model_validate(rows[0]["graph"])
+        graph = PlanGraph.model_validate(rows[0]["graph"])
+        if not graph.floor_outlines and graph.source == "model":
+            from app.cubicasa.detect import floor_outline_candidates
+
+            graph.floor_outlines = floor_outline_candidates(graph.image)
+            if graph.floor_outlines:
+                graph.items = [item for item in graph.items if item.category != "floor"] + [
+                    PlanItem(id=outline.id, category="floor", bbox=(min(x for x, _ in outline.polygon),
+                        min(y for _, y in outline.polygon), max(x for x, _ in outline.polygon),
+                        max(y for _, y in outline.polygon)), polygon=outline.polygon, score=outline.score)
+                    for outline in graph.floor_outlines
+                ]
+                _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+        return graph
     except (KeyError, ValueError) as error:
         raise HTTPException(status_code=500, detail="Saved plan analysis is invalid") from error
+
+
+@app.get("/api/plans/{plan_id}/scale")
+def get_plan_scale(plan_id: UUID) -> dict | None:
+    return _scale_request(plan_id)
+
+
+@app.put("/api/plans/{plan_id}/scale")
+def save_plan_scale(plan_id: UUID, calibration: dict) -> dict:
+    try:
+        points = calibration["points"]
+        x1, y1 = (float(value) for value in points[0])
+        x2, y2 = (float(value) for value in points[1])
+        distance = float(calibration["distance"])
+        unit = calibration["unit"]
+    except (KeyError, TypeError, ValueError, IndexError):
+        raise HTTPException(status_code=422, detail="Provide two points, a distance, and a unit") from None
+    if unit not in ("m", "cm", "ft", "in") or distance <= 0 or (x1 == x2 and y1 == y2):
+        raise HTTPException(status_code=422, detail="Distance and points must be valid")
+    plan = get_plan(plan_id)
+    image = next((item for item in plan.get("plan_images", []) if item.get("role") == "source"), None)
+    if not image:
+        raise HTTPException(status_code=409, detail="Plan has no source image")
+    return _scale_request(plan_id, "PUT", {"plan_id": str(plan_id), "points": [[x1, y1], [x2, y2]], "distance": distance, "unit": unit})
+
+
+def _scale_request(plan_id: UUID, method: str = "GET", body: dict | None = None):
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    query = urlencode({"on_conflict": "plan_id"}) if method == "PUT" else urlencode({"plan_id": f"eq.{plan_id}", "select": "points,distance,unit"})
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
+    if method == "PUT":
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    # PostgREST upserts use POST + on_conflict, even though our app endpoint is PUT.
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_scales?{query}", data=json.dumps(body).encode() if body else None, headers=headers, method="POST" if method == "PUT" else "GET")
+    try:
+        with urlopen(request, timeout=20) as response:
+            rows = json.loads(response.read())
+        return rows[0] if rows else None
+    except HTTPError as error:
+        reason = error.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Plan scale request failed: {reason or error.reason}") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+
+
+def _outline_request(plan_id: UUID, method: str = "GET", body: dict | None = None):
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    query = urlencode({"on_conflict": "plan_id"}) if method == "PUT" else urlencode({"plan_id": f"eq.{plan_id}", "select": "outlines"})
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
+    if method == "PUT":
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_outlines?{query}",
+                      data=json.dumps(body).encode() if body else None, headers=headers,
+                      method="POST" if method == "PUT" else "GET")
+    try:
+        with urlopen(request, timeout=20) as response:
+            rows = json.loads(response.read())
+        return rows[0]["outlines"] if rows else []
+    except HTTPError as error:
+        reason = error.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Floor outline request failed: {reason or error.reason}") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+
+
+@app.get("/api/plans/{plan_id}/outline")
+def get_plan_outline(plan_id: UUID) -> dict:
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    return {"candidates": [outline.model_dump(mode="json") for outline in graph.floor_outlines],
+            "saved": _outline_request(plan_id)}
+
+
+@app.put("/api/plans/{plan_id}/outline")
+def save_plan_outline(plan_id: UUID, req: PlanOutlinesRequest) -> dict:
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    for outline in req.outlines:
+        if any(x < 0 or x > graph.width or y < 0 or y > graph.height for x, y in outline.polygon):
+            raise HTTPException(status_code=422, detail="Outline points must be inside the plan image")
+    saved = _outline_request(plan_id, "PUT", {"plan_id": str(plan_id),
+        "outlines": [outline.model_dump(mode="json") for outline in req.outlines]})
+    return {"saved": saved}
 
 
 @app.get("/api/plans/{plan_id}/image")
@@ -187,7 +291,7 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
-        if (result := answer(req.question, graph, req.history)) is not None:
+        if (result := answer(req.question, graph, req.history, req.scale)) is not None:
             return result
     return _template_answer(req.question, graph)
 
