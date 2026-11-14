@@ -5,6 +5,9 @@ services:
     command: npm run dev
     environment:
       BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+      NEXT_PUBLIC_SUPABASE_BUCKET: ${NEXT_PUBLIC_SUPABASE_BUCKET:-plans}
     ports:
       - "3000:3000"
     volumes:

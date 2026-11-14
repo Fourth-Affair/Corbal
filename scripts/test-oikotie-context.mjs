@@ -9,9 +9,15 @@ const DEFAULT_URL =
 const API_URL = "https://api.context.dev/v1/web/scrape";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-function readOption(name) {
-  const index = process.argv.indexOf(name);
-  return index === -1 ? undefined : process.argv[index + 1];
+function readOptions(name) {
+  const values = [];
+  for (let index = 0; index < process.argv.length; index += 1) {
+    if (process.argv[index] === name && process.argv[index + 1]) {
+      values.push(process.argv[index + 1]);
+      index += 1;
+    }
+  }
+  return values;
 }
 
 function parseEnv(contents) {
@@ -140,17 +146,60 @@ function isFloorplanImage(image) {
   );
 }
 
-async function main() {
-  const rawUrl = readOption("--url") ?? DEFAULT_URL;
-  const listingUrl = validateListingUrl(rawUrl);
-  const apiKey = await loadApiKey();
-
-  if (!apiKey) {
-    console.error("Missing CONTEXT_DEV_API_KEY. Add it to the project .env file first.");
-    process.exitCode = 1;
-    return;
+function isOikotiePropertyImage(image) {
+  try {
+    const url = new URL(image.url);
+    return (
+      url.hostname === "cdn.asunnot.oikotie.fi" &&
+      url.pathname.includes("/ot-real-estate-mediabank-prod/") &&
+      /\/source\/\d+/.test(url.pathname)
+    );
+  } catch {
+    return false;
   }
+}
 
+function deduplicatePropertyImages(images) {
+  const bySourceId = new Map();
+  for (const image of images) {
+    const sourceId = getSourceId(image) ?? image.url;
+    const current = bySourceId.get(sourceId);
+    const pixelArea = (image.width ?? 0) * (image.height ?? 0);
+    const currentPixelArea = current ? (current.width ?? 0) * (current.height ?? 0) : -1;
+    if (!current || pixelArea > currentPixelArea) bySourceId.set(sourceId, image);
+  }
+  return [...bySourceId.values()];
+}
+
+function getSourceId(image) {
+  const match = image.url.match(/\/source\/(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function getAlbumSegment(image) {
+  try {
+    const mediaPath = new URL(image.url).pathname.split("/ot-real-estate-mediabank-prod/")[1];
+    const segments = mediaPath?.split("/");
+    return segments?.length >= 4 ? segments[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function narrowToLeadImageGroup(images) {
+  const leadAlbum = images.length ? getAlbumSegment(images[0]) : null;
+  if (leadAlbum === null) return { images, method: "all_large_media_no_album_key" };
+
+  const group = images.filter((image) => getAlbumSegment(image) === leadAlbum);
+  if (group.length > 1 && group.length < images.length) {
+    return { images: group, method: "shared_album_segment_from_lead_image" };
+  }
+  return { images, method: "all_large_media_no_group" };
+}
+
+async function scrapeListing(listingUrl, apiKey) {
+  const includeDebugImages = process.argv.includes("--debug-images");
+  const openGallery = process.argv.includes("--open-gallery");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 90_000);
 
@@ -164,6 +213,21 @@ async function main() {
       body: JSON.stringify({
         url: listingUrl,
         formats: { markdown: true, json: true, images: true },
+        ...(openGallery
+          ? {
+              sharedParams: {
+                actions: [
+                  {
+                    type: "perform",
+                    action:
+                      "Click the Oikotie button labeled 'Katso kaikki kuvat' to open the full listing photo gallery.",
+                  },
+                  { type: "wait", milliseconds: 1500 },
+                ],
+              },
+            }
+          : {}),
+        imageParams: { enrich: ["dimensions"] },
         jsonParams: {
           schema,
           instructions:
@@ -181,8 +245,20 @@ async function main() {
       throw new Error(`Context.dev request failed: ${message}`);
     }
 
-    const images = result?.images?.success ? result.images.data ?? [] : [];
-    const floorplanCandidates = images.filter(isFloorplanImage).map((image) => ({
+    const pageImages = result?.images?.success ? result.images.data ?? [] : [];
+    const mediaBankImages = deduplicatePropertyImages(pageImages.filter(isOikotiePropertyImage));
+    const largeMediaImages = mediaBankImages.filter(
+      (image) => image.width >= 900 && image.height >= 600,
+    );
+    // Opening the full gallery is intended to expose every listing photo, including
+    // floorplans. Keep all large media-bank images instead of grouping by URL path:
+    // photos in one gallery can have different album segments.
+    const mediaForGrouping = largeMediaImages.length ? largeMediaImages : mediaBankImages;
+    const selectedImages = openGallery
+      ? { images: mediaForGrouping, method: "all_images_after_opening_gallery" }
+      : narrowToLeadImageGroup(mediaForGrouping);
+    const propertyImages = selectedImages.images;
+    const floorplanCandidates = propertyImages.filter(isFloorplanImage).map((image) => ({
       url: image.url,
       alt: image.alt ?? null,
       width: image.width ?? null,
@@ -197,14 +273,34 @@ async function main() {
       extraction_error: result?.json?.success
         ? null
         : result?.json?.message ?? result?.json?.error_code ?? "No JSON extraction returned",
-      floorplan_detection: floorplanCandidates.length ? "candidate_found" : "no_label_match",
+      floorplan_detection: floorplanCandidates.length
+        ? "candidate_found_from_image_label"
+        : propertyImages.length
+          ? "visual_review_needed"
+          : "no_property_images_found",
       floorplan_candidates: floorplanCandidates,
-      gallery_images: images.map((image) => ({
+      page_image_count: pageImages.length,
+      media_bank_image_count: mediaBankImages.length,
+      property_image_candidate_count: propertyImages.length,
+      property_image_selection: selectedImages.method,
+      property_image_candidates: propertyImages.map((image) => ({
         url: image.url,
         alt: image.alt ?? null,
         width: image.width ?? null,
         height: image.height ?? null,
       })),
+      ...(includeDebugImages
+        ? {
+            debug_media_images: mediaBankImages.map((image) => ({
+              url: image.url,
+              alt: image.alt ?? null,
+              width: image.width ?? null,
+              height: image.height ?? null,
+              source_id: getSourceId(image),
+              album_segment: getAlbumSegment(image),
+            })),
+          }
+        : {}),
       gallery_status: result?.images?.success ? "success" : "failed",
       gallery_error: result?.images?.success
         ? null
@@ -214,13 +310,37 @@ async function main() {
       request_id: result?.request_id ?? null,
     };
 
-    console.log(JSON.stringify(output, null, 2));
-    if (!response.headers.get("x-credits-used") && output.credits_used === null) {
-      console.error("Credit usage was not included in the response.");
-    }
+    return output;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function main() {
+  const requestedUrls = readOptions("--url");
+  const listingUrls = (requestedUrls.length ? requestedUrls : [DEFAULT_URL]).map(validateListingUrl);
+  const apiKey = await loadApiKey();
+
+  if (!apiKey) {
+    console.error("Missing CONTEXT_DEV_API_KEY. Add it to the project .env file first.");
+    process.exitCode = 1;
+    return;
+  }
+
+  const results = [];
+  for (const listingUrl of listingUrls) {
+    try {
+      results.push(await scrapeListing(listingUrl, apiKey));
+    } catch (error) {
+      results.push({
+        listing_url: listingUrl,
+        extraction_status: "request_failed",
+        error: error.name === "AbortError" ? "Timed out after 90 seconds" : error.message,
+      });
+    }
+  }
+
+  console.log(JSON.stringify({ results }, null, 2));
 }
 
 main().catch((error) => {
