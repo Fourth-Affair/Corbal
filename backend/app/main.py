@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
+from app.concurrency import THREADPOOL_SIZE, AnalysisBusy, analysis_slot, pdfium_lock
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
 from app.models import (Answer, AskRequest, BuildingQuestionRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
@@ -24,7 +25,18 @@ from app.models import (Answer, AskRequest, BuildingQuestionRequest, Layer, Plan
                         PlanScaleCalibration)
 from app.router import route
 
-app = FastAPI(title="Junc API", version="0.1.0")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    import anyio.to_thread
+
+    # sync endpoints share this pool; requests queued for an analysis slot hold a thread while they wait
+    anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
+    yield
+
+
+app = FastAPI(title="Junc API", version="0.1.0", lifespan=_lifespan)
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 if not log.handlers:
@@ -35,9 +47,6 @@ log.propagate = False
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
 # "llm" = Gemini agent with tools over the plan (falls back to "template" without GEMINI_API_KEY or on API errors).
 ANSWERER = os.environ.get("ANSWERER", "llm")
-MAX_CONCURRENT_ANALYSES = max(1, int(os.environ.get("MAX_CONCURRENT_ANALYSES", "1")))
-ANALYSIS_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("ANALYSIS_QUEUE_TIMEOUT", "45")))
-_analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
 _plan_locks: dict[UUID, list] = {}
 _plan_locks_guard = threading.Lock()
 
@@ -89,12 +98,12 @@ def _upstream_bytes(request: Request, timeout: float, *, retry_safe: bool = Fals
 
 
 def _bounded_analysis(operation):
-    if not _analysis_slots.acquire(timeout=ANALYSIS_QUEUE_TIMEOUT):
-        raise HTTPException(status_code=503, detail="Plan analysis is busy. Please try again shortly.")
+    """Run CPU-heavy work in an analysis slot (see app.concurrency); 503 when the queue wait times out."""
     try:
-        return operation()
-    finally:
-        _analysis_slots.release()
+        with analysis_slot():
+            return operation()
+    except AnalysisBusy:
+        raise HTTPException(status_code=503, detail="Plan analysis is busy. Please try again shortly.") from None
 
 
 def _is_pdf(path: str) -> bool:
@@ -539,11 +548,12 @@ def _upload_pdf(plan_id: UUID, content: bytes | None = None):
 def _render_pdf_page(path_or_bytes, scale: float = 2.0):
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(path_or_bytes)
-    try:
-        return pdf[0].render(scale=scale).to_pil().convert("RGB")
-    finally:
-        pdf.close()
+    with pdfium_lock:  # pdfium is not thread-safe
+        pdf = pdfium.PdfDocument(path_or_bytes)
+        try:
+            return pdf[0].render(scale=scale).to_pil().convert("RGB")
+        finally:
+            pdf.close()
 
 
 @app.get("/api/plans/{plan_id}/image")
@@ -685,7 +695,8 @@ def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
             tmp.replace(path)
         finally:
             tmp.unlink(missing_ok=True)
-    return geometry_from_image(rel, path, graph)
+    # wall segmenter + room geometry: CPU-heavy, shares the analysis slots with the image pipeline
+    return _bounded_analysis(lambda: geometry_from_image(rel, path, graph))
 
 
 def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
@@ -1022,9 +1033,12 @@ def render(path: str = Query(...), question: str | None = Query(None),
             import pypdfium2 as pdfium
 
             k = 2.0
-            pdf = pdfium.PdfDocument(str(p))
-            img = pdf[0].render(scale=k).to_pil().convert("RGB")
-            pdf.close()
+            with pdfium_lock:  # pdfium is not thread-safe
+                pdf = pdfium.PdfDocument(str(p))
+                try:
+                    img = pdf[0].render(scale=k).to_pil().convert("RGB")
+                finally:
+                    pdf.close()
         else:
             img = Image.open(p).convert("RGB")
         draw = ImageDraw.Draw(img)

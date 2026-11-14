@@ -51,16 +51,17 @@ export default function BuildingPage() {
     setQuestion(""); setBusy(true); setStatus("Preparing selected floors…");
     appendMessage(targetChatKey, { role: "user", text });
     try {
-      const analyzed: Record<string, { width: number; height: number }> = {};
-      for (const floor of chosenFloors) {
-        const analysis = await fetch(`/api/plans/${encodeURIComponent(floor.id)}/analyze`, { method: "POST" });
-        if (!analysis.ok) {
-          const body = await analysis.json().catch(() => ({}));
-          throw new Error(body.detail || `Could not analyze ${floor.name}`);
-        }
-        const graph = await analysis.json();
-        analyzed[floor.id] = { width: graph.width, height: graph.height };
-      }
+      // All floors at once: the backend queues the heavy analysis and overlaps downloads and saved-result lookups.
+      const analyzed: Record<string, { width: number; height: number }> = Object.fromEntries(await Promise.all(
+        chosenFloors.map(async floor => {
+          const analysis = await fetch(`/api/plans/${encodeURIComponent(floor.id)}/analyze`, { method: "POST" });
+          if (!analysis.ok) {
+            const body = await analysis.json().catch(() => ({}));
+            throw new Error(body.detail || `Could not analyze ${floor.name}`);
+          }
+          const graph = await analysis.json();
+          return [floor.id, { width: graph.width, height: graph.height }] as const;
+        })));
       setStatus("Checking the plans…");
       const response = mode === "building"
         ? await fetch("/api/buildings/ask", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, floors: chosenFloors }) })

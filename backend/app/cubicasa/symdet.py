@@ -11,6 +11,7 @@ Train with `scripts/verda_train.py` (Verda GPU VM) or `app.cubicasa.export_yolo`
 import argparse
 import json
 import os
+import threading
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -33,6 +34,9 @@ CONF_THRESHOLDS = (0.25, 0.4, 0.55, 0.7)
 MIN_CONF = 0.1  # what is cached; features threshold higher
 ITEM_CONF = 0.4  # detections shown as evidence / citations
 TILE_OVERLAP = 256  # px of native resolution shared by neighbouring tiles (> the largest symbol side)
+# Ultralytics keeps predictor state on the model object, so one model must not predict from two threads at once
+# (API requests run in a thread pool: an image analysis and a PDF question can both reach the detector).
+_predict_lock = threading.Lock()
 
 
 def weights_meta() -> dict:
@@ -151,7 +155,8 @@ def nms(dets: list[dict], iou: float = 0.5, ios: float = 0.7) -> list[dict]:
 
 
 def _predict(img: Image.Image, imgsz: int, ox: float = 0.0, oy: float = 0.0) -> list[dict]:
-    res = _model().predict(img, imgsz=imgsz, conf=MIN_CONF, iou=0.5, max_det=1000, verbose=False)[0]
+    with _predict_lock:
+        res = _model().predict(img, imgsz=imgsz, conf=MIN_CONF, iou=0.5, max_det=1000, verbose=False)[0]
     names = res.names
     return [{"cls": names[int(k)], "conf": round(float(c), 4),
              "bbox": [round(x0 + ox, 1), round(y0 + oy, 1), round(x1 + ox, 1), round(y1 + oy, 1)]}

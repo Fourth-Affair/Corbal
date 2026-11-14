@@ -39,12 +39,13 @@ the first request, which takes a few seconds.
 | `GEMINI_MAX_PER_HOUR`   | 300     | Uncached Gemini questions per rolling hour; beyond it the template answerer replies (no Gemini cost). Cached answers don't count. |
 | `RATE_ASK_PER_MIN`      | 20      | Questions per client IP per minute (Caddy returns 429 beyond). |
 | `RATE_ANALYZE_PER_MIN`  | 6       | Uploads + analyses per client IP per minute (CPU-heavy). |
-| `MAX_CONCURRENT_ANALYSES` | 1     | Heavy analyses running at once in the backend process. Increase only after checking memory and CPU under load. |
-| `ANALYSIS_QUEUE_TIMEOUT` | 45     | Seconds an analysis waits for a slot before returning a retryable busy response. |
+| `MAX_CONCURRENT_ANALYSES` | 1     | Heavy analyses (image pipeline, PDF parsing, wall geometry) running at once in the backend process; the rest queue. One analysis already uses every core: on 4 cores, 2+ in parallel was no faster (threads) or slower (processes). Raise only on a many-core server after measuring. |
+| `ANALYSIS_QUEUE_TIMEOUT` | 240    | Seconds an analysis waits for a slot before returning a retryable busy response (~5 s per image, so ~40 queued uploads). Keep it under 300 s, the Next.js proxy's response-header timeout. |
+| `THREADPOOL_SIZE`       | 100     | Threads for the backend's sync endpoints. Queued analyses each hold one while waiting, so this must stay well above the expected queue length or questions wait behind uploads. |
 
 Also set a **budget alert / spending cap** for the Gemini key in Google AI Studio / Cloud Billing.
 
-The backend serializes analysis of the same plan and bounds simultaneous model inference. This protects the shared model/cache process while other users can still load plans and ask questions. The lock and limit are process-local; add a shared queue/lock and shared cache before running multiple backend replicas. The current anonymous upload flow also has no account ownership, so use Supabase Auth and per-user policies before treating plans as private user data.
+The backend serializes analysis of the same plan and bounds simultaneous model inference (`backend/app/concurrency.py`; pdfium calls and the YOLO detector are also serialized because neither is thread-safe). Questions answered by the Gemini agent are network-bound and run in parallel. This protects the shared model/cache process while other users can still load plans and ask questions. The lock and limit are process-local; add a shared queue/lock and shared cache before running multiple backend replicas. The current anonymous upload flow also has no account ownership, so use Supabase Auth and per-user policies before treating plans as private user data.
 
 ## Notes
 

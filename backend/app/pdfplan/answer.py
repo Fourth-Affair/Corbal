@@ -74,12 +74,15 @@ def raster_symbols(rel: str) -> tuple[Symbol, ...]:
 
     if not symdet.available():
         return ()
+    from app.concurrency import pdfium_lock
+
     k = 2.0
-    pdf = pdfium.PdfDocument(str(resolve_pdf(rel)))
-    try:
-        img = pdf[0].render(scale=k).to_pil().convert("RGB")
-    finally:
-        pdf.close()
+    with pdfium_lock:  # pdfium is not thread-safe
+        pdf = pdfium.PdfDocument(str(resolve_pdf(rel)))
+        try:
+            img = pdf[0].render(scale=k).to_pil().convert("RGB")
+        finally:
+            pdf.close()
     out = []
     for d in symdet.predict_image(img, conf=symdet.ITEM_CONF):
         kind = _DET_KIND.get(d["cls"])

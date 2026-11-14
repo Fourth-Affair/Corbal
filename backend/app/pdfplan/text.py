@@ -26,17 +26,20 @@ def page_segments(pdf_path: Path, page: int = 0) -> tuple[tuple[float, float], l
     """(page width, height) and one Seg per text run that pdfium reports on the page."""
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(str(pdf_path))
-    try:
-        pg = pdf[page]
-        w, h = pg.get_size()
-        tp = pg.get_textpage()
-        segs = []
-        for i in range(tp.count_rects(0, -1)):
-            left, bottom, right, top = tp.get_rect(i)
-            t = " ".join(tp.get_text_bounded(left, bottom, right, top).split())
-            if t:
-                segs.append(Seg(t, (left, h - top, right, h - bottom)))
-        return (w, h), segs
-    finally:
-        pdf.close()
+    from app.concurrency import pdfium_lock
+
+    with pdfium_lock:  # pdfium is not thread-safe, not even across documents
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        try:
+            pg = pdf[page]
+            w, h = pg.get_size()
+            tp = pg.get_textpage()
+            segs = []
+            for i in range(tp.count_rects(0, -1)):
+                left, bottom, right, top = tp.get_rect(i)
+                t = " ".join(tp.get_text_bounded(left, bottom, right, top).split())
+                if t:
+                    segs.append(Seg(t, (left, h - top, right, h - bottom)))
+            return (w, h), segs
+        finally:
+            pdf.close()

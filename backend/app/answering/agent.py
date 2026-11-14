@@ -170,15 +170,19 @@ FINAL = {
 }
 
 _client = None
+_client_lock = threading.Lock()
 
 
 def _get_client():
+    """One shared client for every request thread (its HTTP connection pool is thread-safe)."""
     global _client
     if _client is None:
-        from google import genai
-        from google.genai import types
+        with _client_lock:
+            if _client is None:
+                from google import genai
+                from google.genai import types
 
-        _client = genai.Client(http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_S * 1000)))
+                _client = genai.Client(http_options=types.HttpOptions(timeout=int(GEMINI_TIMEOUT_S * 1000)))
     return _client
 
 

@@ -42,6 +42,10 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
 ## Repo layout
 
 - `backend/` — FastAPI (Python 3.12, **uv-managed**: `pyproject.toml` + `uv.lock`). Entry: `backend/app/main.py`.
+  - `app/concurrency.py` — limits shared by request threads: `analysis_slot()` (`MAX_CONCURRENT_ANALYSES`, default 1:
+    one analysis already saturates the CPU; image pipeline, PDF parsing and wall geometry all take a slot, network I/O
+    does not), `pdfium_lock` (pdfium is not thread-safe: hold it around every pypdfium2 call, concurrent calls
+    segfaulted the server), `THREADPOOL_SIZE`. The YOLO `predict` is serialized in `symdet.py`.
   - `app/router.py` — question (EN/FI) → template id.
   - `app/router.py` is no longer the gate when Gemini is on: it is the offline fallback and a cross-check.
   - `app/answering/agent.py` — question → Gemini (`GEMINI_MODEL`, default `gemini-3.8-flash`) tool loop →
