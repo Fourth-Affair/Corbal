@@ -114,6 +114,7 @@ def test_uploaded_pdf_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_download_source", lambda pid: pdf)
     monkeypatch.setattr(m, "_knowledge_request", knowledge)
     monkeypatch.setattr(m, "_corrections_request", lambda pid, body=None: [])  # no user corrections
+    monkeypatch.setattr(m, "_store_geometry_safely", lambda plan_id, graph, **kw: None)  # wall model: tests/test_rooms
     c, pid = TestClient(m.app), uuid.uuid4()
     r = c.post(f"/api/plans/{pid}/analyze")  # starts the background job (202) or returns the saved graph (200)
     deadline = time.monotonic() + 30

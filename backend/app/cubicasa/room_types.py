@@ -85,8 +85,11 @@ def classify(labels: list[RoomLabel], fixtures: list[Fixture], seg_fractions: di
             continue
         seen.add(lb.room_type)
         sure = (lb.score or 0) >= LABEL_STRONG_SCORE
-        ev.append(RoomEvidence(source="ocr", type=lb.room_type, weight=W["label"] if sure else W["label_unsure"],
-                               detail=f'label "{lb.text}"' + ("" if sure else " (unclear reading)")))
+        drawing = lb.source == "drawing"
+        ev.append(RoomEvidence(source="drawing" if drawing else "ocr", type=lb.room_type,
+                               weight=W["label"] if sure else W["label_unsure"],
+                               detail=(f'drawing text "{lb.text}"' if drawing else f'label "{lb.text}"')
+                               + ("" if sure else " (unclear reading)")))
         if sure:
             strong_types.add(lb.room_type)
 
@@ -130,7 +133,8 @@ def classify(labels: list[RoomLabel], fixtures: list[Fixture], seg_fractions: di
             fixture_top = top
 
     ranked = sorted(((t, round(s, 2)) for t, s in scores.items() if s > 0), key=lambda x: -x[1])
-    purposes = [t for t in dict.fromkeys(e.type for e in ev if e.source == "ocr" and e.weight >= W["label"])]
+    purposes = [t for t in dict.fromkeys(e.type for e in ev
+                                         if e.source in ("ocr", "drawing") and e.weight >= W["label"])]
     if not ranked:
         return Classification("unknown", "unknown", [], {}, ev, [])
     best, best_score = ranked[0]

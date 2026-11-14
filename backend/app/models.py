@@ -145,6 +145,7 @@ class RoomLabel(BaseModel):
     bbox: tuple[float, float, float, float]
     score: float | None = None
     room_type: str | None = None  # the purpose the text names (e.g. "MH" -> bedroom, "OH" -> living), if any
+    source: Literal["ocr", "drawing"] = "ocr"  # drawing = the PDF's own text (exact, not an OCR reading)
 
 
 class RoomEvidence(BaseModel):

@@ -561,7 +561,8 @@ def _upload_pdf(plan_id: UUID, content: bytes | None = None):
     return path
 
 
-def _render_pdf_page(path_or_bytes, scale: float = 2.0):
+def _render_pdf(path_or_bytes, scale: float = 2.0):
+    """(page 1 as an RGB image, pixels per PDF point)."""
     import pypdfium2 as pdfium
 
     from app.pdfplan.text import PDFIUM_LOCK
@@ -570,9 +571,14 @@ def _render_pdf_page(path_or_bytes, scale: float = 2.0):
         pdf = pdfium.PdfDocument(path_or_bytes)
         try:
             page = pdf[0]
-            return page.render(scale=pdf_render_scale(*page.get_size(), scale)).to_pil().convert("RGB")
+            k = pdf_render_scale(*page.get_size(), scale)
+            return page.render(scale=k).to_pil().convert("RGB"), k
         finally:
             pdf.close()
+
+
+def _render_pdf_page(path_or_bytes, scale: float = 2.0):
+    return _render_pdf(path_or_bytes, scale)[0]
 
 
 @app.get("/api/plans/{plan_id}/image")
@@ -723,11 +729,31 @@ def _geometry_request(plan_id: UUID, method: str = "GET", body: dict | None = No
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
 
+def _pdf_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
+    """Rooms and walls of an uploaded PDF: the image geometry of page 1, rendered as the viewer shows it, with the
+    PDF's own room labels; coordinates in PDF points (app.cubicasa.rooms.geometry_from_pdf)."""
+    from app.config import CACHE_DIR
+    from app.cubicasa.rooms import geometry_from_pdf
+
+    pdf = _upload_pdf(plan_id)
+    rel = f"uploads/{plan_id}.pdf.png"
+    path = CACHE_DIR / rel
+    image, k = _render_pdf(str(pdf))  # cheap next to the geometry; gives k for a cached render too
+    if not path.is_file():
+        tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp.png")
+        try:
+            image.save(tmp, format="PNG")
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return geometry_from_pdf(graph, rel, path, k)
+
+
 def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
-    from app.cubicasa.rooms import geometry_from_graph, geometry_from_image
+    from app.cubicasa.rooms import geometry_from_image
 
     if graph.source == "pdf":
-        return geometry_from_graph(graph)
+        return _pdf_geometry(plan_id, graph)
     from app.config import CACHE_DIR
 
     rel = f"uploads/{plan_id}.png"
@@ -798,7 +824,9 @@ def with_metrics(geometry: PlanGeometry, calibration: PlanScaleCalibration | Non
 def _plan_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
     """Stored geometry, computed and stored on first use for plans analysed before it existed."""
     stored = _geometry_request(plan_id)
-    if stored is not None and stored.get("version", 1) >= PlanGeometry.model_fields["version"].default:
+    # PDFs analysed before they got the image geometry: stored without rooms or walls (model "pdf" = DXF outlines)
+    stale_pdf = stored is not None and graph.source == "pdf" and stored.get("model") == "pdf" and not stored.get("rooms")
+    if stored is not None and not stale_pdf and stored.get("version", 1) >= PlanGeometry.model_fields["version"].default:
         try:
             return PlanGeometry.model_validate(stored)
         except ValueError:

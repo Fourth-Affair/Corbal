@@ -99,7 +99,10 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
       bare decimals under a label count). Dimension lines win; a > 10% disagreement with written areas is a warning.
   - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
     `app/pdfplan/`, `.ifc` -> `app/ifc/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
-    saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.
+    saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`. Their room / wall geometry (viewer overlay)
+    is the image geometry of that rendered page (`main._pdf_geometry` -> `rooms.geometry_from_pdf`, back in PDF
+    points), with the PDF's own room labels as sure labels (type, printed area -> written-area scale); with DXF
+    outlines `geometry_from_graph` is used instead. DE/FR/IT room names are in `rooms_dict.PURPOSE_LABELS`.
   - `app/pdfplan/` — vector PDF plans, no vision. `text.py`: text runs with boxes (pdfium). `parse.py`: rooms from
     centred "name / number / area" stacks and apartment tags ("Whg. A") in the PDF text; if a same-name `.dxf` sits
     next to the PDF, room/apartment outlines and door / window / fixture symbols from it (layers matched by keyword,

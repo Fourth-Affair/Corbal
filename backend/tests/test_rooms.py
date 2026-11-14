@@ -15,6 +15,11 @@ from app.models import Layer, PlanGraph, PlanScaleCalibration, TextToken
     # OCR damage: label fused with a dimension, separator lost, umlaut lost, slash read as a letter
     ("VAR4956", "storage"), ("MHTYOH", "bedroom"), ("MH/TYÖH", "bedroom"), ("KEITTIO", "kitchen"),
     ("MHL", "bedroom"), ("AULAI", "entry"), ("KH", "bathroom"), ("KHH", "utility"), ("S", "sauna"),
+    # German / French / Italian names printed on vector PDFs
+    ("Zimmer", "bedroom"), ("Pièce", "bedroom"), ("Camera da letto", "bedroom"), ("Küche", "kitchen"),
+    ("Cuisine", "kitchen"), ("Bagno", "bathroom"), ("Bain", "bathroom"), ("Wohnen/Essen", "living"),
+    ("Séjour/repas", "living"), ("Korridor", "entry"), ("Réduit", "storage"), ("Cage d'escalier", "stairs"),
+    ("Balkon", "balcony"),
 ])
 def test_room_purpose(token, purpose):
     assert room_purpose(token) == purpose
@@ -61,6 +66,50 @@ def test_wall_segments_only_on_the_building(monkeypatch):
     for sg in geo.wall_segments:
         assert all(90 <= x <= 310 and 90 <= y <= 210 for x, y in (sg.p0, sg.p1)), sg
     assert [sg.id for sg in geo.wall_segments] == [f"seg-{j + 1}" for j in range(len(geo.wall_segments))]
+
+
+def test_pdf_geometry_uses_the_drawing_labels(monkeypatch, tmp_path):
+    """Uploaded PDF without a DXF: rooms and walls from the rendered page (k = 2 px per point), typed by the PDF's
+    own room labels, which replace the OCR reading of the same text; everything returned in PDF points."""
+    from PIL import Image
+
+    from app.models import PlanItem
+
+    png = tmp_path / "page.png"
+    Image.new("RGB", (200, 100), "white").save(png)
+    graph = PlanGraph(image="uploads/p.pdf", width=100, height=50, source="pdf", items=[
+        PlanItem(id="room-1.01", category="room", bbox=(20, 20, 30, 25), text="Küche 1.01 12.5 m²"),
+        PlanItem(id="room-1.02", category="room", bbox=(70, 20, 80, 25), text="Zimmer 1.02")])
+    cls = np.zeros((100, 200), np.uint8)
+    cls[:6, :] = cls[-6:, :] = cls[:, :6] = cls[:, -6:] = 1
+    cls[:, 97:103] = 1
+    cls[40:60, 97:103] = 2
+    monkeypatch.setattr(layers, "wall_classes", lambda rel, path: (cls, "wallseg"))
+    monkeypatch.setattr(layers, "text", lambda rel, path: Layer(image=rel, width=200, height=100, layer="text",
+                                                                 model="test", tokens=[
+        TextToken(text="Kuche", bbox=(42, 41, 58, 49), score=0.9),  # OCR of the drawing's own label: dropped
+        TextToken(text="WC", bbox=(150, 70, 160, 80), score=0.9)]))  # text the PDF parser has no room for: kept
+    monkeypatch.setattr(rooms, "_net_maps", lambda rel, shape: (None, None))
+    geo = rooms.geometry_from_pdf(graph, "uploads/p.pdf.png", png, 2.0)
+    assert (geo.image, geo.width, geo.height, geo.model) == ("uploads/p.pdf", 100, 50, "wallseg")
+    left, right = sorted(geo.rooms, key=lambda r: r.bbox[0])
+    assert (left.type, left.tier, left.labeled_area_m2) == ("kitchen", "strong", 12.5)
+    assert [lb.text for lb in left.labels] == ["Küche 1.01 12.5 m²"] and left.labels[0].bbox == (20, 20, 30, 25)
+    assert left.evidence[0].source == "drawing"
+    assert right.labeled_area_m2 is None and "Zimmer 1.02" in [lb.text for lb in right.labels]
+    assert all(0 <= x <= 100 and 0 <= y <= 50 for rm in geo.rooms for x, y in rm.polygon)
+    assert 1900 < left.area_px < 2100  # ~91 x 88 px inside the walls = ~8000 px² = ~2000 pt²
+    assert all(0 <= v <= 100 for sg in geo.wall_segments for v in (*sg.p0, *sg.p1))
+
+
+def test_pdf_geometry_keeps_dxf_outlines(tmp_path):
+    from app.models import PlanItem
+
+    graph = PlanGraph(image="p.pdf", width=100, height=50, source="pdf", items=[
+        PlanItem(id="room-1.01", category="room", bbox=(0, 0, 10, 10), text="Bad 1.01 4.0 m²",
+                 polygon=[(0, 0), (10, 0), (10, 10), (0, 10)])])
+    geo = rooms.geometry_from_pdf(graph, "unused.png", tmp_path / "unused.png", 2.0)  # no render needed
+    assert geo.model == "pdf" and geo.rooms[0].type == "bathroom" and geo.rooms[0].polygon[1] == (10, 0)
 
 
 def test_low_confidence_label_gives_no_type(monkeypatch):

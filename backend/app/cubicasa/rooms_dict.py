@@ -51,6 +51,33 @@ PURPOSE_LABELS: dict[str, list[str]] = {
     "balcony": ["BALCONY", "BALKONG"],
 }
 
+# German, French and Italian room names (printed in full on vector PDFs, e.g. the Swiss dwelling plans). A generic
+# "room" (Zimmer / Pièce / Stanza) is a bedroom, like the Finnish H / HUONE above.
+for _typ, _words in {
+    "living": ["WOHNEN", "WOHNZIMMER", "WOHNENESSEN", "SALON", "SÉJOUR", "SEJOUR", "SÉJOURREPAS", "SEJOURREPAS",
+               "SOGGIORNO", "SOGGIORNOPRANZO"],
+    "dining": ["ESSEN", "ESSZIMMER", "REPAS", "SALLEÀMANGER", "SALLEAMANGER", "PRANZO", "SALADAPRANZO"],
+    "entry": ["KORRIDOR", "FLUR", "DIELE", "EINGANG", "EINGANGSHALLE", "GANG", "COULOIR", "ENTRÉE", "HALLDENTRÉE",
+              "DÉGAGEMENT", "DEGAGEMENT", "CORRIDOIO", "INGRESSO", "DISIMPEGNO"],
+    "closet": ["ANKLEIDE", "ANKLEIDEZIMMER", "DRESSING", "GARDEROBE", "GUARDAROBA", "CABINAARMADIO"],
+    "storage": ["REDUIT", "RÉDUIT", "ABSTELLRAUM", "ABSTELLKAMMER", "DÉBARRAS", "DEBARRAS", "RIPOSTIGLIO",
+                "DEPOSITO"],
+    "utility": ["WASCHKÜCHE", "WASCHRAUM", "BUANDERIE", "LAVANDERIA"],
+    "study": ["BÜRO", "ARBEITSZIMMER", "BUREAU", "UFFICIO"],
+    "technical": ["TECHNIK", "HAUSTECHNIK", "TECHNIQUE", "LOCALETECNICO"],
+    "terrace": ["TERRASSE", "TERRAZZA"],
+    "garage": ["AUTORIMESSA"],
+    "stairs": ["TREPPE", "TREPPENHAUS", "ESCALIER", "CAGEDESCALIER", "SCALA", "VANOSCALA"],
+    "basement": ["KELLER", "CAVE", "CANTINA"],
+    "bedroom": ["ZIMMER", "SCHLAFZIMMER", "SCHLAFEN", "KINDERZIMMER", "PIÈCE", "PIECE", "CHAMBRE", "CHAMBREÀCOUCHER",
+                "CHAMBREACOUCHER", "STANZA", "CAMERA", "CAMERADALETTO"],
+    "kitchen": ["KÜCHE", "KUCHE", "CUISINE", "CUCINA"],
+    "bathroom": ["BADEZIMMER", "DUSCHE", "BAIN", "SALLEDEBAIN", "SALLEDEBAINS", "SALLEDEAU", "DOUCHE", "BAGNO"],
+    "wc": ["TOILETTE", "TOILETTEN", "GABINETTO"],
+    "balcony": ["BALKON", "BALCON", "BALCONE", "LOGGIA"],
+}.items():
+    PURPOSE_LABELS[_typ] += _words
+
 
 def normalise(token: str) -> str:
     t = token.upper().strip()
