@@ -68,6 +68,33 @@ def get_plan(plan_id: UUID) -> dict:
     return plans[0]
 
 
+@app.get("/api/plans/{plan_id}/image")
+def get_plan_image(plan_id: UUID) -> Response:
+    """Stream the private source image for a plan to its frontend viewer."""
+    plan = get_plan(plan_id)
+    images = [image for image in plan.get("plan_images", []) if image.get("role") == "source"]
+    if not images:
+        raise HTTPException(status_code=404, detail="Plan has no source image")
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    image_ref = images[0]
+    object_path = "/".join(quote(part, safe="") for part in image_ref["object_path"].split("/"))
+    bucket = quote(image_ref["bucket_id"], safe="")
+    request = Request(
+        f"{supabase_url}/storage/v1/object/{bucket}/{object_path}",
+        headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+    )
+    try:
+        with urlopen(request, timeout=30) as upstream:
+            content = upstream.read()
+            media_type = upstream.headers.get("Content-Type", "application/octet-stream")
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail="Could not download the uploaded plan image") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase Storage") from error
+    return Response(content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
+
+
 @app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
 def analyze_plan(plan_id: UUID) -> PlanGraph:
     """Download the uploaded source image from Supabase and analyze it with the plan models."""

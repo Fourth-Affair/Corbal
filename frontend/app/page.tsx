@@ -1,6 +1,7 @@
 "use client";
 
 import { DragEvent, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 // The app's table/function types are managed by SQL migrations rather than generated TS types.
@@ -12,12 +13,14 @@ function getSupabaseClient(url: string, anonKey: string) {
 }
 
 export default function Home() {
+  const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -40,11 +43,13 @@ export default function Home() {
 
     // PDFs remain available for the existing local preview. Images are uploaded to Supabase.
     if (!selected.type.startsWith("image/")) return;
+    setIsUploading(true);
 
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
     const bucket = process.env.NEXT_PUBLIC_SUPABASE_BUCKET || "plans";
     if (!supabaseUrl || !supabaseAnonKey) {
+      setIsUploading(false);
       setUploadError("Supabase is not configured. Add the project URL and anon key to frontend/.env.local.");
       return;
     }
@@ -59,8 +64,10 @@ export default function Home() {
       p_bucket_id: bucket,
       p_object_path: path,
       p_role: "source",
+      p_metadata: { filename: selected.name, content_type: selected.type },
     });
     if (recordError) {
+      setIsUploading(false);
       setUploadStatus(null);
       setUploadError(`Plan record could not be created, so the image was not uploaded: ${recordError.message}`);
       return;
@@ -72,6 +79,7 @@ export default function Home() {
     });
 
     if (error) {
+      setIsUploading(false);
       await supabase.rpc("set_plan_image_upload_status", {
         p_plan_id: planId,
         p_object_path: path,
@@ -86,22 +94,8 @@ export default function Home() {
       p_object_path: path,
       p_status: "uploaded",
     });
-    const savedStatus = `Image uploaded to Supabase. Plan ID: ${planId}${statusError ? " (upload status confirmation pending)" : ""}`;
-    setUploadStatus(`${savedStatus} Analyzing plan…`);
-    try {
-      const response = await fetch(`/api/plans/${planId}/analyze`, { method: "POST" });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Plan analysis failed");
-      }
-      const counts = Object.entries(result.counts ?? {})
-        .map(([name, count]) => `${name.replaceAll("_", " ")}: ${count}`)
-        .join(", ");
-      setUploadStatus(`Analysis complete. ${counts || "Plan parsed"}${statusError ? " · Upload status pending" : ""} · ID: ${planId}`);
-    } catch (error) {
-      setUploadStatus(savedStatus);
-      setAnalysisError(`Analysis failed: ${error instanceof Error ? error.message : "Unknown error"}`);
-    }
+    router.push(`/plans/${planId}`);
+    if (statusError) console.error("Plan image uploaded, but status confirmation failed", statusError);
   };
 
   const handleDrop = (event: DragEvent<HTMLElement>) => {
@@ -141,8 +135,10 @@ export default function Home() {
           onDragLeave={() => setIsDragging(false)}
           onDrop={handleDrop}
         >
-          {preview ? (
-            <img className="plan-image" src={preview} alt={`Original floor plan: ${file?.name ?? "uploaded plan"}`} />
+          {isUploading ? (
+            <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Uploading your floor plan</h1><p>This usually takes a few seconds.</p></div>
+          ) : preview ? (
+            <div className="image-frame"><img className="plan-image" src={preview} alt={`Original floor plan: ${file?.name ?? "uploaded plan"}`} /></div>
           ) : file ? (
             <div className="pdf-preview">
               <div className="pdf-icon" aria-hidden="true">PDF</div>
