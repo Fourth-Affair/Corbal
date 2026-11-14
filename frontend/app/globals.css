@@ -39,7 +39,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 
 .drawing-panel { position: relative; min-width: 0; min-height: 0; display: grid; place-items: center; overflow: hidden; background: #eef0ed; }
 .drawing-panel.is-dragging { background: #e8f1ea; box-shadow: inset 0 0 0 2px #629576; }
-.plan-image { display: block; width: 100%; height: 100%; object-fit: contain; }
+.plan-image { display: block; width: calc(100% - 48px); height: calc(100% - 48px); object-fit: contain; }
 .upload-empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; }
 .upload-icon { width: 42px; height: 42px; margin-bottom: 16px; border-radius: 10px; display: grid; place-items: center; background: #e2eee5; color: #3d7652; font-size: 22px; }
 .upload-empty-state h1 { margin: 0; color: #33443a; font: 700 19px Manrope, sans-serif; letter-spacing: -.2px; }
@@ -82,6 +82,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
   .connection-status { font-size: 10px; }
   .work-area { display: flex; flex-direction: column; gap: 1px; }
   .drawing-panel { min-height: 54vh; }
+  .plan-image { width: calc(100% - 32px); height: calc(100% - 32px); }
   .chat-panel { min-height: 520px; }
   .conversation { min-height: 220px; }
 }
