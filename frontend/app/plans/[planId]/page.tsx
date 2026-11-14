@@ -971,21 +971,28 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
-          {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose type is backed by a readable label or decisive fixtures">Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>}
-          {ready && geometry && <button className="toolbar-button" type="button" onClick={() => setAnimationRun(run => run + 1)}>↻ Replay analysis</button>}
-          {geometry && showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button className={`toolbar-button${showUncertain ? " is-on" : ""}`} type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)} title="Spaces whose type is only a weak guess (dashed) or unknown (grey)">Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
-          {geometry && geometry.wall_segments.length > 0 && <button className={`toolbar-button${showWalls ? " is-on" : ""}`} type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)} title="Wall centrelines: exterior walls thick">Walls ({geometry.wall_segments.length})</button>}
+          <Link className="toolbar-button building-link" href="/building">Building view</Link>
+          {geometry && <details className="toolbar-menu"><summary className={`toolbar-button${showRooms || showWalls ? " is-on" : ""}`}>Overlays</summary><div className="toolbar-menu-popover" onClick={event => { if (event.target instanceof HTMLElement && event.target.closest("button")) event.currentTarget.closest("details")?.removeAttribute("open"); }}>
+            <button type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)}>{showRooms ? "✓ " : ""}Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>
+            {showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)}>{showUncertain ? "✓ " : ""}Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
+            {geometry.wall_segments.length > 0 && <button type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)}>{showWalls ? "✓ " : ""}Walls ({geometry.wall_segments.length})</button>}
+          </div></details>}
           {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
-          {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
-          {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
-          {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
-          {ready && !correctionMode && <button className="toolbar-button" type="button" onClick={startCorrectionReview}>Review detections</button>}
-          {ready && !correctionMode && !outlineMode && <button className={`toolbar-button${referenceMode ? " is-on" : ""}`} type="button" aria-pressed={referenceMode} onClick={() => { setReferenceMode(mode => !mode); setReferenceDragStart(null); setReferenceDragEnd(null); }}>{referenceMode ? "Cancel reference" : "Refer to drawing"}</button>}
+          {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale set</span>}
+          {ready && scaleLoaded && !scaleMode && !scale && <button className="toolbar-button primary-button" type="button" onClick={startScaleCalibration}>Set scale</button>}
+          {ready && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
           {correctionMode && <button className="toolbar-button" type="button" onClick={() => { setCorrectionMode(false); setCorrectionAddMode(false); setSelectedEvidenceId(null); }}>Done reviewing</button>}
-          {ready && scaleLoaded && !outlineMode && <button className="toolbar-button" type="button" onClick={() => startOutlineReview()}>{savedOutlines.length ? `Edit ${savedOutlines[0].label?.toLowerCase() ?? "outline"}` : floorOutlines.length ? "Review detected outline" : "Draw outline"}</button>}
+          {referenceMode && <button className="toolbar-button" type="button" onClick={() => { setReferenceMode(false); setReferenceDragStart(null); setReferenceDragEnd(null); }}>Cancel reference</button>}
           {outlineMode && <button className="toolbar-button" type="button" onClick={() => setOutlineMode(false)}>Cancel outline</button>}
+          {ready && !scaleMode && !correctionMode && !outlineMode && !referenceMode && <details className="toolbar-menu"><summary className="toolbar-button">More tools</summary><div className="toolbar-menu-popover" onClick={event => { if (event.target instanceof HTMLElement && event.target.closest("button, a")) event.currentTarget.closest("details")?.removeAttribute("open"); }}>
+            {scaleLoaded && scale && <button type="button" onClick={startScaleCalibration}>Adjust scale</button>}
+            {ready && geometry && <button type="button" onClick={() => setAnimationRun(run => run + 1)}>↻ Replay analysis</button>}
+            <button type="button" onClick={startCorrectionReview}>Review detections</button>
+            <button type="button" onClick={() => { setReferenceMode(true); setReferenceDragStart(null); setReferenceDragEnd(null); }}>Refer to drawing</button>
+            {scaleLoaded && <button type="button" onClick={() => startOutlineReview()}>{savedOutlines.length ? `Edit ${savedOutlines[0].label?.toLowerCase() ?? "outline"}` : floorOutlines.length ? "Review detected outline" : "Draw outline"}</button>}
+            <Link href="/">Upload another plan</Link>
+          </div></details>}
           <span className="connection-status"><i /> {error ?? (imageStatus === "uploaded" ? analysisStatus : "Loading saved plan…")}</span>
-          <Link className="toolbar-button" href="/">Upload another plan</Link>
         </div>
       </header>
       <div className="work-area">

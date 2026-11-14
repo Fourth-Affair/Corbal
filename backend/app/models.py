@@ -92,6 +92,11 @@ class PlanQuestionRequest(BaseModel):
     references: list[PlanReference] = Field(default_factory=list, max_length=10)
 
 
+class BuildingQuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    floors: list[dict[str, str]] = Field(min_length=1, max_length=20)
+
+
 class ChatTurn(BaseModel):
     role: Literal["user", "assistant"]
     text: str = Field(max_length=4000)

@@ -9,7 +9,7 @@ import re
 _RULES: list[tuple[str, str]] = [
     ("sinks", r"\bsinks?\b|wash ?basin|allas"),
     ("showers_baths", r"shower|bathtub|suihku|kylpyamme"),
-    ("wc_seats", r"toilet bowl|wc seat|wc-istuin"),
+    ("wc_seats", r"toilet(?!\s+rooms?)|wc seat|wc-istuin"),
     ("bathrooms", r"bathroom|washroom|kylpy- tai pesuhuone|kylpyhuone|pesuhuone"),
     ("wc_rooms", r"wc rooms?|toilet rooms?|wc-tila"),
     ("doors", r"\bdoors?\b|\bove[ai]?\b|\boveä\b"),

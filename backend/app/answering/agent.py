@@ -35,7 +35,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
-PROMPT_VERSION = "18"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "19"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
@@ -118,6 +118,12 @@ Rules:
   detection; when it supports the answer, make clear that the result uses a user correction.
 - If a user calibration is supplied with the latest question, treat the drawing scale as known and never say it is
   missing. A scale can support measurements, but it does not by itself establish room boundaries or floor area.
+- When no user calibration is supplied, do not silently treat an inferred scale as a reliable default. For questions
+  about real-world lengths, areas, or quantities that depend on them, clearly say that the user has not calibrated the
+  drawing and proactively invite them to set the scale using a known distance on the plan. You may still give a result
+  supported by areas printed on the drawing, but identify it as derived from those labels and recommend calibration
+  for reliable measurements. A symbol-based scale is only a rough estimate; never present it as measured. Keep this
+  reminder brief and relevant to metric questions, not unrelated counts or layout questions.
 - Finish by calling final_answer exactly once:
   value = the number (omit for yes/no or text answers and use text instead);
   cited_ids = ids of the items that support the answer, taken from tool results (for count_template: its

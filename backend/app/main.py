@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, Response
 
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
+from app.models import (Answer, AskRequest, BuildingQuestionRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
                         PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest, PlanScale,
                         PlanScaleCalibration)
 from app.router import route
@@ -901,6 +901,39 @@ def _template_answer(question: str, graph) -> Answer:
     if template is None:
         return Answer(answer=None, confidence="not_found", explanation="This question type is not supported yet.")
     return count(graph, template)
+
+
+@app.post("/api/buildings/ask")
+def ask_building(req: BuildingQuestionRequest) -> dict:
+    """Answer count questions across independently analyzed floors, with a per-floor breakdown."""
+    results: list[tuple[str, Answer]] = []
+    graphs: list[PlanGraph] = []
+    for floor in req.floors:
+        try:
+            plan_id = UUID(floor["id"])
+        except (KeyError, ValueError):
+            raise HTTPException(status_code=400, detail="Each floor needs a valid plan id") from None
+        graph = _saved_graph(plan_id)
+        if graph is None:
+            raise HTTPException(status_code=409, detail=f"{floor.get('name', 'A floor')} is still being analyzed")
+        graph = _apply_corrections(graph, _corrections_request(plan_id) or [])
+        graphs.append(graph)
+        results.append((floor.get("name", "Floor"), _template_answer(req.question, graph)))
+
+    floor_results = [{"id": floor["id"], "name": floor.get("name", "Floor"),
+                      "answer": result.answer, "unit": result.unit, "confidence": result.confidence,
+                      "explanation": result.explanation, "citations": [item.model_dump(mode="json") for item in result.citations],
+                      "width": graph.width, "height": graph.height}
+                     for floor, (_, result), graph in zip(req.floors, results, graphs)]
+    if any(result.answer is None or not isinstance(result.answer, (int, float)) for _, result in results):
+        detail = "; ".join(f"{name}: {result.explanation}" for name, result in results if result.answer is None)
+        return {"answer": None, "confidence": "not_found", "explanation": detail or "This question cannot yet be combined across floors.", "floors": floor_results}
+    total = sum(result.answer for _, result in results)
+    breakdown = "; ".join(f"{name}: {result.answer}" for name, result in results)
+    confidence = "low" if any(result.confidence == "low" for _, result in results) else "medium"
+    return {"answer": total, "unit": results[0][1].unit, "confidence": confidence,
+            "explanation": f"Across {len(results)} selected floors ({breakdown}). Evidence is highlighted on each plan below.",
+            "floors": floor_results}
 
 
 @app.post("/api/ask")

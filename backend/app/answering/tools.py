@@ -308,13 +308,15 @@ class PlanTools:
             if sym is not None:
                 return ("No drawing scale. rough_area_m2_range is a wide bound estimated from the typical sizes of the "
                         "detected doors and fixtures: give it only as a rough range ('roughly X-Y m²'), never as a "
-                        "measurement, and suggest setting the scale for exact sizes.")
-            return "No drawing scale: metric sizes are unknown except areas written on the drawing."
+                        "measurement, and invite the user to set the scale for reliable sizes.")
+            return ("No user-calibrated drawing scale: metric sizes are unknown except areas written on the drawing. "
+                    "For real-world measurements, invite the user to set the scale using a known distance on the plan.")
         warn = f" Warning: this scale {sc.warning}." if sc.warning else ""
         if sc.source == "calibration":
             return "Metric sizes use the user's scale calibration." + warn
         return (f"Metric sizes use a scale derived from the areas written in rooms {', '.join(sc.rooms)}: "
-                "mention that they are derived, not measured." + warn)
+                "mention that they are derived, not measured, and invite the user to calibrate the drawing for reliable "
+                "measurements." + warn)
 
     def list_rooms(self, include_uncertain: bool = False) -> tuple[dict, ToolTrace]:
         rooms = [rm for rm in self.rooms.values() if include_uncertain or rm.tier == "strong"]
