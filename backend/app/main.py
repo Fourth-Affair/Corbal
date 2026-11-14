@@ -1,5 +1,7 @@
 import io
 import json
+import logging
+import math
 import os
 from typing import Literal
 from urllib.error import HTTPError, URLError
@@ -12,10 +14,12 @@ from fastapi.responses import FileResponse, Response
 
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import Answer, AskRequest, Layer, PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest
+from app.models import (Answer, AskRequest, Layer, PlanGeometry, PlanGraph, PlanItem, PlanOutlinesRequest,
+                        PlanQuestionRequest, PlanScaleCalibration)
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
+log = logging.getLogger(__name__)
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
@@ -297,6 +301,7 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
         except Exception as error:  # noqa: BLE001  unreadable or encrypted PDF
             raise HTTPException(status_code=422, detail=f"Uploaded PDF could not be read: {error}") from error
         _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+        _store_geometry_safely(plan_id, graph)
         return graph
 
     # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
@@ -321,7 +326,123 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
     _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+    _store_geometry_safely(plan_id, graph)
     return graph
+
+
+# ---------------------------------------------------------------- plan geometry (rooms, walls, openings)
+
+def _geometry_request(plan_id: UUID, method: str = "GET", body: dict | None = None) -> dict | None:
+    """Read or upsert the plan_geometry row (backend-only credentials, like plan_knowledge)."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    query = urlencode({"on_conflict": "plan_id"}) if method == "POST" else urlencode(
+        {"plan_id": f"eq.{plan_id}", "select": "geometry"})
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
+    if method == "POST":
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_geometry?{query}",
+                      data=json.dumps(body).encode() if body is not None else None, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=30) as response:
+            if method == "POST":
+                return None
+            rows = json.loads(response.read())
+            return rows[0]["geometry"] if rows else None
+    except HTTPError as error:
+        reason = error.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Plan geometry request failed: {reason or error.reason}") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+
+
+def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
+    from app.cubicasa.rooms import geometry_from_graph, geometry_from_image
+
+    if graph.source == "pdf":
+        return geometry_from_graph(graph)
+    from app.config import CACHE_DIR
+
+    rel = f"uploads/{plan_id}.png"
+    path = CACHE_DIR / rel
+    if not path.is_file():  # cache cleared since the analysis: fetch the source image again
+        from PIL import Image
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB").save(path, format="PNG")
+    return geometry_from_image(rel, path, graph)
+
+
+def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
+    _geometry_request(plan_id, "POST", {
+        "plan_id": str(plan_id), "geometry": geometry.model_dump(mode="json", exclude={"rooms": {"__all__": {"area_m2"}}}),
+        "model": geometry.model, "labeled_rooms": sum(r.confidence == "labeled" for r in geometry.rooms),
+        "rough_rooms": sum(r.confidence == "rough" for r in geometry.rooms)})
+
+
+def _store_geometry_safely(plan_id: UUID, graph: PlanGraph) -> None:
+    """Geometry is an extra layer: a failure here must not fail the analysis (it is retried on first read)."""
+    try:
+        _store_geometry(plan_id, _compute_geometry(plan_id, graph))
+    except Exception as error:  # noqa: BLE001
+        log.warning("plan %s: geometry not stored (%s)", plan_id, error)
+
+
+def _metres_per_unit(scale: PlanScaleCalibration) -> float | None:
+    """Metres per image pixel (PDF point) from the user's two-point calibration."""
+    (x1, y1), (x2, y2) = scale.points
+    span = math.hypot(x2 - x1, y2 - y1)
+    if span <= 0:
+        return None
+    unit_m = {"m": 1.0, "cm": 0.01, "ft": 0.3048, "in": 0.0254}[scale.unit]
+    return scale.distance * unit_m / span
+
+
+def with_areas(geometry: PlanGeometry, scale: PlanScaleCalibration | None) -> PlanGeometry:
+    if scale and (m := _metres_per_unit(scale)):
+        for room in geometry.rooms:
+            room.area_m2 = round(room.area_px * m * m, 2)
+    return geometry
+
+
+def _plan_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
+    """Stored geometry, computed and stored on first use for plans analysed before it existed."""
+    stored = _geometry_request(plan_id)
+    if stored is not None:
+        try:
+            return PlanGeometry.model_validate(stored)
+        except ValueError:
+            log.warning("plan %s: stored geometry is invalid, recomputing", plan_id)
+    geometry = _compute_geometry(plan_id, graph)
+    _store_geometry(plan_id, geometry)
+    return geometry
+
+
+def _saved_scale(plan_id: UUID) -> PlanScaleCalibration | None:
+    try:
+        row = _scale_request(plan_id)
+        return PlanScaleCalibration.model_validate(row) if row else None
+    except (HTTPException, ValueError):
+        return None
+
+
+@app.get("/api/plans/{plan_id}/geometry", response_model=PlanGeometry)
+def get_plan_geometry(plan_id: UUID, rough: bool = Query(True, description="include rough (unlabelled) rooms")
+                      ) -> PlanGeometry:
+    """Rooms (polygons, purpose read from the drawing, labeled vs rough), walls and openings of an analysed plan.
+    Room areas in m² are filled in when the plan has a scale calibration."""
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    try:
+        geometry = _plan_geometry(plan_id, graph)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=f"Wall model unavailable: {error}") from error
+    if not rough:
+        geometry.rooms = [r for r in geometry.rooms if r.confidence == "labeled"]
+    return with_areas(geometry, _saved_scale(plan_id))
 
 
 @app.post("/api/plans/{plan_id}/ask", response_model=Answer)
@@ -337,7 +458,12 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
-        if (result := answer(req.question, graph, req.history, req.scale)) is not None:
+        geometry = None
+        try:  # room tools for the agent; without geometry it answers with the item tools only
+            geometry = with_areas(_plan_geometry(plan_id, graph), req.scale)
+        except Exception as error:  # noqa: BLE001
+            log.warning("plan %s: no geometry for the agent (%s)", plan_id, error)
+        if (result := answer(req.question, graph, req.history, req.scale, geometry=geometry)) is not None:
             return result
     return _template_answer(req.question, graph)
 

@@ -98,3 +98,63 @@ class Layer(BaseModel):
     items: list[PlanItem] = Field(default_factory=list)
     tokens: list[TextToken] = Field(default_factory=list)
     stats: dict[str, float] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------- plan geometry (rooms + walls), stored per plan
+
+
+class RoomLabel(BaseModel):
+    """Text read inside a room (OCR on images, the drawing's own text on PDFs)."""
+
+    text: str
+    bbox: tuple[float, float, float, float]
+    score: float | None = None
+    room_type: str | None = None  # the purpose the text names (e.g. "MH" -> bedroom, "OH" -> living), if any
+
+
+class RoomShape(BaseModel):
+    """One enclosed space. Coordinates in pixels of the plan image (PDF: points of page 1), origin top-left."""
+
+    id: str  # citable, e.g. "space-3"
+    # bedroom, bathroom, wc, sauna, kitchen, balcony, living, dining, entry, closet, storage, utility, study,
+    # technical, terrace, garage, stairs, basement, or unknown
+    type: str
+    type_source: Literal["label", "segmentation", "drawing", "unknown"]  # label = OCR text inside the room
+    # labeled = a clear purpose label was read inside the room (show it, state it); rough = a wall-enclosed space with
+    # no readable label: shape and type are guesses (hidden from the overlay by default, never stated as fact)
+    confidence: Literal["labeled", "rough"]
+    purposes: list[str] = Field(default_factory=list)  # every purpose labelled inside (open plan: living + kitchen)
+    name: str | None = None  # the room's own label as written, e.g. "MH" or "KEITTIÖ"
+    labels: list[RoomLabel] = Field(default_factory=list)  # all text inside the room
+    polygon: list[tuple[float, float]]
+    bbox: tuple[float, float, float, float]
+    area_px: float
+    labeled_area_m2: float | None = None  # an area written in the room ("12,5 m²"), if any
+    area_m2: float | None = None  # area_px through the user's scale calibration (filled when served, not stored)
+    neighbours: list[str] = Field(default_factory=list)  # rooms across a wall
+    connections: list[str] = Field(default_factory=list)  # opening ids leading out of this room
+
+
+class WallShape(BaseModel):
+    id: str  # wall-N or opening-N
+    kind: Literal["wall", "opening"]
+    polygon: list[tuple[float, float]]
+    holes: list[list[tuple[float, float]]] = Field(default_factory=list)
+    bbox: tuple[float, float, float, float]
+    area_px: float
+    rooms: list[str] = Field(default_factory=list)  # opening: the rooms it joins ("outside" = exterior)
+    symbol: str | None = None  # opening: "door" / "window" when a detected symbol overlaps it
+
+
+class PlanGeometry(BaseModel):
+    """Rooms and walls of one plan, stored in Supabase (plan_geometry) for overlays and the answering agent."""
+
+    version: int = 1
+    image: str
+    width: int
+    height: int
+    model: str  # what produced the walls, e.g. "wallseg", "cubicasa-net", "pdf"
+    wall_thickness_px: float | None = None
+    rooms: list[RoomShape] = Field(default_factory=list)
+    walls: list[WallShape] = Field(default_factory=list)
+    openings: list[WallShape] = Field(default_factory=list)
