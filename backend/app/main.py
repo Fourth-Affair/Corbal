@@ -27,7 +27,7 @@ PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
 # "llm" = Gemini agent with tools over the plan (falls back to "template" without GEMINI_API_KEY or on API errors).
 ANSWERER = os.environ.get("ANSWERER", "llm")
 
-# Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser.
+# Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser, .ifc -> app.ifc.
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
 
@@ -699,6 +699,17 @@ def _template_answer(question: str, graph) -> Answer:
 
 @app.post("/api/ask")
 def ask(req: AskRequest) -> Answer:
+    if req.path.lower().endswith(".ifc"):  # BIM model: deterministic IFC tools, citations carry IFC GlobalIds
+        try:
+            resolve_dataset_path(req.path)
+        except FileNotFoundError:
+            raise HTTPException(404, f"File not found: {req.path}") from None
+        from app.ifc.answer import answer_question as ifc_answer
+
+        try:
+            return ifc_answer(req.path, req.question)
+        except FileNotFoundError as error:
+            return Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {error}")
     _check_path(req.path, pdf_ok=True)
     if _is_pdf(req.path):  # vector plan: deterministic parser, citations in PDF points
         from app.pdfplan.answer import answer_question

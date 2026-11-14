@@ -15,8 +15,8 @@
 Sets (deterministic from --seed; stored under dataset/, never committed):
 - dataset questions: cubicasa5k images of the official *test* split only (both languages, so EN/FI consistency can
   be checked), plus a sample of every other dataset. Plans are routed by file type like the API does: images ->
-  image pipeline (agent or template counter), PDFs -> app.pdfplan (deterministic, whatever --answerer says). File
-  types without a parser (.ifc) show up as 0% coverage, so the blind spot stays visible.
+  image pipeline (agent or template counter), PDFs -> app.pdfplan and IFC models -> app.ifc (both deterministic,
+  whatever --answerer says). File types without a parser show up as 0% coverage, so a blind spot stays visible.
 - paraphrases (app.answering.paraphrases) on test images: unseen wordings and languages. Ground truth = the SVG
   label count for the expected template; trap / out-of-scope questions expect not_found.
 - open questions (app.answering.openq) on test images: questions no count template covers (items in one room, rooms
@@ -284,6 +284,17 @@ def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dic
             res = Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {e}")
             rec["error"] = "parser"
         except Exception as e:  # noqa: BLE001  the API would return a 500: count it, keep the run going
+            res = Answer(answer=None, confidence="not_found", explanation=f"{type(e).__name__}: {e}")
+            rec["error"] = "crash"
+    elif path.lower().endswith(".ifc"):  # BIM model: deterministic parser, citations are IFC GlobalIds
+        from app.ifc.answer import answer_question as ifc_answer
+
+        try:
+            res = ifc_answer(path, item["question"])
+        except FileNotFoundError as e:
+            res = Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {e}")
+            rec["error"] = "parser"
+        except Exception as e:  # noqa: BLE001
             res = Answer(answer=None, confidence="not_found", explanation=f"{type(e).__name__}: {e}")
             rec["error"] = "crash"
     elif Path(path).suffix.lower() not in IMAGE_SUFFIXES:

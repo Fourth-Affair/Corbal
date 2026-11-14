@@ -78,7 +78,7 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
       `Layer` response shape; cached per image and weights).
     - ground truth: `labels_from_svg.py`.
   - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
-    `app/pdfplan/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
+    `app/pdfplan/`, `.ifc` -> `app/ifc/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
     saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.
   - `app/pdfplan/` — vector PDF plans, no vision. `text.py`: text runs with boxes (pdfium). `parse.py`: rooms from
     centred "name / number / area" stacks and apartment tags ("Whg. A") in the PDF text; if a same-name `.dxf` sits
@@ -87,9 +87,20 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     texts with an affine fit. Without a DXF, symbol counts use the image detector on the rendered page (low
     confidence) and apartment areas say not found. `answer.py`: EN/DE/FR/IT questions -> 12 templates.
     `python -m app.pdfplan.eval [--prefix data/swiss_dwellings/] [--split eval] [--no-dxf]`.
+  - `app/ifc/` — IFC (BIM) models, deterministic, no API key. `model.py`: ifcopenshell -> IfcModel evidence (header /
+    IfcApplication / schema, project / sites / buildings / storeys, every element with class, effective kind (IFC2X3
+    generic class + type object -> IfcSanitaryTerminal etc.), storey, type, materials + layer thicknesses, all
+    properties and quantities converted to m / m² / m³ in code, spaces with floor area / volume / height measured
+    from their 3D shape, systems / zones); cached in `CACHE_DIR/ifc/`. Space net area = NetFloorArea quantity > body
+    geometry > GrossFloorArea > area property (the dataset's "net floor area" equals the geometry, not Revit's Area
+    property). `tools.py`: general tools (count / select / group by class + storey + filters, find spaces, sum /
+    extreme of a quantity, types, materials, storeys, metadata, systems), every result carries GlobalIds.
+    `answer.py`: EN/DE/FI/SV question -> operation -> tools -> Answer; citations are PlanItems with id = IFC
+    GlobalId, raw = IFC class, bbox (0,0,0,0). Unmapped -> not_found. Not yet offered to the Gemini agent.
+    `python -m app.ifc.eval [--preview]` (counts exact, numbers within 2%, text scored approximately).
   - `app/eval.py` — exact-match eval per template (counting models only, bypasses the agent).
   - `app/bench.py` — benchmark of the `/api/ask` answer path, routed by file type like the API (images -> agent /
-    template counter, PDFs -> `app/pdfplan/`, anything else = unsupported): fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
+    template counter, PDFs -> `app/pdfplan/`, IFC -> `app/ifc/`, anything else = unsupported): fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
     test split EN+FI, paraphrases/traps from `app/answering/paraphrases.py`, samples of every other dataset), runs in
     `dataset/runs/bench/` (meta: git sha, set hash, graph cache, Gemini model/prompt version), metrics: accuracy with
     image-bootstrap CI, coverage, precision, calibration per confidence, citation validity, EN/FI consistency,
@@ -205,6 +216,13 @@ held-out odd half **99.0%**. All counts, room labels and per-room areas are 100%
 apartment / floor area totals 3–10% too high (unnamed numbered rooms counted as indoor). PDF only (`--no-dxf`):
 52.8% — room labels 100%, but many plans print no areas and symbol counts fall back to the CubiCasa-trained
 detector. All 71 preview PDFs (2644 questions, incl. IFC renders and drawing sets): 88.5%.
+
+## Current IFC results (deterministic, `app.ifc.eval`)
+
+Full dataset (1188 questions): counts 100% (76), room / storey areas 100% (292), text ≈49% (820; approximate scoring
+of free-text reference answers); all 64.9%, coverage 91.2%, precision 67.6%. Preview (1076 questions, test set): areas
+99.0% (692), counts 48% / lengths 50% / volumes 50% (the misses are Danish / Estonian phrasings the word lists do not
+cover, answered not_found), text ≈54%; all 82.2%, coverage 90.8%, precision 88.5%.
 
 ## Conventions
 
