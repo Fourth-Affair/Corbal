@@ -102,11 +102,15 @@ def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list
         if size < 0.03 * H * W:
             continue
         ys, xs = bounds
-        region = (labels[ys, xs] == label).astype(np.uint8)
+        # pad by 1 px: the crop is the region's bounding box, and find_contours cannot close a boundary that lies on
+        # the array edge (a rectangular region would get no contour at all)
+        region = np.pad((labels[ys, xs] == label).astype(np.uint8), 1)
         contours = find_contours(region, 0.5)
         polygons = []
         for contour in contours:
-            polygon = Polygon([(float(x + xs.start), float(y + ys.start)) for y, x in contour])
+            if len(contour) < 4:  # degenerate (a few pixels): shapely needs >= 4 coordinates for a ring
+                continue
+            polygon = Polygon([(float(x - 1 + xs.start), float(y - 1 + ys.start)) for y, x in contour])
             if polygon.is_valid and polygon.area > 0:
                 polygons.append(polygon)
         if not polygons:
