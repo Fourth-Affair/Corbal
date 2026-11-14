@@ -165,6 +165,9 @@ class RoomShape(BaseModel):
     area_px: float
     labeled_area_m2: float | None = None  # an area written in the room ("12,5 m²"), if any
     area_m2: float | None = None  # area_px through the plan scale (filled when served, not stored)
+    # rough range from the symbol-size scale band, only when no better scale exists (filled when served)
+    area_m2_range: tuple[float, float] | None = None
+    size_check: str | None = None  # set when the size is implausible for the type (filled when served)
     neighbours: list[str] = Field(default_factory=list)  # rooms across a wall
     connections: list[str] = Field(default_factory=list)  # opening ids leading out of this room
     walls: list[str] = Field(default_factory=list)  # wall segment ids bounding the room
@@ -203,14 +206,20 @@ class PlanScale(BaseModel):
     """Metres per image pixel (PDF point) and where that number comes from."""
 
     m_per_px: float
-    source: Literal["calibration", "written_areas"]  # user's two-point calibration, or areas written in rooms
+    # calibration = the user's two points; written_areas = areas written in rooms; symbols = rough band from the
+    # known sizes of doors / toilets / sinks (app.cubicasa.size_priors), never a measurement
+    source: Literal["calibration", "written_areas", "symbols"]
     rooms: list[str] = Field(default_factory=list)  # written_areas: the rooms whose areas agreed
+    low: float | None = None  # symbols: band of plausible m/px
+    high: float | None = None
+    items: list[str] = Field(default_factory=list)  # symbols: the plan items used
+    warning: str | None = None  # e.g. the scale disagrees with the symbol sizes (filled when served)
 
 
 class PlanGeometry(BaseModel):
     """Rooms and walls of one plan, stored in Supabase (plan_geometry) for overlays and the answering agent."""
 
-    version: int = 2  # bump when the content changes: older stored rows are recomputed
+    version: int = 3  # bump when the content changes: older stored rows are recomputed
     image: str
     width: int
     height: int
@@ -221,3 +230,4 @@ class PlanGeometry(BaseModel):
     openings: list[WallShape] = Field(default_factory=list)
     wall_segments: list[WallSegment] = Field(default_factory=list)
     scale: PlanScale | None = None  # derived from written areas when stored; the user's calibration wins when served
+    symbol_scale: PlanScale | None = None  # rough band from symbol sizes (doors, toilets, ...): bounds, not a measurement

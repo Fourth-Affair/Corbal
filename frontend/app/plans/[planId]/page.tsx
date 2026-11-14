@@ -32,6 +32,8 @@ type RoomShape = {
   bbox: [number, number, number, number];
   area_m2?: number | null;
   labeled_area_m2?: number | null;
+  area_m2_range?: [number, number] | null; // rough, from door / fixture sizes
+  size_check?: string | null;
 };
 type WallSegment = {
   id: string;
@@ -55,7 +57,9 @@ type PlanGeometry = {
 function roomWhy(room: RoomShape): string {
   const reasons = room.evidence.filter(e => e.type === room.type && e.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3).map(e => e.detail);
   const conflict = room.conflicts.length ? ` · conflicting evidence: ${room.conflicts.join(", ")}` : "";
-  return reasons.length ? `${reasons.join("; ")}${conflict}` : "no evidence";
+  const size = room.size_check ? ` · size: ${room.size_check}` : "";
+  const rough = room.area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
+  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + rough;
 }
 
 // One colour per purpose; weak rooms are dashed, unknown spaces grey and dashed
@@ -68,7 +72,9 @@ const ROOM_COLOURS: Record<string, string> = {
 function roomCaption(room: RoomShape): string {
   const area = room.area_m2 ?? room.labeled_area_m2;
   const what = room.purposes.length > 1 ? room.purposes.join(" + ") : room.type;
-  return area != null ? `${what} · ${area.toFixed(1)} m²` : what;
+  if (area != null) return `${what} · ${area.toFixed(1)} m²`;
+  if (room.area_m2_range) return `${what} · ~${Math.round(room.area_m2_range[0])}–${Math.round(room.area_m2_range[1])} m²`;
+  return what;
 }
 
 type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };

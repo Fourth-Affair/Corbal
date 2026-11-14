@@ -82,6 +82,8 @@ Room and wall geometry is available:
   spaces whose purpose could not be determined. Report conflicting evidence when a tool lists it.
 - Sizes and lengths may be stated only as numbers a tool returned. Say where a metric number comes from: the user's
   scale calibration, a scale derived from areas written on the drawing, or an area written in the room itself.
+  rough_area_m2_range (from typical door / fixture sizes) may only be given as "roughly X-Y m²", marked as a rough
+  estimate. Mention a size_check or a scale warning when it is relevant to the question.
 - For whole-plan counts that count_template covers, count_template still takes precedence."""
 
 FINAL = {

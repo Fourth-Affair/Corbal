@@ -128,6 +128,10 @@ def _room_row(rm: RoomShape, detail: bool = False) -> dict[str, Any]:
         row["area_m2"] = rm.area_m2
     if rm.labeled_area_m2 is not None:
         row["area_m2_written_on_drawing"] = rm.labeled_area_m2
+    if rm.area_m2_range is not None:
+        row["rough_area_m2_range"] = list(rm.area_m2_range)  # from door / fixture sizes: bounds, not a measurement
+    if rm.size_check:
+        row["size_check"] = rm.size_check
     row["neighbours"] = rm.neighbours
     row["openings"] = len(rm.connections)
     if detail:
@@ -242,12 +246,18 @@ class PlanTools:
 
     def _scale_note(self) -> str:
         sc = self.geometry.scale if self.geometry else None
+        sym = self.geometry.symbol_scale if self.geometry else None
         if sc is None:
+            if sym is not None:
+                return ("No drawing scale. rough_area_m2_range is a wide bound estimated from the typical sizes of the "
+                        "detected doors and fixtures: give it only as a rough range ('roughly X-Y m²'), never as a "
+                        "measurement, and suggest setting the scale for exact sizes.")
             return "No drawing scale: metric sizes are unknown except areas written on the drawing."
+        warn = f" Warning: this scale {sc.warning}." if sc.warning else ""
         if sc.source == "calibration":
-            return "Metric sizes use the user's scale calibration."
+            return "Metric sizes use the user's scale calibration." + warn
         return (f"Metric sizes use a scale derived from the areas written in rooms {', '.join(sc.rooms)}: "
-                "mention that they are derived, not measured.")
+                "mention that they are derived, not measured." + warn)
 
     def list_rooms(self, include_uncertain: bool = False) -> tuple[dict, ToolTrace]:
         rooms = [rm for rm in self.rooms.values() if include_uncertain or rm.tier == "strong"]
@@ -262,6 +272,7 @@ class PlanTools:
         numbers: list[float] = [tiers["strong"], tiers["weak"], tiers["unknown"], len(rooms)]
         numbers += [rm.area_m2 for rm in rooms if rm.area_m2 is not None]
         numbers += [rm.labeled_area_m2 for rm in rooms if rm.labeled_area_m2 is not None]
+        numbers += [v for rm in rooms if rm.area_m2_range for v in rm.area_m2_range]
         return out, ToolTrace(item_ids=[rm.id for rm in rooms[:MAX_LIST]], numbers=numbers)
 
     def room_details(self, room_id: str) -> tuple[dict, ToolTrace]:
@@ -291,6 +302,7 @@ class PlanTools:
                        "Walls = wall segments bounding the room ('outside' = exterior). " + self._scale_note())
         numbers: list[float] = [len(inside), len(openings), len(walls)]
         numbers += [v for v in (rm.area_m2, rm.labeled_area_m2) if v is not None]
+        numbers += list(rm.area_m2_range or ())
         numbers += [v for sg in walls for v in (sg.length_m, sg.thickness_m, sg.length_px) if v is not None]
         return row, ToolTrace(item_ids=[rm.id] + [it.id for it in inside[:MAX_LIST]] + [sg.id for sg in walls[:MAX_LIST]],
                               numbers=numbers)

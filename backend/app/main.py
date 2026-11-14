@@ -528,8 +528,9 @@ def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
 def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
     _geometry_request(plan_id, "POST", {
         "plan_id": str(plan_id),
-        # metric values depend on the user's calibration at read time: stored in pixels only
-        "geometry": geometry.model_dump(mode="json", exclude={"rooms": {"__all__": {"area_m2"}},
+        # metric values and size checks depend on the user's calibration at read time: stored in pixels only
+        "geometry": geometry.model_dump(mode="json", exclude={"rooms": {"__all__": {"area_m2", "area_m2_range",
+                                                                                  "size_check"}},
                                                               "wall_segments": {"__all__": {"length_m", "thickness_m"}}}),
         "model": geometry.model, "strong_rooms": sum(r.tier == "strong" for r in geometry.rooms),
         "weak_rooms": sum(r.tier == "weak" for r in geometry.rooms)})
@@ -565,6 +566,9 @@ def with_metrics(geometry: PlanGeometry, calibration: PlanScaleCalibration | Non
         for seg in geometry.wall_segments:
             seg.length_m = round(seg.length_px * m, 2)
             seg.thickness_m = round(seg.thickness_px * m, 3)
+    from app.cubicasa.size_priors import check_sizes
+
+    check_sizes(geometry)  # rough ranges from symbol sizes + plausibility (may lower a room's tier)
     return geometry
 
 

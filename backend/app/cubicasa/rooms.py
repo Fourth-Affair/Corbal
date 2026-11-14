@@ -182,8 +182,11 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
         for rid in set(sg.rooms_left) | set(sg.rooms_right):
             if rid in by_id:
                 by_id[rid].walls.append(sg.id)
+    from app.cubicasa.size_priors import symbol_scale
+
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
-                        walls=walls, openings=openings, wall_segments=segments, scale=scale_from_written_areas(rooms))
+                        walls=walls, openings=openings, wall_segments=segments, scale=scale_from_written_areas(rooms),
+                        symbol_scale=symbol_scale(graph))
 
 
 def scale_from_written_areas(rooms: list[RoomShape]) -> PlanScale | None:

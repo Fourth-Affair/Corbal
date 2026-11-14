@@ -83,3 +83,45 @@ def test_wall_segments_of_two_rooms():
     assert outer and all("outside" in s.rooms_left + s.rooms_right for s in outer)
     top = [s for s in segs if s.orientation == "horizontal" and s.p0[1] < 10]
     assert top and sum(s.length_px for s in top) > 150  # the top wall spans most of the 200 px width
+
+
+def test_symbol_scale_band_and_size_checks():
+    from app.cubicasa.size_priors import check_sizes, symbol_scale
+    from app.models import PlanGeometry, PlanGraph, PlanItem
+
+    def item(i, cat, cls, side):
+        return PlanItem(id=f"{cat}-{i}", category=cat, cls=cls, bbox=(0, 0, side, side * 0.9), score=0.9)
+
+    # doors 40 px (0.7-1.0 m) and toilets 28 px (0.5-0.8 m) -> about 2.1 cm per pixel
+    graph = PlanGraph(image="x.png", width=500, height=500, source="model",
+                      items=[item(i, "door", "", 40) for i in range(4)] + [item(9, "fixture", "toilet", 28),
+                                                                          item(8, "window", "", 120)])
+    band = symbol_scale(graph)
+    assert band is not None and band.source == "symbols" and band.low < 0.021 < band.high
+    assert len(band.items) == 5  # windows are not used
+    assert symbol_scale(PlanGraph(image="x", width=1, height=1, source="model", items=graph.items[:2])) is None
+
+    def room(i, rtype, tier, area_px):
+        return RoomShape(id=f"space-{i}", type=rtype, tier=tier, polygon=[(0, 0), (1, 0), (1, 1)], bbox=(0, 0, 1, 1),
+                         area_px=area_px)
+    living_ok, living_tiny, speck = room(1, "living", "strong", 60000), room(2, "living", "strong", 5000), \
+        room(3, "unknown", "unknown", 300)
+    geo = PlanGeometry(image="x", width=500, height=500, model="t", rooms=[living_ok, living_tiny, speck],
+                       symbol_scale=band)
+    check_sizes(geo)
+    lo, hi = living_ok.area_m2_range
+    assert lo < 0.021 ** 2 * 60000 < hi and living_ok.size_check is None and living_ok.tier == "strong"
+    assert living_tiny.tier == "weak" and "implausibly small" in living_tiny.size_check  # ~2 m² living room
+    assert any(e.source == "geometry" and e.weight < 0 for e in living_tiny.evidence)
+    assert "door swing" in speck.size_check and speck.tier == "unknown"
+
+
+def test_written_scale_disagreeing_with_symbols_gets_a_warning():
+    from app.cubicasa.size_priors import check_sizes
+    from app.models import PlanGeometry, PlanScale
+
+    geo = PlanGeometry(image="x", width=1, height=1, model="t",
+                       scale=PlanScale(m_per_px=0.2, source="written_areas", rooms=["a", "b"]),
+                       symbol_scale=PlanScale(m_per_px=0.02, source="symbols", low=0.017, high=0.025))
+    check_sizes(geo)
+    assert geo.scale.warning and "disagrees" in geo.scale.warning
