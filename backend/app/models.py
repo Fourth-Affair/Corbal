@@ -233,8 +233,8 @@ class PlanGeometry(BaseModel):
     """Rooms and walls of one plan, stored in Supabase (plan_geometry) for overlays and the answering agent."""
 
     version: int = 5  # bump when the content changes: older stored rows are recomputed
-    # virtual walls closing door-less passages between rooms (p0, p1 in pixels), app.cubicasa.passages
-    passages: list[tuple[tuple[float, float], tuple[float, float]]] = Field(default_factory=list)
+    # straight cuts splitting a space between two room labels (p0, p1 in pixels), app.cubicasa.room_split
+    room_cuts: list[tuple[tuple[float, float], tuple[float, float]]] = Field(default_factory=list)
     image: str
     width: int
     height: int

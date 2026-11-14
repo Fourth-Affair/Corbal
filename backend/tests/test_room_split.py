@@ -1,8 +1,8 @@
-"""Splitting merged spaces (app.cubicasa.passages) and splitting merged window boxes (app.cubicasa.windows)."""
+"""Splitting merged spaces (app.cubicasa.room_split) and splitting merged window boxes (app.cubicasa.windows)."""
 
 import numpy as np
 
-from app.cubicasa import passages, windows
+from app.cubicasa import room_split, windows
 
 
 def _region():
@@ -14,7 +14,7 @@ def _region():
 
 
 def test_bedroom_open_to_living_room_is_cut_at_the_stub():
-    lab, cuts = passages.split_by_labels(_region(), [(50, 50, "bedroom"), (150, 50, "living")], t=4, min_area=500)
+    lab, cuts = room_split.split_by_labels(_region(), [(50, 50, "bedroom"), (150, 50, "living")], t=4, min_area=500)
     assert len(np.unique(lab[lab > 0])) == 2 and len(cuts) == 1
     (x0, _), (x1, _) = cuts[0]
     assert 95 <= x0 <= 105 and x0 == x1  # vertical cut through the stub's line
@@ -22,26 +22,15 @@ def test_bedroom_open_to_living_room_is_cut_at_the_stub():
 
 
 def test_open_plan_and_tiny_parts_stay_whole():
-    lab, cuts = passages.split_by_labels(_region(), [(50, 50, "kitchen"), (150, 50, "living")], t=4, min_area=500)
+    lab, cuts = room_split.split_by_labels(_region(), [(50, 50, "kitchen"), (150, 50, "living")], t=4, min_area=500)
     assert len(np.unique(lab[lab > 0])) == 1 and not cuts
-    lab, cuts = passages.split_by_labels(_region(), [(50, 50, "bedroom"), (150, 50, "living")], t=4, min_area=8000)
+    lab, cuts = room_split.split_by_labels(_region(), [(50, 50, "bedroom"), (150, 50, "living")], t=4, min_area=8000)
     assert not cuts  # a side would be smaller than a room
 
 
 def test_two_bedrooms_in_one_space_are_separated():
-    lab, cuts = passages.split_by_labels(_region(), [(50, 50, "bedroom"), (150, 50, "bedroom")], t=4, min_area=500)
+    lab, cuts = room_split.split_by_labels(_region(), [(50, 50, "bedroom"), (150, 50, "bedroom")], t=4, min_area=500)
     assert len(cuts) == 1
-
-
-def test_split_by_evidence_needs_evidence_on_both_sides():
-    lab0 = _region()
-    virtual = np.zeros_like(lab0, bool)
-    virtual[35:90, 98:102] = True  # closes the passage below the stub
-    one = passages.split_by_evidence(lab0, virtual, [(50, 50)], r=2)
-    assert len(np.unique(one[one > 0])) == 1  # a corridor-like cut with evidence on one side only: not kept
-    two = passages.split_by_evidence(lab0, virtual, [(50, 50), (150, 50)], r=2)
-    assert len(np.unique(two[two > 0])) == 2 and two[50, 50] != two[50, 150]
-    assert (two[lab0 > 0] > 0).all()  # the virtual wall pixels are given to a side, nothing is lost
 
 
 def _window(n_windows: int, double: bool = True) -> np.ndarray:

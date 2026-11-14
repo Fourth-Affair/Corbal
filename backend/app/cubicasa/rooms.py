@@ -30,8 +30,7 @@ from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLab
 _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
 _ICON_KINDS = {3: "closet", 4: "appliance", 8: "fireplace"}  # icon classes the detector / graph do not carry
 _FIXTURE_KINDS = {"toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench"}
-CLOSE_PASSAGES = False  # virtual walls across door-less passages (app.cubicasa.passages): measured net loss, see rooms_eval
-SPLIT_BY_LABELS = True  # cut spaces holding two labels that should not share a space (app.cubicasa.passages)
+SPLIT_BY_LABELS = True  # cut spaces holding two labels that should not share a space (app.cubicasa.room_split)
 CUT_MIN_ROOM_FRAC = 0.004  # each side of such a cut keeps at least this share of the image
 SCALE_AGREE = 0.15  # written areas must agree within this (relative m/px) to set the plan scale
 SCALE_CROSS_CHECK = 0.10  # dimension-line and written-area scales further apart than this get a warning
@@ -130,34 +129,15 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     closed = ndimage.binary_closing(barrier, iterations=max(1, round(t / 4))) | barrier
     text = layers.text(rel, path)
     lab, n = ndimage.label(~closed)
-    passages = []
-    if CLOSE_PASSAGES:  # virtual walls across door-less passages, kept only where both sides carry evidence
-        from app.cubicasa.passages import close_passages, split_by_evidence
-        from app.cubicasa.room_types import DECISIVE_FIXTURES, LABEL_STRONG_SCORE
-        from app.cubicasa.size_priors import symbol_scale
-
-        sym = symbol_scale(graph)
-        virtual, passages = close_passages(closed, skeletonize(closed), t, sym.m_per_px if sym else None)
-        if passages:
-            seeds = [((tk.bbox[0] + tk.bbox[2]) / 2, (tk.bbox[1] + tk.bbox[3]) / 2) for tk in text.tokens
-                     if tk.score >= LABEL_STRONG_SCORE and room_purpose(tk.text)]
-            seeds += [((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2) for it in (graph.items if graph else [])
-                      if it.category == "fixture" and it.cls in DECISIVE_FIXTURES and (it.score or 1) >= 0.4]
-            before = lab
-            lab = split_by_evidence(lab, virtual & ~closed, seeds, max(2, round(t)))
-            n = int(lab.max())
-            changed = set(np.unique(before[lab != before]))  # regions that were split
-            passages = [pw for pw in passages
-                        if int(before[min(H - 1, int((pw[0][1] + pw[1][1]) / 2)), min(W - 1, int((pw[0][0] + pw[1][0]) / 2))]) in changed]
+    room_cuts = []
     if SPLIT_BY_LABELS:  # a bedroom open to the living room: cut between the two labels at the narrowest line
-        from app.cubicasa.passages import split_by_labels
+        from app.cubicasa.room_split import split_by_labels
         from app.cubicasa.room_types import LABEL_STRONG_SCORE
 
         label_seeds = [((tk.bbox[0] + tk.bbox[2]) / 2, (tk.bbox[1] + tk.bbox[3]) / 2, purpose) for tk in text.tokens
                        if tk.score >= LABEL_STRONG_SCORE and (purpose := room_purpose(tk.text))]
-        lab, cuts = split_by_labels(lab, label_seeds, t, CUT_MIN_ROOM_FRAC * H * W)
+        lab, room_cuts = split_by_labels(lab, label_seeds, t, CUT_MIN_ROOM_FRAC * H * W)
         n = int(lab.max())
-        passages = passages + cuts
     outside = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
     sizes = ndimage.sum(np.ones_like(lab, dtype=np.int32), lab, np.arange(1, n + 1))
     slices = ndimage.find_objects(lab)
@@ -230,7 +210,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
 
     sym = symbol_scale(graph)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
-                        walls=walls, openings=openings, wall_segments=segments, passages=passages,
+                        walls=walls, openings=openings, wall_segments=segments, room_cuts=room_cuts,
                         scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym)), symbol_scale=sym)
 
 
