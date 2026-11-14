@@ -11,13 +11,16 @@ answer() returns None when Gemini is unavailable (no key, API error, no final an
 """
 
 import hashlib
+import ast
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 from collections import deque
+from uuid import uuid4
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
@@ -254,6 +257,37 @@ def explanation_problem(explanation: str, value, n_citations: int) -> str | None
     return None
 
 
+def _verified_arithmetic(explanation: str, evidence_numbers: set[float], expected: float) -> bool:
+    """Accept a derived answer only when its written equation uses tool values and evaluates correctly."""
+    equation = re.compile(r"(?<![\w.])((?:\d+(?:\.\d+)?|\.\d+)(?:\s*[+*/-]\s*(?:\d+(?:\.\d+)?|\.\d+))+)\s*=\s*(-?(?:\d+(?:\.\d+)?|\.\d+))")
+
+    def calculate(node):
+        if isinstance(node, ast.Expression):
+            return calculate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left, right = calculate(node.left), calculate(node.right)
+            return {ast.Add: lambda: left + right, ast.Sub: lambda: left - right,
+                    ast.Mult: lambda: left * right, ast.Div: lambda: left / right}[type(node.op)]()
+        return math.nan
+
+    for match in equation.finditer(explanation):
+        expression, stated = match.groups()
+        operands = [float(number) for number in re.findall(r"(?:\d+(?:\.\d+)?|\.\d+)", expression)]
+        if not all(any(math.isclose(number, evidence, rel_tol=1e-9, abs_tol=1e-9)
+                       for evidence in evidence_numbers) for number in operands):
+            continue
+        try:
+            result = calculate(ast.parse(expression, mode="eval"))
+        except (SyntaxError, ZeroDivisionError):
+            continue
+        if math.isfinite(result) and math.isclose(result, float(stated), rel_tol=1e-6, abs_tol=1e-6) \
+                and math.isclose(result, float(expected), rel_tol=1e-6, abs_tol=1e-6):
+            return True
+    return False
+
+
 _YES = {"yes", "kyllä", "joo", "on", "ja", "jo"}
 _NO = {"no", "ei", "nej", "none", "not"}
 
@@ -296,9 +330,8 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
                           explanation="The answer could not be verified against the drawing analysis.")
         if source is None:
             evidence_numbers = {float(n) for trace in traces for n in trace.numbers}
-            stated_numbers = {float(n) for n in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", explanation)}
-            if not evidence_numbers.intersection(stated_numbers):
-                log.warning("derived value %r explanation does not state a numeric tool input", value)
+            if not _verified_arithmetic(explanation, evidence_numbers, float(value)):
+                log.warning("derived value %r has no verifiable equation using tool values", value)
                 return Answer(answer=None, confidence="not_found", answered_by="llm",
                               explanation="The answer could not be verified against the drawing analysis.")
             if not cited:
@@ -378,7 +411,10 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     history = history or []
     cache = _cache_path(question, graph, scale, geometry) if not history else None
     if use_cache and cache and cache.is_file():
-        return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
+        try:
+            return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            log.warning("invalid answer cache %s (%s); regenerating", cache.name, error)
     if not _take_budget():
         log.warning("Gemini hourly cap (%d) reached: falling back to the template answerer", GEMINI_MAX_PER_HOUR)
         return None
@@ -392,7 +428,12 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     try:
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(result.model_dump_json(), encoding="utf-8")
+            tmp = cache.with_name(f"{cache.name}.{uuid4().hex}.tmp")
+            try:
+                tmp.write_text(result.model_dump_json(), encoding="utf-8")
+                os.replace(tmp, cache)
+            finally:
+                tmp.unlink(missing_ok=True)
     except OSError:
         pass
     return result

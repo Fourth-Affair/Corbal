@@ -100,6 +100,16 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .answer-feedback button { padding: 4px 7px; border: 1px solid #e2e8e2; border-radius: 5px; background: #fff; color: #7b867d; font: inherit; font-size: 9px; cursor: pointer; }
 .answer-feedback button:hover { border-color: #a9c2ad; color: #385b43; }
 .answer-feedback small, .feedback-error { color: #738076; font-size: 10px; }
+.evidence-review { margin-top: 10px; padding: 9px; border: 1px solid #ead8b7; border-radius: 7px; background: #fffaf1; }
+.evidence-review>strong { display: block; color: #735525; font-size: 10px; }
+.evidence-focus { margin-top: 5px; padding: 0; border: 0; background: none; color: #8b6120; font-size: 10px; text-decoration: underline; cursor: pointer; }
+.evidence-review ul { margin: 6px 0 0; padding-left: 17px; color: #6b6253; font-size: 10px; line-height: 1.5; }
+.evidence-actions { display: flex; gap: 6px; margin-top: 8px; }
+.evidence-actions button { min-height: 29px; padding: 0 10px; border: 1px solid #dec99f; border-radius: 5px; background: #fff; color: #624d27; font-size: 10px; font-weight: 600; cursor: pointer; }
+.evidence-actions button:first-child { border-color: #34764e; background: #34764e; color: #fff; }
+.evidence-decision { display: block; margin-top: 8px; font-size: 10px; }
+.evidence-decision.trusted { color: #34764e; }
+.evidence-decision.rejected { color: #a1483c; }
 .feedback-error { margin: -5px 14px 8px; color: #a1483c; }
 .thinking-message { min-width: 190px; border: 1px solid #dce8df; background: #f3f8f4 !important; box-shadow: 0 2px 8px rgba(37, 72, 48, .06); }
 .thinking-message p { display: flex; align-items: center; gap: 9px; color: #385b43; font-weight: 600; }

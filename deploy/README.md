@@ -39,8 +39,12 @@ the first request, which takes a few seconds.
 | `GEMINI_MAX_PER_HOUR`   | 300     | Uncached Gemini questions per rolling hour; beyond it the template answerer replies (no Gemini cost). Cached answers don't count. |
 | `RATE_ASK_PER_MIN`      | 20      | Questions per client IP per minute (Caddy returns 429 beyond). |
 | `RATE_ANALYZE_PER_MIN`  | 6       | Uploads + analyses per client IP per minute (CPU-heavy). |
+| `MAX_CONCURRENT_ANALYSES` | 1     | Heavy analyses running at once in the backend process. Increase only after checking memory and CPU under load. |
+| `ANALYSIS_QUEUE_TIMEOUT` | 45     | Seconds an analysis waits for a slot before returning a retryable busy response. |
 
 Also set a **budget alert / spending cap** for the Gemini key in Google AI Studio / Cloud Billing.
+
+The backend serializes analysis of the same plan and bounds simultaneous model inference. This protects the shared model/cache process while other users can still load plans and ask questions. The lock and limit are process-local; add a shared queue/lock and shared cache before running multiple backend replicas. The current anonymous upload flow also has no account ownership, so use Supabase Auth and per-user policies before treating plans as private user data.
 
 ## Notes
 

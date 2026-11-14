@@ -9,7 +9,7 @@ type PlanRecord = {
   plan_images?: Array<{ upload_status?: string; role?: string }>;
 };
 
-type ChatMessage = { role: "user" | "assistant"; text: string; evidence_ids?: string[]; confidence?: string; feedback?: string };
+type ChatMessage = { role: "user" | "assistant"; text: string; originalText?: string; evidence_ids?: string[]; evidence?: PlanCitation[]; confidence?: string; feedback?: string; evidenceDecision?: "trusted" | "rejected" };
 type PlanCitation = {
   id: string;
   category?: string;
@@ -428,7 +428,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     } finally { setCorrectionSaving(false); }
   }
 
-  async function submitFeedback(messageIndex: number, feedback: "helpful" | "incorrect" | "unclear") {
+  async function submitFeedback(messageIndex: number, feedback: "helpful" | "incorrect" | "unclear" | "trusted" | "rejected") {
     if (!planId) return;
     const answer = messages[messageIndex];
     const question = [...messages.slice(0, messageIndex)].reverse().find(message => message.role === "user");
@@ -441,10 +441,18 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not save feedback");
-      setMessages(current => current.map((message, index) => index === messageIndex ? { ...message, feedback } : message));
+      setMessages(current => current.map((message, index) => index === messageIndex ? {
+        ...message, feedback,
+        ...(feedback === "trusted" ? { evidenceDecision: feedback, text: message.originalText ?? message.text } : {}),
+        ...(feedback === "rejected" ? { evidenceDecision: feedback, text: "You rejected the supporting evidence, so I’m withdrawing this provisional answer. Review or correct the highlighted items before relying on a new answer." } : {}),
+      } : message));
     } catch (error) {
       setFeedbackError(error instanceof Error ? error.message : "Could not save feedback");
     }
+  }
+
+  function showMessageEvidence(message: ChatMessage) {
+    if (message.evidence?.length) setCitations(message.evidence);
   }
 
   function beginCorrection(item: EvidenceItem) {
@@ -513,7 +521,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
               : "I couldn’t detect a clear floor boundary. Draw or edit the outline, then accept it to calculate an area estimate."
         : result.answer === null ? result.explanation : `${result.answer}${result.unit ? ` ${result.unit}` : ""}. ${result.explanation}`;
       setCitations(Array.isArray(result.citations) ? result.citations : []);
-      setMessages(current => [...current, { role: "assistant", text: answer, evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id), confidence: result.confidence }]);
+      const provisional = result.confidence === "low";
+      setMessages(current => [...current, { role: "assistant", text: provisional ? `Possible answer: ${answer}` : answer, ...(provisional ? { originalText: answer } : {}), evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id), evidence: result.citations ?? [], confidence: result.confidence }]);
       if (needsScale) {
         setPendingAreaQuestion(submitted);
         startScaleCalibration();
@@ -1039,7 +1048,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             {correctionError && <p className="correction-error" role="alert">{correctionError}</p>}
           </section>}
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
-          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && message.confidence === "low" && <small className="answer-confidence">Lower confidence · based on the highlighted plan evidence</small>}{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
+          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && message.confidence === "low" && <><small className="answer-confidence">Lower confidence · check the highlighted evidence on the drawing</small>{message.evidence?.length ? <section className="evidence-review" aria-label="Evidence to review"><strong>Evidence behind this answer</strong><button type="button" className="evidence-focus" onClick={() => showMessageEvidence(message)}>Show {message.evidence.length} item{message.evidence.length === 1 ? "" : "s"} on drawing</button><ul>{message.evidence.map((item, evidenceIndex) => <li key={`${item.id}-${evidenceIndex}`}>{itemLabel({ category: item.category ?? "item", cls: item.cls ?? "", text: item.text })}{item.text ? ` · “${item.text}”` : ""}{item.score != null ? ` · ${Math.round(item.score * 100)}% model confidence` : ""}</li>)}</ul>{message.evidenceDecision ? <small className={`evidence-decision ${message.evidenceDecision}`}>{message.evidenceDecision === "trusted" ? "You trust this evidence." : "You rejected this evidence."}</small> : <div className="evidence-actions"><button type="button" onClick={() => void submitFeedback(index, "trusted")}>Trust</button><button type="button" onClick={() => void submitFeedback(index, "rejected")}>Don’t trust</button></div>}</section> : null}</>}{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
           {feedbackError && <p className="feedback-error" role="alert">{feedbackError}</p>}
           {measurementRequested && <section className="requested-action" aria-label="Requested measurement">
             <div><strong>Measure a distance</strong><span>Choose the two points you want measured on the plan.</span></div>
