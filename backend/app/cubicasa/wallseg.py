@@ -176,7 +176,10 @@ def predict(img: Image.Image, model=None, device: str = "cpu", batch: int = 8, s
     import torch
     import torch.nn.functional as F
 
-    model = model or load(device)
+    from app.profiling import stage
+
+    with stage("model_load"):
+        model = model or load(device)
     img = img.convert("RGB")
     W0, H0 = img.size
     if scale != 1.0:
@@ -195,7 +198,7 @@ def predict(img: Image.Image, model=None, device: str = "cpu", batch: int = 8, s
     acc = torch.zeros((len(CLASSES), Hp, Wp))
     wsum = torch.zeros((Hp, Wp))
     coords = [(y, x) for y in ys for x in xs]
-    with torch.inference_mode():
+    with stage("tiles"), torch.inference_mode():
         for i in range(0, len(coords), batch):
             cs = coords[i:i + batch]
             xb = torch.stack([to_tensor(a[y:y + TILE, x:x + TILE]) for y, x in cs]).to(device)

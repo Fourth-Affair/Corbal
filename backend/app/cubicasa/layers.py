@@ -9,6 +9,10 @@ symbols  symdet.py (YOLO11 detector). Items: one box per door / window / fixture
 text     ocr.py (RapidOCR, rotation-aware). Tokens: text + box; room labels mapped to a room type.
 """
 
+import contextvars
+import os
+import threading
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -16,10 +20,16 @@ from PIL import Image
 from scipy import ndimage
 
 from app.config import CACHE_DIR
+from app.profiling import stage
 from app.models import Layer, PlanItem, TextToken
 
 LAYER_CACHE = CACHE_DIR / "layers"
 MIN_REGION_PX = 30  # ignore specks
+# The wall segmenter runs at native resolution and is the largest single cost of a big plan (27 s of 61 s at 12 MP).
+# Above this many pixels it runs on a downscaled copy (probabilities upsampled back). 0 = always native.
+WALLSEG_MAX_PIXELS = int(os.environ.get("WALLSEG_MAX_PIXELS", "0"))
+_inflight: dict[Path, Future] = {}  # wall maps being computed, so concurrent callers for one plan wait instead of
+_inflight_lock = threading.Lock()   # computing it twice (see prefetch_walls)
 
 
 def _image(path: Path) -> Image.Image:
@@ -34,27 +44,75 @@ def _box(sl) -> tuple[float, float, float, float]:
 # ---------------------------------------------------------------- walls
 
 def wall_classes(rel: str, path: Path) -> tuple[np.ndarray, str]:
-    """(HxW uint8 map: 0 background, 1 solid wall, 2 opening; model name). Cached per weights file."""
+    """(HxW uint8 map: 0 background, 1 solid wall, 2 opening; model name). Cached per weights file. A call while the
+    same map is being computed (prefetch_walls) waits for that result."""
     from app.cubicasa import wallseg
 
+    scale = 1.0
     if wallseg.available():
         st = wallseg.WEIGHTS.stat()
         model, key = "wallseg", f"wallseg-{st.st_size:x}-{int(st.st_mtime):x}"
+        if WALLSEG_MAX_PIXELS:
+            w, h = Image.open(path).size  # header only
+            if w * h > WALLSEG_MAX_PIXELS:
+                scale = (WALLSEG_MAX_PIXELS / (w * h)) ** 0.5
+                key += f"-max{WALLSEG_MAX_PIXELS}"  # plans under the cap keep their cache entries
     else:
         model, key = "cubicasa-net", "cubicasa-net"
     cache = LAYER_CACHE / "walls" / f"{Path(rel).stem}.{key}.png"
     if cache.is_file():
         return np.asarray(Image.open(cache)), model
-    img = _image(path)
-    if model == "wallseg":
-        p = wallseg.predict(img)
-        cls = p.argmax(0).astype(np.uint8)
-    else:  # 2019 net: wall pixels include openings, so there is no opening class
-        from app.cubicasa.walls import predict_walls
+    with _inflight_lock:
+        running = _inflight.get(cache)
+        if running is None:
+            mine = _inflight[cache] = Future()
+    if running is not None:
+        with stage("wait_prefetch"):
+            return running.result()
+    try:
+        result = _compute_wall_classes(path, model, scale, cache)
+        mine.set_result(result)
+        return result
+    except BaseException as error:
+        mine.set_exception(error)
+        raise
+    finally:
+        with _inflight_lock:
+            _inflight.pop(cache, None)
 
-        cls = predict_walls(img, vector=False)["mask"].astype(np.uint8)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(cls).save(cache, optimize=True)
+
+def prefetch_walls(rel: str, path: Path) -> threading.Thread:
+    """Compute the wall map in a background thread (e.g. while the image pipeline runs); the geometry step's own
+    wall_classes call then waits for it instead of starting again. Stages go to the caller's profile."""
+    ctx = contextvars.copy_context()
+
+    def run():
+        try:
+            with stage("walls_prefetch"):
+                wall_classes(rel, path)
+        except Exception:  # noqa: BLE001  the geometry step computes it again and reports the error
+            pass
+
+    thread = threading.Thread(target=ctx.run, args=(run,), name="walls-prefetch", daemon=True)
+    thread.start()
+    return thread
+
+
+def _compute_wall_classes(path: Path, model: str, scale: float, cache: Path) -> tuple[np.ndarray, str]:
+    from app.cubicasa import wallseg
+
+    img = _image(path)
+    with stage(model):
+        if model == "wallseg":
+            p = wallseg.predict(img, scale=scale)
+            cls = p.argmax(0).astype(np.uint8)
+        else:  # 2019 net: wall pixels include openings, so there is no opening class
+            from app.cubicasa.walls import predict_walls
+
+            cls = predict_walls(img, vector=False)["mask"].astype(np.uint8)
+    with stage("cache_write"):
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(cls).save(cache, optimize=True)
     return cls, model
 
 

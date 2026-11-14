@@ -108,12 +108,40 @@ def test_uploaded_pdf_flow(tmp_path, monkeypatch):
             return None
         return [store[str(pid)]] if str(pid) in store else []
 
+    import time
+
     pdf = (DATASET_DIR / PLAN).read_bytes()
     monkeypatch.setattr(m, "_download_source", lambda pid: pdf)
     monkeypatch.setattr(m, "_knowledge_request", knowledge)
+    monkeypatch.setattr(m, "_corrections_request", lambda pid, body=None: [])  # no user corrections
     c, pid = TestClient(m.app), uuid.uuid4()
-    g = c.post(f"/api/plans/{pid}/analyze").json()
+    r = c.post(f"/api/plans/{pid}/analyze")  # starts the background job (202) or returns the saved graph (200)
+    deadline = time.monotonic() + 30
+    while r.status_code == 202 and time.monotonic() < deadline:
+        time.sleep(0.05)
+        r = c.get(f"/api/plans/{pid}/analysis")
+    body = r.json()
+    assert r.status_code == 200 and body.get("state", "done") == "done", body
+    g = body.get("graph", body)
     assert g["source"] == "pdf" and (g["width"], g["height"]) == (1191, 842)
     assert c.get(f"/api/plans/{pid}/image").headers["content-type"] == "image/png"
     a = c.post(f"/api/plans/{pid}/ask", json={"question": "How many rooms labelled 'Zimmer' are there on this floor?"}).json()
     assert a["answer"] == 12 and len(a["citations"]) == 12
+
+
+@needs_data
+def test_agent_tools():
+    from app.pdfplan.tools import PdfTools
+
+    t = PdfTools(PLAN)
+    out, trace = t.call("pdf_lookup", {"template": "label_count", "argument": "Zimmer"})
+    assert out["value"] == answer_question(PLAN, "How many rooms labelled 'Zimmer' are there?").answer == 12
+    assert trace.template_answer is not None and all(t.item(i) for i in trace.item_ids)
+    assert "error" in t.call("pdf_lookup", {"template": "room_area"})[0]  # needs a room number
+    out, trace = t.call("list_rooms", {"apartment": "A"})
+    areas = [r["area_m2"] for r in out["rooms"] if "area_m2" in r]
+    assert out["count"] == 9 and areas and all(a in trace.numbers for a in areas)
+    out, trace = t.call("list_symbols", {"kind": "door"})
+    assert out["count"] == len(trace.item_ids) > 0 and t.item(trace.item_ids[0]).category == "door"
+    _, total = t.call("calculate", {"operation": "add", "operands": areas[:2]})
+    assert total.numbers == [round(areas[0] + areas[1], 6)]
