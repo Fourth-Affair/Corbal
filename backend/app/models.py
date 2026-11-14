@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 Category = Literal["floor", "room", "door", "window", "fixture", "wall", "opening", "unit"]  # unit = apartment
 
-# Canonical classes. Rooms: bedroom, bathroom, wc, sauna, kitchen, balcony, other.
+# Canonical classes. Rooms: bedroom, bathroom, wc, sauna, kitchen, living, balcony, entry, storage, garage, other.
 # Fixtures: toilet, sink, double_sink, shower, bathtub, sauna_stove, other.
 # Walls (layers API): wall = solid wall region, opening = door/window gap in a wall.
 
