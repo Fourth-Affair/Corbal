@@ -18,6 +18,32 @@ type PlanCitation = {
   user_verified?: boolean;
 };
 type EvidenceItem = PlanCitation & { category: string; cls: string; text?: string | null; score?: number | null; raw?: string | null; user_verified?: boolean };
+type RoomShape = {
+  id: string;
+  type: string;
+  confidence: "labeled" | "rough";
+  purposes: string[];
+  name?: string | null;
+  polygon: Array<[number, number]>;
+  bbox: [number, number, number, number];
+  area_m2?: number | null;
+  labeled_area_m2?: number | null;
+};
+type PlanGeometry = { width: number; height: number; model: string; rooms: RoomShape[] };
+
+// One colour per purpose; rough (unlabelled) spaces are drawn dashed and unfilled
+const ROOM_COLOURS: Record<string, string> = {
+  bedroom: "#5b8def", living: "#e0a43b", kitchen: "#e0613b", bathroom: "#3bb3c9", wc: "#3b8fc9", sauna: "#c9733b",
+  balcony: "#6dbb5f", terrace: "#6dbb5f", entry: "#9b8bd6", closet: "#b07fc0", storage: "#a0a0a0", utility: "#5fb3a0",
+  dining: "#d6b13b", study: "#7f9bc0", technical: "#8a8a8a", garage: "#8a8a8a", stairs: "#b0906a", basement: "#8a8a8a",
+};
+
+function roomCaption(room: RoomShape): string {
+  const area = room.area_m2 ?? room.labeled_area_m2;
+  const what = room.purposes.length > 1 ? room.purposes.join(" + ") : room.type;
+  return area != null ? `${what} · ${area.toFixed(1)} m²` : what;
+}
+
 type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };
 type FloorOutline = { id: string; polygon: Array<[number, number]>; score?: number | null; scope?: "floor" | "room"; room_type?: string | null; label?: string };
 const itemTypes: Record<string, string[]> = {
@@ -75,7 +101,28 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [correctionSaving, setCorrectionSaving] = useState(false);
   const [correctionError, setCorrectionError] = useState<string | null>(null);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [geometry, setGeometry] = useState<PlanGeometry | null>(null);
+  const [geometryError, setGeometryError] = useState<string | null>(null);
+  const [showRooms, setShowRooms] = useState(true);
+  const [showRough, setShowRough] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
+
+  // Room geometry once the analysis is ready; refetched when the scale changes (areas in m² depend on it)
+  useEffect(() => {
+    if (!ready || !planId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/geometry`, { cache: "no-store" });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || "Rooms could not be loaded");
+        if (!cancelled) { setGeometry(body); setGeometryError(null); }
+      } catch (geometryLoadError) {
+        if (!cancelled) setGeometryError(geometryLoadError instanceof Error ? geometryLoadError.message : "Rooms could not be loaded");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [ready, planId, scale]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -522,6 +569,9 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
+          {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose purpose was read from the drawing">Rooms ({geometry.rooms.filter(room => room.confidence === "labeled").length})</button>}
+          {geometry && showRooms && geometry.rooms.some(room => room.confidence === "rough") && <button className={`toolbar-button${showRough ? " is-on" : ""}`} type="button" aria-pressed={showRough} onClick={() => setShowRough(on => !on)} title="Enclosed spaces without a readable label: shape and purpose are rough guesses">Unlabelled spaces ({geometry.rooms.filter(room => room.confidence === "rough").length})</button>}
+          {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
           {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
           {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
@@ -544,6 +594,19 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(2, x1 - x0)} height={Math.max(2, y1 - y0)} />}
                 </g>;
               })}
+              {geometry && showRooms && <g className="room-layer">
+                {geometry.rooms.filter(room => room.confidence === "labeled" || showRough).map(room => {
+                  const colour = room.confidence === "labeled" ? (ROOM_COLOURS[room.type] ?? "#7a8a80") : "#7a8a80";
+                  const [x0, y0, x1, y1] = room.bbox;
+                  const fontSize = Math.max(11, Math.min(imageSize.width, imageSize.height) / 45);
+                  return <g key={room.id} className={`room-shape ${room.confidence}`}>
+                    <polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.confidence === "labeled" ? colour : "none" }}>
+                      <title>{room.confidence === "labeled" ? `${room.name ?? room.type}: ${roomCaption(room)}` : "Unlabelled space (rough: purpose unknown)"}</title>
+                    </polygon>
+                    <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{room.confidence === "labeled" ? roomCaption(room) : "?"}</text>
+                  </g>;
+                })}
+              </g>}
               {citations.map((item, index) => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");

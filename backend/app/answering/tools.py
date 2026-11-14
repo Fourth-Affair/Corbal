@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.cubicasa.answer import count
-from app.models import Answer, PlanGraph, PlanItem
+from app.models import Answer, PlanGeometry, PlanGraph, PlanItem, RoomShape
 from app.router import TEMPLATES
 
 # What each count template counts (the dataset's counting rules). Shown to the model in the tool description.
@@ -79,10 +79,44 @@ def _area(b: tuple) -> float:
     return (b[2] - b[0]) * (b[3] - b[1])
 
 
+def _room_item(rm: RoomShape) -> PlanItem:
+    """A geometry room as a citable item: the frontend highlights its polygon."""
+    return PlanItem(id=rm.id, category="room", cls=rm.type, bbox=rm.bbox, polygon=rm.polygon, text=rm.name,
+                    raw=f"geometry:{rm.confidence}")
+
+
+def _room_row(rm: RoomShape, detail: bool = False) -> dict[str, Any]:
+    row: dict[str, Any] = {"id": rm.id, "confidence": rm.confidence}
+    if rm.confidence == "labeled":
+        row["type"] = rm.type
+        row["label"] = rm.name
+        if len(rm.purposes) > 1:
+            row["purposes"] = rm.purposes  # open plan: several labels in one enclosed space
+    elif rm.type != "unknown":
+        row["guessed_type"] = rm.type  # segmentation guess for an unlabelled space: never state as fact
+    if rm.area_m2 is not None:
+        row["area_m2"] = rm.area_m2
+    if rm.labeled_area_m2 is not None:
+        row["area_m2_written_on_drawing"] = rm.labeled_area_m2
+    row["neighbours"] = rm.neighbours
+    row["openings"] = len(rm.connections)
+    if detail:
+        row["text_inside"] = [lb.text for lb in rm.labels]
+        row["bbox"] = [round(v) for v in rm.bbox]
+    return row
+
+
 class PlanTools:
-    def __init__(self, graph: PlanGraph):
+    def __init__(self, graph: PlanGraph, geometry: PlanGeometry | None = None):
         self.graph = graph
+        self.geometry = geometry
         self.by_id = {it.id: it for it in graph.items}
+        self.rooms = {rm.id: rm for rm in geometry.rooms} if geometry else {}
+        for rm in self.rooms.values():
+            self.by_id.setdefault(rm.id, _room_item(rm))
+
+    def declarations(self) -> list[dict]:
+        return DECLARATIONS + (ROOM_DECLARATIONS if self.geometry else [])
 
     # --- tools -------------------------------------------------------------------------------------------------
 
@@ -157,11 +191,51 @@ class PlanTools:
                "note": "Containment uses the container's bounding box (item centre inside), so it is approximate."}
         return out, ToolTrace(item_ids=[region.id] + [it.id for it in hits[:MAX_LIST]], numbers=[len(hits)])
 
+    def list_rooms(self, include_rough: bool = False) -> tuple[dict, ToolTrace]:
+        rooms = [rm for rm in self.rooms.values() if include_rough or rm.confidence == "labeled"]
+        labeled = [rm for rm in self.rooms.values() if rm.confidence == "labeled"]
+        rough = len(self.rooms) - len(labeled)
+        out = {"labeled_rooms": len(labeled), "rough_spaces": rough, "rooms": [_room_row(rm) for rm in rooms[:MAX_LIST]],
+               "note": ("Rooms are spaces enclosed by the detected walls. 'labeled' = a purpose label was read inside "
+                        "the room, so its type is reliable. 'rough' = an enclosed space with no readable label: it may "
+                        "be a closet, shaft or detection artefact; never state its purpose or count it as a room of a "
+                        "type. An open-plan space with several labels is one enclosed space with several purposes.")}
+        if not any(rm.area_m2 is not None for rm in rooms):
+            out["note"] += " No scale calibration: areas in m² are only known where written on the drawing."
+        numbers: list[float] = [len(labeled), rough, len(rooms)]
+        numbers += [rm.area_m2 for rm in rooms if rm.area_m2 is not None]
+        numbers += [rm.labeled_area_m2 for rm in rooms if rm.labeled_area_m2 is not None]
+        return out, ToolTrace(item_ids=[rm.id for rm in rooms[:MAX_LIST]], numbers=numbers)
+
+    def room_details(self, room_id: str) -> tuple[dict, ToolTrace]:
+        rm = self.rooms.get(room_id)
+        if rm is None:
+            return {"error": f"no room {room_id!r} (use ids from list_rooms)"}, ToolTrace()
+        from shapely.geometry import Point, Polygon
+
+        poly = Polygon(rm.polygon)
+        inside = [it for it in self.graph.items if it.category in ("door", "window", "fixture") and poly.contains(
+            Point((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2))]
+        openings = [op for op in (self.geometry.openings if self.geometry else []) if op.id in rm.connections]
+        row = _room_row(rm, detail=True)
+        row["neighbours"] = [{"id": n, "confidence": self.rooms[n].confidence,
+                              **({"type": self.rooms[n].type} if self.rooms[n].confidence == "labeled" else {})}
+                             for n in rm.neighbours if n in self.rooms]
+        row["openings"] = [{"leads_to": [r for r in op.rooms if r != rm.id] or ["(same room)"],
+                            **({"symbol": op.symbol} if op.symbol else {})} for op in openings]
+        row["items_inside"] = [_row(it) for it in inside[:MAX_LIST]]
+        row["note"] = ("Items inside = detected doors/windows/fixtures whose centre lies in the room outline. "
+                       "Openings are gaps in the room's walls; 'outside' = the exterior.")
+        numbers: list[float] = [len(inside), len(openings)]
+        numbers += [v for v in (rm.area_m2, rm.labeled_area_m2) if v is not None]
+        return row, ToolTrace(item_ids=[rm.id] + [it.id for it in inside[:MAX_LIST]], numbers=numbers)
+
     # --- dispatch ----------------------------------------------------------------------------------------------
 
     def call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
         fn = {"plan_summary": self.plan_summary, "count_template": self.count_template,
-              "list_items": self.list_items, "items_in": self.items_in}.get(name)
+              "list_items": self.list_items, "items_in": self.items_in,
+              **({"list_rooms": self.list_rooms, "room_details": self.room_details} if self.geometry else {})}.get(name)
         if fn is None:
             return {"error": f"unknown tool {name!r}"}, ToolTrace()
         try:
@@ -204,5 +278,27 @@ DECLARATIONS = [
             "category": {"type": "string", "enum": CATEGORIES},
             "type": {"type": "string", "enum": ROOM_TYPES + FIXTURE_TYPES},
         }, "required": ["container_id", "category"]},
+    },
+]
+
+
+# Only offered when the plan has stored room geometry (uploaded plans); the benchmark path keeps the tools above.
+ROOM_DECLARATIONS = [
+    {
+        "name": "list_rooms",
+        "description": ("Rooms as spaces enclosed by the plan's walls, each with the purpose read from its label "
+                        "(confidence 'labeled') or none ('rough'), its area in m² when the drawing scale is known or an "
+                        "area is written in it, and its neighbouring rooms. Use it for questions about which rooms "
+                        "exist, what they are for, their sizes and how they connect."),
+        "parameters": {"type": "object", "properties": {
+            "include_rough": {"type": "boolean",
+                              "description": "also list unlabelled enclosed spaces (default false)"},
+        }},
+    },
+    {
+        "name": "room_details",
+        "description": ("One room from list_rooms: all text read inside it, its openings and where they lead, "
+                        "neighbouring rooms, and the detected doors, windows and fixtures inside its outline."),
+        "parameters": {"type": "object", "properties": {"room_id": {"type": "string"}}, "required": ["room_id"]},
     },
 ]

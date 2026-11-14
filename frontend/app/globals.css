@@ -172,3 +172,10 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
   .chat-panel { min-height: 520px; }
   .conversation { min-height: 220px; }
 }
+
+/* Room overlay: labeled rooms filled by purpose, rough (unlabelled) spaces dashed */
+.toolbar-button.is-on { border-color: #34764e; background: #e8f1ea; color: #285c3c; }
+.room-layer .room-shape polygon { stroke-width: 3; fill-opacity: 0.18; vector-effect: non-scaling-stroke; }
+.room-layer .room-shape.rough polygon { stroke-dasharray: 6 5; stroke-width: 1.5; opacity: 0.8; }
+.room-layer text { fill: #1f2a23; font-weight: 700; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: rgba(255, 255, 255, 0.9); stroke-width: 4px; stroke-linejoin: round; }
+.room-layer .room-shape.rough text { fill: #7a8a80; font-weight: 600; }
