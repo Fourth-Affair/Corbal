@@ -65,7 +65,8 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
 - `dataset/` (gitignored, never commit) — `junction-dataset/` (full challenge data + `questions.jsonl`),
   `junction-dataset-preview/` (preview release = our test set, never trained on), `cubicasa5k-original/`
   (Zenodo 2613548, labels + official split for training/eval only), `cache/`, `yolo-cubicasa-det/`, `runs/`,
-  `models/` (`MODELS_DIR`: fusion models, OCR table, `symbol-det.onnx`, `wallseg.pt`).
+  `models/` is now at the repo root (see below).
+- `models/` (`MODELS_DIR`, tracked in git, all files < 50 MB): `cubicasa-fusion.joblib`, `ocr_token_table.json`, `symbol-det.onnx`, `wallseg.pt` (fp16); checksums in `models/MANIFEST.json`. Not committed: `cubicasa-net.pkl` (208 MB CubiCasa net; the share bundle's `dataset/cubicasa-pretrained/` path also works). The detector fingerprint is a content hash, so retraining the detector requires refitting the fusion models.
 - `docs/literature-review.md` — floor-plan recognition since CubiCasa5K and the roadmap.
 
 ## Commands
@@ -82,16 +83,16 @@ uv run python -m app.eval --method svg --split val          # oracle (should be 
 uv run python -m app.eval --method mode --split val         # majority baseline (~57%)
 uv run python -m app.cubicasa.features --splits val test     # cache net maps + OCR (~3 s/image on CPU)
 uv run python -m app.cubicasa.fit --test --fit-on train+val          # CV on val, score on test
-uv run python -m app.cubicasa.fit --test --final --fit-on train+val  # + save fusion models -> dataset/models/
+uv run python -m app.cubicasa.fit --test --final --fit-on train+val  # + save fusion models -> models/
 uv run python -m app.eval --method model --split test       # end-to-end score through the runtime path
 
 # symbol detector on a Verda GPU VM (VERDA_CLIENT_ID/SECRET in .env). The VM downloads CubiCasa5K itself;
 # the challenge preview images (= test) are held out. VM is deleted at the end unless --keep.
 uv run python scripts/verda_train.py list                   # GPU types, prices, availability
-uv run python scripts/verda_train.py run                    # -> dataset/models/symbol-det.{pt,onnx}
+uv run python scripts/verda_train.py run                    # -> dataset/models/ (staging; copy to models/ + refit to adopt)
 # local alternative (needs dataset/cubicasa5k-original):
 uv run python -m app.cubicasa.export_yolo --holdout ../dataset/junction-dataset-preview/questions.jsonl
-uv run python -m app.cubicasa.train --device 0 --onnx      # -> dataset/models/symbol-det.{pt,onnx}
+uv run python -m app.cubicasa.train --device 0 --onnx      # -> dataset/models/ (staging; copy to models/ + refit to adopt)
 uv run python -m app.cubicasa.symdet --splits train val test # cache detections, then refit (fit --final)
 
 # walls (needs dataset/cubicasa5k-original). Local AMD GPU: ~/.venvs/stoa-rocm (torch rocm7.1), PYTHONPATH=. 

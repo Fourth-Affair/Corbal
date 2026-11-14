@@ -106,7 +106,7 @@ def graph_from_image(rel: str, path) -> PlanGraph:
     if dets is not None:
         f.update(symdet.det_features(dets))
     elif _bundle().get("symdet"):
-        raise FileNotFoundError("fusion models need the symbol detector (dataset/models/symbol-det.onnx)")
+        raise FileNotFoundError("fusion models need the symbol detector (models/symbol-det.onnx)")
     counts = {}
     for t, spec in _fusion().items():
         X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)

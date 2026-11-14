@@ -1,0 +1,27 @@
+{
+  "files": {
+    "cubicasa-fusion.joblib": {
+      "sha256": "9589dad00974afcf47610eab143348f6b2ca9c32fc4640c0e7e6e98c2de538d7",
+      "bytes": 2782971,
+      "what": "per-template counting models, fit on train+val with det_* features; test 81.4% exact"
+    },
+    "ocr_token_table.json": {
+      "sha256": "f6f13149b5e9a599c50fd12708cfc397f94fd9645d00ce91eb99af6bedca0a9d",
+      "bytes": 1767,
+      "what": "OCR token -> room-type table"
+    },
+    "symbol-det.onnx": {
+      "sha256": "c963f239d1d3acbfb767ac3fdf495109623e56d57ac9849d7162d1de7568333c",
+      "bytes": 38443506,
+      "what": "YOLO11s symbol detector, imgsz 1280; val mAP50 0.87"
+    },
+    "wallseg.pt": {
+      "sha256": "e54133e81b455663a5b0a18f0131d98edc8690fb0b5690a08205016f56a9ea8b",
+      "bytes": 48996051,
+      "what": "U-Net ResNet-34 wall segmenter, fp16 weights; 60 test plans wall F1 0.925"
+    }
+  },
+  "not_committed": {
+    "cubicasa-net.pkl": "CubiCasa5K pretrained net (CC BY-NC, 208 MB). Copy dataset/cubicasa-pretrained/model_best_val_loss_var.pkl from the share bundle to models/cubicasa-net.pkl (the old location also works)."
+  }
+}

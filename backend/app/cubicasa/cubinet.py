@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from app.config import DATASET_DIR
+from app.config import DATASET_DIR, MODELS_DIR
 
 _VENDOR = Path(__file__).parent / "vendor"
 if str(_VENDOR) not in sys.path:
@@ -24,7 +24,10 @@ if str(_VENDOR) not in sys.path:
 from floortrans.models.hg_furukawa_original import hg_furukawa_original  # noqa: E402
 from floortrans.post_prosessing import get_polygons, split_prediction  # noqa: E402
 
-WEIGHTS = Path(os.environ.get("CUBINET_WEIGHTS", DATASET_DIR.parent / "cubicasa-pretrained" / "model_best_val_loss_var.pkl"))
+# 208 MB, too big for git: fetched by scripts/fetch_models.py. The old share-bundle location still works.
+_LEGACY = DATASET_DIR.parent / "cubicasa-pretrained" / "model_best_val_loss_var.pkl"
+WEIGHTS = Path(os.environ.get("CUBINET_WEIGHTS") or (
+    MODELS_DIR / "cubicasa-net.pkl" if (MODELS_DIR / "cubicasa-net.pkl").is_file() or not _LEGACY.is_file() else _LEGACY))
 ROOM_CLASSES = ["Background", "Outdoor", "Wall", "Kitchen", "Living Room", "Bed Room", "Bath", "Entry",
                 "Railing", "Storage", "Garage", "Undefined"]
 ICON_CLASSES = ["No Icon", "Window", "Door", "Closet", "Electrical Appliance", "Toilet", "Sink", "Sauna Bench",

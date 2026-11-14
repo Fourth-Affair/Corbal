@@ -28,7 +28,7 @@ services:
       DATASET_DIR: /dataset/junction-dataset
       CUBICASA_ORIG_DIR: /dataset/cubicasa5k-original/cubicasa5k
       CACHE_DIR: /dataset/cache
-      MODELS_DIR: /dataset/models
+      MODELS_DIR: /models
       PLAN_SOURCE: ${PLAN_SOURCE:-model}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
@@ -36,6 +36,7 @@ services:
     volumes:
       - ./backend:/app
       - ./dataset:/dataset
+      - ./models:/models
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s

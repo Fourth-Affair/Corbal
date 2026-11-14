@@ -13,4 +13,4 @@ CUBICASA_ORIG_DIR = Path(os.environ.get("CUBICASA_ORIG_DIR", _REPO / "dataset" /
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", _REPO / "dataset" / "cache"))
 # Trained models: counting models (cubicasa-fusion.joblib), OCR token table, symbol detector (symbol-det.onnx),
 # wall segmenter (wallseg.pt). Everything in here comes from the share bundle or a training run.
-MODELS_DIR = Path(os.environ.get("MODELS_DIR", _REPO / "dataset" / "models"))
+MODELS_DIR = Path(os.environ.get("MODELS_DIR", _REPO / "models"))  # tracked in git; see models/MANIFEST.json

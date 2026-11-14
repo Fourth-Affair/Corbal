@@ -1,15 +1,17 @@
-"""Train the symbol detector on a rented Verda GPU VM, download the weights, delete the VM.
+"""Train the symbol detector or the wall segmenter on a rented Verda GPU VM, download the weights, delete the VM.
 
   uv run python scripts/verda_train.py list                    # GPU types, prices, availability
   uv run python scripts/verda_train.py run                     # cheapest available >= 24 GB GPU, yolo11s, 80 epochs
   uv run python scripts/verda_train.py run --type 1A100.22V --base rtdetr-l.pt --epochs 60 --batch 8
   uv run python scripts/verda_train.py run --host 1.2.3.4             # VM you created in the dashboard
+  uv run python scripts/verda_train.py run --host 1.2.3.4 --task wallseg   # wall segmenter (wallseg prepare first)
   uv run python scripts/verda_train.py attach <instance-id>    # re-follow a run (e.g. after the laptop slept)
   uv run python scripts/verda_train.py delete <instance-id>
 
 Credentials: VERDA_CLIENT_ID / VERDA_CLIENT_SECRET in the environment or the repo-root .env.
 The VM downloads CubiCasa5K itself (fast datacenter link); we upload only code, SVG labels and the holdout
-questions (the challenge preview, never trained on). Results land in dataset/models/symbol-det.{pt,onnx}.
+questions (the challenge preview, never trained on); for --task wallseg also the label masks (~20 MB).
+Results land in dataset/models/: symbol-det.{pt,onnx} or wallseg.{pt,log.csv}.
 The VM is deleted when the run ends, fails, times out (--max-hours) or is interrupted, unless --keep.
 """
 
@@ -175,11 +177,17 @@ def _follow(ip: str, deadline: float) -> bool:
     return False
 
 
-def _collect(ip: str) -> None:
-    (DATASET / "models").mkdir(parents=True, exist_ok=True)
-    _rsync(ip, [f"root@{ip}:{REMOTE}/data/out/"], str(DATASET / "models") + "/")
-    _rsync(ip, [f"root@{ip}:{REMOTE}/train.log"], str(DATASET / "models" / "symbol-det.train.log"))
-    print(f"weights in {DATASET / 'models'}: symbol-det.pt, symbol-det.onnx, symbol-det.results.csv")
+def _collect(ip: str, task: str = "symdet") -> None:
+    models = DATASET / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    if task == "wallseg":
+        _rsync(ip, [f"root@{ip}:{REMOTE}/data/out/wallseg/"], str(models) + "/")
+        _rsync(ip, [f"root@{ip}:{REMOTE}/train.log"], str(models / "wallseg.train.log"))
+        print(f"weights in {models}: wallseg.pt, wallseg.log.csv")
+        return
+    _rsync(ip, [f"root@{ip}:{REMOTE}/data/out/"], str(models) + "/", "--exclude=wallseg/")
+    _rsync(ip, [f"root@{ip}:{REMOTE}/train.log"], str(models / "symbol-det.train.log"))
+    print(f"weights in {models}: symbol-det.pt, symbol-det.onnx, symbol-det.results.csv")
 
 
 def cmd_run(args) -> None:
@@ -224,12 +232,19 @@ def _train_on(ip: str, args, holdout: Path, svg: Path) -> bool:
            "--exclude=.venv", "--exclude=__pycache__", "--exclude=.pytest_cache")
     _rsync(ip, [str(svg)], f"root@{ip}:{REMOTE}/data/cache/")
     _rsync(ip, [str(holdout)], f"root@{ip}:{REMOTE}/data/holdout.jsonl")
-    env = f"BASE={args.base} EPOCHS={args.epochs} IMGSZ={args.imgsz} BATCH={args.batch}"
-    _ssh(ip, f"cd {REMOTE} && {env} nohup bash backend/scripts/verda_remote.sh > train.log 2>&1 < /dev/null &")
+    if args.task == "wallseg":
+        masks = DATASET / "cache" / "wallmasks"
+        if not (masks / "index.json").is_file():
+            raise SystemExit(f"{masks}/index.json missing: run `python -m app.cubicasa.wallseg prepare` first")
+        _rsync(ip, [str(masks)], f"root@{ip}:{REMOTE}/data/cache/")
+    env = f"TASK={args.task} BASE={args.base} EPOCHS={args.epochs} IMGSZ={args.imgsz} BATCH={args.batch} DEGREES={args.degrees}"
+    # clear markers from an earlier run first, so _follow cannot see a stale DONE
+    _ssh(ip, f"cd {REMOTE} && rm -f DONE FAILED && {env} nohup bash backend/scripts/verda_remote.sh > train.log 2>&1 "
+             "< /dev/null &")
     print("training started; following the log (if this script stops, training continues on the VM)")
     ok = _follow(ip, time.time() + args.max_hours * 3600)
     if ok:
-        _collect(ip)
+        _collect(ip, args.task)
     return ok
 
 
@@ -238,7 +253,7 @@ def cmd_attach(args) -> None:
     ip = _wait_running(client, args.id)
     ok = _follow(ip, time.time() + args.max_hours * 3600)
     if ok:
-        _collect(ip)
+        _collect(ip, args.task)
     if not args.keep:
         _delete(client, args.id)
     sys.exit(0 if ok else 1)
@@ -259,10 +274,12 @@ def main() -> None:
     p.add_argument("--min-gpu-gb", type=float, default=24)
     p.add_argument("--image", help="OS image (default: newest Ubuntu+CUDA image for the type)")
     p.add_argument("--spot", action="store_true", help="cheaper, but can be reclaimed mid-run")
-    p.add_argument("--base", default="yolo11s.pt")
-    p.add_argument("--epochs", type=int, default=80)
-    p.add_argument("--imgsz", type=int, default=1280)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--task", choices=["symdet", "wallseg"], default="symdet")
+    p.add_argument("--base", default="yolo11s.pt", help="symdet only")
+    p.add_argument("--epochs", type=int, default=None, help="default: 80 (symdet), 40 (wallseg)")
+    p.add_argument("--imgsz", type=int, default=1280, help="symdet only")
+    p.add_argument("--degrees", type=float, default=0.0, help="symdet only: random rotation augmentation (+/- deg)")
+    p.add_argument("--batch", type=int, default=None, help="default: 16 (symdet), 24 (wallseg)")
     p.add_argument("--holdout", default=str(_default_holdout()),
                    help="questions.jsonl whose images must never be trained on")
     p.add_argument("--max-hours", type=float, default=8)
@@ -273,11 +290,16 @@ def main() -> None:
     p.add_argument("id")
     p.add_argument("--max-hours", type=float, default=8)
     p.add_argument("--keep", action="store_true")
+    p.add_argument("--task", choices=["symdet", "wallseg"], default="symdet")
     p.set_defaults(fn=cmd_attach)
     p = sub.add_parser("delete")
     p.add_argument("id")
     p.set_defaults(fn=cmd_delete)
     args = ap.parse_args()
+    if args.cmd == "run":
+        wall = args.task == "wallseg"
+        args.epochs = args.epochs or (40 if wall else 80)
+        args.batch = args.batch or (24 if wall else 16)
     args.fn(args)
 
 

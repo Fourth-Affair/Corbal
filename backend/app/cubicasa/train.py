@@ -23,14 +23,14 @@ AUG = dict(fliplr=0.5, flipud=0.5, degrees=0.0, hsv_h=0.0, hsv_s=0.2, hsv_v=0.2,
 
 def train(data: Path, base: str, epochs: int, imgsz: int, batch: int, device: str, fraction: float = 1.0,
           workers: int = 4, project: Path = DATASET_DIR.parent / "runs", name: str = "symdet",
-          onnx: bool = False) -> tuple[Path, Path | None]:
+          onnx: bool = False, degrees: float = 0.0) -> tuple[Path, Path | None]:
     """Train, then return (best .pt, ONNX export or None)."""
     from ultralytics import RTDETR, YOLO
 
     cls = RTDETR if "rtdetr" in base else YOLO
     model = cls(base)
     model.train(data=str(data), epochs=epochs, imgsz=imgsz, batch=batch, device=device, fraction=fraction,
-                workers=workers, project=str(project), name=name, exist_ok=True, **AUG)
+                workers=workers, project=str(project), name=name, exist_ok=True, **(AUG | {"degrees": degrees}))
     best = Path(model.trainer.best)
     onnx_path = Path(cls(str(best)).export(format="onnx", imgsz=imgsz, dynamic=False, simplify=True)) if onnx else None
     return best, onnx_path
@@ -47,11 +47,12 @@ def main() -> None:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--fraction", type=float, default=1.0, help="fraction of train images to use")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--degrees", type=float, default=0.0, help="random rotation range (+/-), for rotated plans")
     ap.add_argument("--onnx", action="store_true", help="also export ONNX next to --out (CPU runtime)")
     args = ap.parse_args()
 
     best, onnx_path = train(args.data, args.base, args.epochs, args.imgsz, args.batch, args.device, args.fraction,
-                            args.workers, onnx=args.onnx)
+                            args.workers, onnx=args.onnx, degrees=args.degrees)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(best, args.out)
     print(f"copied {best} -> {args.out}")
