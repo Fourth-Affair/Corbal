@@ -2,6 +2,7 @@ services:
   frontend:
     build:
       context: ./frontend
+      target: dev
     # Refresh the persistent node_modules volume after dependency changes.
     command: sh -c "npm ci && npm run dev"
     environment:
@@ -31,6 +32,8 @@ services:
       MODELS_DIR: /models
       PLAN_SOURCE: ${PLAN_SOURCE:-model}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      MAX_CONCURRENT_ANALYSES: ${MAX_CONCURRENT_ANALYSES:-1}
+      ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-45}
       SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     volumes:

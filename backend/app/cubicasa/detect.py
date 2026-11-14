@@ -8,6 +8,8 @@ counting:    per-template fusion models (app.cubicasa.fit) over the evidence fea
 """
 
 import json
+import logging
+import time
 from functools import lru_cache
 
 import joblib
@@ -28,6 +30,11 @@ ICON_ITEMS = {"window": ("window", ""), "door": ("door", ""), "toilet": ("fixtur
               "sink": ("fixture", "sink"), "bathtub": ("fixture", "bathtub"), "sauna_bench": ("fixture", "sauna_bench")}
 ROOM_ITEMS = {"bedroom": "bedroom", "bath": "bathroom", "kitchen": "kitchen", "living": "living",
               "outdoor": "balcony", "entry": "entry", "storage": "storage", "garage": "garage"}
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 
 @lru_cache(maxsize=1)
@@ -79,18 +86,40 @@ def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
                                       bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop))))
     for name, cls in ROOM_ITEMS.items():
         m = ndimage.binary_opening(rooms == ROOM[name], iterations=2)
-        _, sizes, mconf, boxes = components(m, rconf)
+        labels, sizes, mconf, boxes = components(m, rconf)
         for k, (sz, c, sl) in enumerate(zip(sizes, mconf, boxes)):
             if sz >= 2e-3 * H * W:
                 ys, xs = sl
                 items.append(PlanItem(id=f"room-{name}-{k}", category="room", cls=cls, score=round(float(c), 3),
-                                      bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop))))
+                                      bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop)),
+                                      polygon=_region_outline(labels[ys, xs] == k + 1, xs.start, ys.start,
+                                                              max(H, W) * 0.0015)))
     for k, tok in enumerate(meta["ocr"]):
         t = room_type(tok["text"])
         if t:
             items.append(PlanItem(id=f"label-{k}", category="room", cls=t, text=tok["text"],
                                   score=tok["score"], bbox=tuple(tok["bbox"]), raw="ocr"))
     return items
+
+
+def _region_outline(region: np.ndarray, x0: int, y0: int, tolerance: float) -> list[tuple[float, float]] | None:
+    """Outer contour of one segmented region (a crop at x0, y0) as a simplified polygon in image pixels.
+
+    The outline lets containment tests follow the room's real shape: an L-shaped room's bounding box also covers
+    whatever sits in its notch."""
+    contours = find_contours(np.pad(region.astype(np.uint8), 1), 0.5)
+    polygons = [Polygon([(float(x - 1 + x0), float(y - 1 + y0)) for y, x in contour])
+                for contour in contours if len(contour) >= 4]
+    polygons = [p for p in polygons if p.is_valid and p.area > 0]
+    if not polygons:
+        return None
+    polygon = max(polygons, key=lambda p: p.area).simplify(tolerance, preserve_topology=True)
+    coords = list(polygon.exterior.coords)[:-1]
+    if not polygon.is_valid or len(coords) < 3:
+        return None
+    if len(coords) > 200:
+        coords = coords[::(len(coords) + 198) // 199]
+    return [(round(x, 1), round(y, 1)) for x, y in coords]
 
 
 def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list[PlanOutline]:
@@ -207,21 +236,35 @@ def room_outline_candidates(rel: str) -> list[PlanOutline]:
 
 
 def graph_from_image(rel: str, path) -> PlanGraph:
-    img = Image.open(path).convert("RGB")
-    compute(rel, img)  # cached perception outputs
-    f = image_features(rel)
-    dets = symdet.detect(rel, img) if symdet.available() else None
+    started = time.perf_counter()
+    stages: dict[str, float] = {}
+
+    def timed(stage, operation):
+        stage_started = time.perf_counter()
+        try:
+            return operation()
+        finally:
+            stages[stage] = time.perf_counter() - stage_started
+
+    img = timed("image_load", lambda: Image.open(path).convert("RGB"))
+    timed("perception", lambda: compute(rel, img))  # cached perception outputs
+    f = timed("feature_extraction", lambda: image_features(rel))
+    dets = timed("symbol_detection", lambda: symdet.detect(rel, img) if symdet.available() else None)
     if dets is not None:
         f.update(symdet.det_features(dets))
     elif _bundle().get("symdet"):
         raise FileNotFoundError("fusion models need the symbol detector (models/symbol-det.onnx)")
     counts = {}
-    for t, spec in _fusion().items():
-        X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
-        counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
-    with np.load(feature_paths(rel)[0]) as z:
-        floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
-        room_outlines = _room_outline_candidates(z["rooms"], z["rooms_conf"])
+    def predict_counts():
+        for t, spec in _fusion().items():
+            X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
+            counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
+    timed("count_prediction", predict_counts)
+
+    def find_outlines():
+        with np.load(feature_paths(rel)[0]) as z:
+            return _floor_outline_candidates(z["rooms"], z["rooms_conf"])
+    floor_outlines = timed("floor_outlines", find_outlines)
     floor_items = []
     for outline in floor_outlines:
         xs, ys = zip(*outline.polygon)
@@ -232,6 +275,9 @@ def graph_from_image(rel: str, path) -> PlanGraph:
             polygon=outline.polygon,
             score=outline.score,
         ))
-    items = _evidence(rel, dets) + floor_items
-    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
-                     counts=counts, floor_outlines=floor_outlines, room_outlines=room_outlines)
+    items = timed("evidence_assembly", lambda: _evidence(rel, dets) + floor_items)
+    graph = timed("graph_build", lambda: PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
+                                                    counts=counts, floor_outlines=floor_outlines))
+    log.info("image analysis timing image=%s stages_s=%s total_s=%.3f", rel,
+             {name: round(seconds, 3) for name, seconds in stages.items()}, time.perf_counter() - started)
+    return graph

@@ -1,8 +1,13 @@
 import io
+import http.client
 import json
 import logging
 import math
 import os
+import re
+import threading
+import time
+from contextlib import contextmanager
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -21,15 +26,75 @@ from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
 # "llm" = Gemini agent with tools over the plan (falls back to "template" without GEMINI_API_KEY or on API errors).
 ANSWERER = os.environ.get("ANSWERER", "llm")
+MAX_CONCURRENT_ANALYSES = max(1, int(os.environ.get("MAX_CONCURRENT_ANALYSES", "1")))
+ANALYSIS_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("ANALYSIS_QUEUE_TIMEOUT", "45")))
+_analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+_plan_locks: dict[UUID, list] = {}
+_plan_locks_guard = threading.Lock()
 
-# Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser.
+# Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser, .ifc -> app.ifc.
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
+
+
+@contextmanager
+def _plan_analysis_lock(plan_id: UUID):
+    """Serialize work for one plan while letting different plans proceed independently."""
+    with _plan_locks_guard:
+        entry = _plan_locks.get(plan_id)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _plan_locks[plan_id] = entry
+        entry[1] += 1
+    entry[0].acquire()
+    try:
+        yield
+    finally:
+        with _plan_locks_guard:
+            entry[1] -= 1
+            entry[0].release()
+            if entry[1] == 0:
+                _plan_locks.pop(plan_id, None)
+
+
+def _upstream_bytes(request: Request, timeout: float, *, retry_safe: bool = False) -> tuple[bytes, int, object]:
+    """Read an upstream response with a total deadline and retries for idempotent calls."""
+    deadline = time.monotonic() + min(max(timeout * 2, timeout + 5), 90)
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with urlopen(request, timeout=min(timeout, remaining)) as response:
+                return response.read(), response.status, response.headers
+        except HTTPError as error:
+            if retry_safe and error.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(min(0.25 * (2 ** attempt), max(0, deadline - time.monotonic())))
+                continue
+            raise
+        except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError):
+            if not retry_safe or attempt >= 2:
+                raise
+            time.sleep(min(0.25 * (2 ** attempt), max(0, deadline - time.monotonic())))
+    raise TimeoutError("Upstream request exceeded its overall deadline")
+
+
+def _bounded_analysis(operation):
+    if not _analysis_slots.acquire(timeout=ANALYSIS_QUEUE_TIMEOUT):
+        raise HTTPException(status_code=503, detail="Plan analysis is busy. Please try again shortly.")
+    try:
+        return operation()
+    finally:
+        _analysis_slots.release()
 
 
 def _is_pdf(path: str) -> bool:
@@ -73,11 +138,11 @@ def get_plan(plan_id: UUID) -> dict:
         headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
     )
     try:
-        with urlopen(request, timeout=10) as response:
-            plans = json.loads(response.read())
+        content, _, _ = _upstream_bytes(request, 10, retry_safe=True)
+        plans = json.loads(content)
     except HTTPError as error:
         raise HTTPException(status_code=502, detail="Supabase plan lookup failed") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
     if not plans:
@@ -98,41 +163,91 @@ def _knowledge_request(plan_id: UUID, method: str = "GET", body: dict | None = N
     data = json.dumps(body).encode() if body is not None else None
     request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_knowledge?{query}", data=data, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=20) as response:
-            return json.loads(response.read()) if response.status != 204 and response.headers.get("Content-Length") != "0" else None
+        content, status, response_headers = _upstream_bytes(request, 20, retry_safe=True)
+        return json.loads(content) if status != 204 and response_headers.get("Content-Length") != "0" else None
     except HTTPError as error:
+        if error.code in (401, 403, 404):
+            raise HTTPException(status_code=503, detail="Plan data service needs administrator attention.") from error
         raise HTTPException(status_code=502, detail="Supabase plan knowledge request failed") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
 
-def _saved_graph(plan_id: UUID) -> PlanGraph | None:
-    rows = _knowledge_request(plan_id)
-    if not rows:
+def _local_graph_path(plan_id: UUID):
+    from app.config import CACHE_DIR
+
+    return CACHE_DIR / "plan-graphs" / f"{plan_id}.json"
+
+
+def _cache_graph(plan_id: UUID, graph: PlanGraph) -> None:
+    path = _local_graph_path(plan_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(graph.model_dump_json(), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _read_cached_graph(plan_id: UUID) -> PlanGraph | None:
+    path = _local_graph_path(plan_id)
+    try:
+        return PlanGraph.model_validate_json(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return None
+    except (ValueError, OSError) as error:
+        log.warning("plan %s: local analysis cache is invalid (%s)", plan_id, error)
+        return None
+
+
+def _persist_graph(plan_id: UUID, graph: PlanGraph) -> None:
+    # Save locally first so a brief database outage does not discard a completed analysis.
+    try:
+        _cache_graph(plan_id, graph)
+    except OSError as error:
+        log.warning("plan %s: could not save local analysis cache (%s)", plan_id, error)
+    try:
+        _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+    except HTTPException as error:
+        log.warning("plan %s: analysis saved locally; Supabase persistence failed (%s)", plan_id, error.detail)
+
+
+def _saved_graph(plan_id: UUID) -> PlanGraph | None:
+    try:
+        rows = _knowledge_request(plan_id)
+    except HTTPException:
+        if graph := _read_cached_graph(plan_id):
+            log.warning("plan %s: serving cached analysis while Supabase is unavailable", plan_id)
+            return graph
+        raise
+    if not rows:
+        return _read_cached_graph(plan_id)
     try:
         graph = PlanGraph.model_validate(rows[0]["graph"])
         if graph.source == "model":
-            from app.cubicasa.detect import floor_outline_candidates, room_outline_candidates
+            from app.cubicasa.detect import floor_outline_candidates
 
             current_candidates = floor_outline_candidates(graph.image)
-            current_rooms = room_outline_candidates(graph.image)
             changed = (
                 (current_candidates and [item.model_dump(mode="json") for item in current_candidates] !=
                  [item.model_dump(mode="json") for item in graph.floor_outlines])
-                or (current_rooms and [item.model_dump(mode="json") for item in current_rooms] !=
-                    [item.model_dump(mode="json") for item in graph.room_outlines])
+                or bool(graph.room_outlines)
             )
             if changed:
                 graph.floor_outlines = current_candidates
-                graph.room_outlines = current_rooms
+                graph.room_outlines = []
                 graph.items = [item for item in graph.items if item.category != "floor"] + [
                     PlanItem(id=outline.id, category="floor", bbox=(min(x for x, _ in outline.polygon),
                         min(y for _, y in outline.polygon), max(x for x, _ in outline.polygon),
                         max(y for _, y in outline.polygon)), polygon=outline.polygon, score=outline.score)
                     for outline in graph.floor_outlines
                 ]
-                _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+                _persist_graph(plan_id, graph)
+        try:
+            _cache_graph(plan_id, graph)
+        except OSError as error:
+            log.warning("plan %s: could not refresh local analysis cache (%s)", plan_id, error)
         return graph
     except (KeyError, ValueError) as error:
         raise HTTPException(status_code=500, detail="Saved plan analysis is invalid") from error
@@ -152,11 +267,13 @@ def _corrections_request(plan_id: UUID, body: dict | None = None):
     request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_corrections?{query}",
                       data=json.dumps(body).encode() if body else None, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=20) as response:
-            return None if body or response.status == 204 else json.loads(response.read())
+        content, status, _ = _upstream_bytes(request, 20, retry_safe=not body)
+        return None if body or status == 204 else json.loads(content)
     except HTTPError as error:
+        if error.code in (401, 403, 404):
+            raise HTTPException(status_code=503, detail="Plan data service needs administrator attention.") from error
         raise HTTPException(status_code=502, detail="Supabase correction request failed") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
 
@@ -234,8 +351,14 @@ def add_plan_correction(plan_id: UUID, req: PlanCorrectionRequest) -> dict:
         if req.action == "update":
             if req.item.category not in ("room", "door", "window", "fixture"):
                 raise HTTPException(status_code=422, detail="Only rooms, doors, windows, and fixtures can be corrected")
-            # Preserve the detection's location and identity; let the reviewer correct its interpretation.
+            if (any(value < 0 for value in req.item.bbox) or req.item.bbox[2] > graph.width or req.item.bbox[3] > graph.height
+                    or req.item.bbox[0] >= req.item.bbox[2] or req.item.bbox[1] >= req.item.bbox[3]):
+                raise HTTPException(status_code=422, detail="Item bounds must be inside the plan image")
+            if req.item.polygon and any(x < 0 or y < 0 or x > graph.width or y > graph.height for x, y in req.item.polygon):
+                raise HTTPException(status_code=422, detail="Item outline must be inside the plan image")
+            # Keep identity and source fields while saving the reviewer's corrected type and geometry.
             after = current.model_copy(update={"category": req.item.category, "cls": req.item.cls,
+                                               "bbox": req.item.bbox, "polygon": req.item.polygon,
                                                "score": None, "user_verified": True}).model_dump(mode="json")
     event = {"plan_id": str(plan_id), "action": req.action, "item_id": item_id,
              "original_item": before, "corrected_item": after}
@@ -258,11 +381,10 @@ def add_plan_answer_feedback(plan_id: UUID, req: PlanFeedbackRequest) -> dict:
                           "Content-Type": "application/json", "Prefer": "return=minimal",
                       }, method="POST")
     try:
-        with urlopen(request, timeout=20):
-            pass
+        _upstream_bytes(request, 20)
     except HTTPError as error:
         raise HTTPException(status_code=502, detail="Supabase feedback request failed") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
     return {"saved": True}
 
@@ -303,13 +425,13 @@ def _scale_request(plan_id: UUID, method: str = "GET", body: dict | None = None)
     # PostgREST upserts use POST + on_conflict, even though our app endpoint is PUT.
     request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_scales?{query}", data=json.dumps(body).encode() if body else None, headers=headers, method="POST" if method == "PUT" else "GET")
     try:
-        with urlopen(request, timeout=20) as response:
-            rows = json.loads(response.read())
+        content, _, _ = _upstream_bytes(request, 20, retry_safe=True)
+        rows = json.loads(content)
         return rows[0] if rows else None
     except HTTPError as error:
         reason = error.read().decode("utf-8", errors="replace")
         raise HTTPException(status_code=502, detail=f"Plan scale request failed: {reason or error.reason}") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
 
@@ -328,15 +450,15 @@ def _outline_request(plan_id: UUID, method: str = "GET", body: dict | None = Non
                       data=json.dumps(body).encode() if body else None, headers=headers,
                       method="POST" if method == "PUT" else method)
     try:
-        with urlopen(request, timeout=20) as response:
-            if method == "DELETE":
-                return []
-            rows = json.loads(response.read())
+        content, _, _ = _upstream_bytes(request, 20, retry_safe=True)
+        if method == "DELETE":
+            return []
+        rows = json.loads(content)
         return rows[0]["outlines"] if rows else []
     except HTTPError as error:
         reason = error.read().decode("utf-8", errors="replace")
         raise HTTPException(status_code=502, detail=f"Floor outline request failed: {reason or error.reason}") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
 
@@ -345,7 +467,9 @@ def get_plan_outline(plan_id: UUID) -> dict:
     graph = _saved_graph(plan_id)
     if graph is None:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
-    candidates = graph.floor_outlines + graph.room_outlines
+    # Room boundaries come from PlanGeometry everywhere in the product. This endpoint
+    # only serves the independent whole-floor outline suggestions.
+    candidates = graph.floor_outlines
     return {"candidates": [outline.model_dump(mode="json") for outline in candidates],
             "saved": _outline_request(plan_id)}
 
@@ -383,11 +507,11 @@ def _download_source(plan_id: UUID) -> bytes:
     request = Request(f"{supabase_url}/storage/v1/object/{bucket}/{object_path}",
                       headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"})
     try:
-        with urlopen(request, timeout=60) as upstream:
-            return upstream.read()
+        content, _, _ = _upstream_bytes(request, 60, retry_safe=True)
+        return content
     except HTTPError as error:
         raise HTTPException(status_code=502, detail="Could not download the uploaded plan file") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase Storage") from error
 
 
@@ -403,9 +527,12 @@ def _upload_pdf(plan_id: UUID, content: bytes | None = None):
     if not path.is_file():
         content = content if content is not None else _download_source(plan_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".pdf.tmp")
-        tmp.write_bytes(content)
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+        try:
+            tmp.write_bytes(content)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
     return path
 
 
@@ -439,20 +566,43 @@ def get_plan_image(plan_id: UUID) -> Response:
 
 @app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
 def analyze_plan(plan_id: UUID) -> PlanGraph:
+    with _plan_analysis_lock(plan_id):
+        return _analyze_plan(plan_id)
+
+
+def _analyze_plan(plan_id: UUID) -> PlanGraph:
     """Download the uploaded source file from Supabase and analyze it (image pipeline, or the PDF parser)."""
-    if graph := _saved_graph(plan_id):
+    request_started = time.perf_counter()
+    stage_times: dict[str, float] = {}
+
+    def timed(stage: str, operation):
+        started = time.perf_counter()
+        try:
+            return operation()
+        finally:
+            stage_times[stage] = time.perf_counter() - started
+
+    def finish(graph: PlanGraph, cache_hit: bool = False) -> PlanGraph:
+        log.info("plan analysis timing plan_id=%s source=%s cache_hit=%s stages_s=%s total_s=%.3f",
+                 plan_id, graph.source, cache_hit,
+                 {name: round(seconds, 3) for name, seconds in stage_times.items()},
+                 time.perf_counter() - request_started)
         return graph
-    image_bytes = _download_source(plan_id)
+
+    if graph := timed("saved_graph_lookup", lambda: _saved_graph(plan_id)):
+        return finish(graph, cache_hit=True)
+    image_bytes = timed("source_download", lambda: _download_source(plan_id))
     if _is_pdf_bytes(image_bytes):  # vector PDF: deterministic parser, coordinates in PDF points
         from app.pdfplan.answer import plan_graph
 
         try:
-            graph = plan_graph(str(_upload_pdf(plan_id, image_bytes)), image=f"uploads/{plan_id}.pdf")
+            graph = timed("pdf_parse", lambda: _bounded_analysis(
+                lambda: plan_graph(str(_upload_pdf(plan_id, image_bytes)), image=f"uploads/{plan_id}.pdf")))
         except Exception as error:  # noqa: BLE001  unreadable or encrypted PDF
             raise HTTPException(status_code=422, detail=f"Uploaded PDF could not be read: {error}") from error
-        _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
-        _store_geometry_safely(plan_id, graph)
-        return graph
+        timed("knowledge_persist", lambda: _persist_graph(plan_id, graph))
+        timed("geometry_store", lambda: _store_geometry_safely(plan_id, graph))
+        return finish(graph)
 
     # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
     # cache key prevents unrelated uploads from sharing feature files.
@@ -464,20 +614,28 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
     cache_key = f"uploads/{plan_id}.png"
     cache_path = CACHE_DIR / cache_key
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    def prepare_image():
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            image.verify()
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            tmp = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp.png")
+            try:
+                image.save(tmp, format="PNG")
+                tmp.replace(cache_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+        except (UnidentifiedImageError, OSError) as error:
+            raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
+
+    timed("image_decode_and_cache", prepare_image)
     try:
-        image = Image.open(io.BytesIO(image_bytes))
-        image.verify()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image.save(cache_path, format="PNG")
-    except (UnidentifiedImageError, OSError) as error:
-        raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
-    try:
-        graph = graph_from_image(cache_key, cache_path)
+        graph = timed("image_pipeline", lambda: _bounded_analysis(lambda: graph_from_image(cache_key, cache_path)))
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
-    _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
-    _store_geometry_safely(plan_id, graph)
-    return graph
+    timed("knowledge_persist", lambda: _persist_graph(plan_id, graph))
+    timed("geometry_store", lambda: _store_geometry_safely(plan_id, graph))
+    return finish(graph)
 
 
 # ---------------------------------------------------------------- plan geometry (rooms, walls, openings)
@@ -496,15 +654,15 @@ def _geometry_request(plan_id: UUID, method: str = "GET", body: dict | None = No
     request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_geometry?{query}",
                       data=json.dumps(body).encode() if body is not None else None, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=30) as response:
-            if method == "POST":
-                return None
-            rows = json.loads(response.read())
-            return rows[0]["geometry"] if rows else None
+        content, _, _ = _upstream_bytes(request, 30, retry_safe=True)
+        if method == "POST":
+            return None
+        rows = json.loads(content)
+        return rows[0]["geometry"] if rows else None
     except HTTPError as error:
         reason = error.read().decode("utf-8", errors="replace")
         raise HTTPException(status_code=502, detail=f"Plan geometry request failed: {reason or error.reason}") from error
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ConnectionError, http.client.HTTPException, OSError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
 
 
@@ -521,7 +679,12 @@ def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
         from PIL import Image
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB").save(path, format="PNG")
+        tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp.png")
+        try:
+            Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB").save(tmp, format="PNG")
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
     return geometry_from_image(rel, path, graph)
 
 
@@ -613,25 +776,70 @@ def get_plan_geometry(plan_id: UUID, uncertain: bool = Query(True, description="
 @app.post("/api/plans/{plan_id}/ask", response_model=Answer)
 def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     """Answer a question using the analysis saved for this plan in Supabase."""
-    graph = _saved_graph(plan_id)
-    if graph is None:
-        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
-    graph = _apply_corrections(graph, _corrections_request(plan_id) or [])
+    try:
+        graph = _saved_graph(plan_id)
+        if graph is None:
+            raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+        graph = _apply_corrections(graph, _corrections_request(plan_id) or [])
+    except HTTPException as error:
+        if error.status_code == 502:
+            raise HTTPException(
+                status_code=503,
+                detail="I couldn't load the saved plan just now. Your question is still in the chat; please try again in a moment.",
+            ) from error
+        raise
     question = req.question.casefold()
-    area_question = any(term in question for term in ("area", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
+    area_question = any(term in question for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
+    # Short follow-ups inherit a room-area context from the most recent user turn.
+    # Keep this deliberately narrow so an old topic in a long conversation cannot
+    # turn a new, unrelated size question into an area calculation.
+    if not area_question and re.search(r"\b(it|that|this|there|its|their)\b", question):
+        for turn in reversed(req.history):
+            if turn.role == "user":
+                earlier = turn.text.casefold()
+                area_question = any(term in earlier for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²"))
+                break
+    if area_question:
+        # “How big is the toilet?” normally asks about the fixture. The room
+        # area flow should only claim toilet-room wording or an explicit WC.
+        fixture_size_question = bool(re.search(r"\b(toilet|toilet bowl|wc seat)\b", question)) and not bool(
+            re.search(r"\b(toilet room|wc room|wc|toilet area)\b", question)
+        )
+        explicit_floor_area = bool(re.search(r"\b(floor|whole plan|entire plan|building|apartment)\b", question))
+        if fixture_size_question and not explicit_floor_area:
+            area_question = False
     if area_question:
         if req.scale is None:
             return Answer(answer=None, confidence="not_found", explanation="I need a known distance to establish the drawing scale before estimating floor area.")
-        room_terms = (("living room", "living"), ("kitchen", "kitchen"), ("bedroom", "bedroom"),
-                      ("bathroom", "bathroom"), ("bath", "bathroom"), ("balcony", "balcony"),
-                      ("sauna", "sauna"), ("garage", "garage"), ("storage", "storage"), ("entry", "entry"))
-        requested_room = next((room_type for term, room_type in room_terms if term in question), None)
+        room_terms = (("living room", "living"), ("livingroom", "living"), ("kitchen", "kitchen"), ("bedroom", "bedroom"),
+                      ("bathroom", "bathroom"), ("washroom", "bathroom"), ("bath", "bathroom"), ("balcony", "balcony"),
+                      ("sauna", "sauna"), ("garage", "garage"), ("storage", "storage"), ("entry", "entry"),
+                      ("hallway", "entry"), ("wc room", "wc"), ("toilet room", "wc"), ("wc", "wc"))
+        subject = question
+        if re.search(r"\b(it|that|this|there|its|their)\b", question):
+            for turn in reversed(req.history):
+                if turn.role == "user":
+                    subject = turn.text.casefold()
+                    break
+        requested_room = next((room_type for term, room_type in room_terms if term in subject), None)
+        if not requested_room and not re.search(r"\b(floor|whole plan|entire plan|building|apartment)\b", question):
+            return Answer(answer=None, confidence="not_found", clarification_needed=True,
+                          explanation="Do you mean the room’s floor area or the toilet fixture’s dimensions?")
         if requested_room:
-            outlines = [outline for outline in req.floor_outlines if outline.scope == "room" and outline.room_type == requested_room]
+            geometry = _plan_geometry(plan_id, graph)
+            room_candidates = [room for room in geometry.rooms if room.type == requested_room]
+            outlines = [outline for outline in req.floor_outlines if outline.scope == "room" and outline.room_type == requested_room and outline.decision != "rejected"]
+            suggested_ids = {room.id for room in room_candidates}
+            reviewed_ids = {outline.id for outline in req.floor_outlines
+                            if outline.scope == "room" and outline.room_type == requested_room
+                            and outline.decision in ("accepted", "rejected")}
+            if suggested_ids - reviewed_ids:
+                return Answer(answer=None, confidence="not_found",
+                              explanation=f"Some suggested {requested_room} boundaries still need to be reviewed before I can calculate their areas.")
             if not outlines:
                 return Answer(answer=None, confidence="not_found", explanation=f"The {requested_room} boundary still needs to be reviewed or drawn before I can estimate its area.")
         else:
-            outlines = [outline for outline in req.floor_outlines if outline.scope == "floor"]
+            outlines = [outline for outline in req.floor_outlines if outline.scope == "floor" and outline.decision != "rejected"]
             if not outlines:
                 return Answer(answer=None, confidence="not_found", explanation="The drawing scale is available, but a whole-floor boundary still needs to be reviewed or drawn before I can estimate floor area.")
         calibration_pixels = ((req.scale.points[1][0] - req.scale.points[0][0]) ** 2 +
@@ -640,12 +848,19 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
             return Answer(answer=None, confidence="not_found", explanation="The scale reference points are too close together. Please recalibrate using a longer known distance.")
         meters_per_unit = {"m": 1.0, "cm": 0.01, "ft": 0.3048, "in": 0.0254}[req.scale.unit]
         meters_per_pixel = req.scale.distance * meters_per_unit / calibration_pixels
-        pixel_area = 0.0
+        room_areas = []
         for outline in outlines:
             polygon = outline.polygon
-            pixel_area += abs(sum(x * polygon[(index + 1) % len(polygon)][1] - polygon[(index + 1) % len(polygon)][0] * y
-                                  for index, (x, y) in enumerate(polygon))) / 2
-        area = pixel_area * meters_per_pixel * meters_per_pixel
+            pixel_area = abs(sum(x * polygon[(index + 1) % len(polygon)][1] - polygon[(index + 1) % len(polygon)][0] * y
+                                 for index, (x, y) in enumerate(polygon))) / 2
+            room_areas.append((outline, pixel_area * meters_per_pixel * meters_per_pixel))
+        area = sum(value for _, value in room_areas)
+        if requested_room and len(room_areas) > 1:
+            details = "; ".join(f"{outline.label or requested_room} {index + 1}: {value:.1f} m²"
+                                 for index, (outline, value) in enumerate(room_areas))
+            return Answer(answer=details + f". Total: {area:.1f} m².", unit=None, confidence="low",
+                          explanation="Areas are calculated separately from the accepted room outlines and saved drawing scale. Check each highlighted boundary.",
+                          answered_by="template")
         return Answer(answer=round(area, 1), unit="m²", confidence="low",
                       explanation=f"Estimated {outlines[0].label.lower()} area from the saved scale and user-accepted outline. Check the highlighted boundary before relying on this area.",
                       answered_by="template")
@@ -676,6 +891,17 @@ def _template_answer(question: str, graph) -> Answer:
 
 @app.post("/api/ask")
 def ask(req: AskRequest) -> Answer:
+    if req.path.lower().endswith(".ifc"):  # BIM model: deterministic IFC tools, citations carry IFC GlobalIds
+        try:
+            resolve_dataset_path(req.path)
+        except FileNotFoundError:
+            raise HTTPException(404, f"File not found: {req.path}") from None
+        from app.ifc.answer import answer_question as ifc_answer
+
+        try:
+            return ifc_answer(req.path, req.question)
+        except FileNotFoundError as error:
+            return Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {error}")
     _check_path(req.path, pdf_ok=True)
     if _is_pdf(req.path):  # vector plan: deterministic parser, citations in PDF points
         from app.pdfplan.answer import answer_question

@@ -1,0 +1,71 @@
+# Production stack for a single server (see deploy/README.md):
+#   docker compose -f compose.prod.yaml up -d --build
+# Only Caddy is published (80/443, automatic HTTPS). Frontend and backend stay on the internal network.
+services:
+  caddy:
+    build: ./deploy/caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env, e.g. 65-108-1-2.sslip.io}
+      RATE_ASK_PER_MIN: ${RATE_ASK_PER_MIN:-20}
+      RATE_ANALYZE_PER_MIN: ${RATE_ANALYZE_PER_MIN:-6}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+
+  frontend:
+    build:
+      context: ./frontend
+      target: prod
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+        NEXT_PUBLIC_SUPABASE_BUCKET: ${NEXT_PUBLIC_SUPABASE_BUCKET:-plans}
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+      NEXT_PUBLIC_SUPABASE_BUCKET: ${NEXT_PUBLIC_SUPABASE_BUCKET:-plans}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    # One process: inference releases the GIL, and GEMINI_MAX_PER_HOUR is counted per process.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips '*'
+    environment:
+      DATASET_DIR: /data/dataset/junction-dataset
+      CACHE_DIR: /data/cache
+      MODELS_DIR: /models
+      PLAN_SOURCE: model
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MAX_PER_HOUR: ${GEMINI_MAX_PER_HOUR:-300}
+      MAX_CONCURRENT_ANALYSES: ${MAX_CONCURRENT_ANALYSES:-1}
+      ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-45}
+      SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+    volumes:
+      - ./models:/models:ro          # git-tracked weights + cubicasa-net.pkl copied in by hand
+      - ./dataset:/data/dataset:ro   # optional: only needed for the dataset-browsing endpoints
+      - ./dataset/cache:/data/cache  # uploads, analysis graphs, Gemini answer cache (persistent, rsync-able)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  caddy_data:
+  caddy_config:

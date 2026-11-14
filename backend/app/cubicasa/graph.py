@@ -9,6 +9,8 @@ from pathlib import Path
 from app.config import CACHE_DIR, DATASET_DIR
 from app.models import PlanGraph
 
+GRAPH_VERSION = 2  # bump when graph_from_image changes what it stores (2: room regions carry their outline)
+
 
 def resolve_dataset_path(rel: str) -> Path:
     """Resolve a dataset-relative path, refusing anything outside the dataset dir."""
@@ -30,6 +32,7 @@ def _cache_path(rel: str, source: str) -> Path:
 
         if symdet.available():  # detector boxes are part of the evidence
             sub += "-" + symdet.fingerprint().replace(".", "_")
+        sub += f"-g{GRAPH_VERSION}"
     return CACHE_DIR / sub / (Path(rel).stem + ".json")
 
 

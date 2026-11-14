@@ -33,6 +33,7 @@ class PlanOutline(BaseModel):
     scope: Literal["floor", "room"] = "floor"
     room_type: str | None = None
     label: str = "Floor"
+    decision: Literal["accepted", "rejected"] | None = None
 
 
 class PlanGraph(BaseModel):
@@ -72,7 +73,7 @@ class PlanCorrectionRequest(BaseModel):
 class PlanFeedbackRequest(BaseModel):
     question: str = Field(max_length=4000)
     answer: str = Field(max_length=4000)
-    feedback: Literal["helpful", "incorrect", "unclear"]
+    feedback: Literal["helpful", "incorrect", "unclear", "trusted", "rejected"]
     reason: str | None = Field(default=None, max_length=500)
     evidence_ids: list[str] = Field(default_factory=list, max_length=100)
 
@@ -95,6 +96,7 @@ class Answer(BaseModel):
     template: str | None = None
     confidence: Literal["high", "medium", "low", "not_found"]
     explanation: str
+    clarification_needed: bool = False
     citations: list[PlanItem] = Field(default_factory=list)
     answered_by: Literal["template", "llm"] = "template"  # template = router + counter, llm = Gemini agent (values still tool-computed)
 

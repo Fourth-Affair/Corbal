@@ -5,6 +5,7 @@ produced, so the agent can check that the final answer and its citations are bac
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 from app.cubicasa.answer import count
@@ -39,6 +40,7 @@ class ToolTrace:
     item_ids: list[str] = field(default_factory=list)  # items the call returned (citable)
     numbers: list[int | float] = field(default_factory=list)  # numbers the call computed (answerable)
     template_answer: Answer | None = None  # set by count_template
+    derived_from: list["ToolTrace"] | None = None  # set by calculate: the calls whose numbers it combined
 
 
 def _kind(it: PlanItem) -> str:
@@ -73,6 +75,45 @@ def _match(it: PlanItem, category: str, type_: str | None) -> bool:
 def _inside(inner: tuple, outer: tuple) -> bool:
     cx, cy = (inner[0] + inner[2]) / 2, (inner[1] + inner[3]) / 2
     return outer[0] <= cx <= outer[2] and outer[1] <= cy <= outer[3]
+
+
+def _shape(region: PlanItem):
+    """The region's outline as a shapely polygon, or None when it only has a bounding box."""
+    if not region.polygon or len(region.polygon) < 3:
+        return None
+    from shapely.geometry import Polygon
+
+    poly = Polygon(region.polygon)
+    poly = poly if poly.is_valid else poly.buffer(0)
+    return None if poly.is_empty else poly
+
+
+def _contains(region: PlanItem, shape, it: PlanItem) -> bool:
+    """Is the item in the region? With an outline, an L-shaped room no longer claims what sits in its notch.
+
+    Fixtures, rooms and labels: centre inside the outline, or most of the box inside it (a basin against the wall of
+    a roughly segmented room). Doors and windows sit in the wall, just outside the room outline: they belong to
+    the room when at least half of their length runs along it (so a door belongs to both rooms it connects). Without an outline: centre in the bounding box."""
+    if shape is None:
+        return _inside(it.bbox, region.bbox)
+    from shapely.geometry import Point, box
+
+    x0, y0, x1, y1 = it.bbox
+    if it.category in ("door", "window"):
+        pad = max(2.0, min(x1 - x0, y1 - y0))  # about one wall thickness
+        hit = box(x0 - pad, y0 - pad, x1 + pad, y1 + pad).intersection(shape)
+        if hit.is_empty:
+            return False
+        hx0, hy0, hx1, hy1 = hit.bounds
+        w, h = x1 - x0, y1 - y0
+        share_x, share_y = (hx1 - hx0) / (w + 2 * pad), (hy1 - hy0) / (h + 2 * pad)
+        if max(w, h) >= 2 * min(w, h):  # a bar in the wall: measure along it
+            return (share_x if w >= h else share_y) >= 0.5
+        return max(share_x, share_y) >= 0.5  # squarish box (door with its swing): the wall may run either way
+    if shape.contains(Point((x0 + x1) / 2, (y0 + y1) / 2)):
+        return True
+    area = (x1 - x0) * (y1 - y0)
+    return area > 0 and box(x0, y0, x1, y1).intersection(shape).area >= 0.5 * area
 
 
 def _area(b: tuple) -> float:
@@ -163,6 +204,7 @@ class PlanTools:
         self.by_id = {it.id: it for it in graph.items}
         self.rooms = {rm.id: rm for rm in geometry.rooms} if geometry else {}
         self.segments = {sg.id: sg for sg in geometry.wall_segments} if geometry else {}
+        self.produced: dict[float, ToolTrace] = {}  # every number a tool returned so far -> the call it came from
         for rm in self.rooms.values():
             self.by_id.setdefault(rm.id, _room_item(rm))
         for sg in self.segments.values():
@@ -178,13 +220,15 @@ class PlanTools:
         for it in self.graph.items:
             key = it.category + (f":{it.cls}" if it.cls else "") + (f" ({_kind(it)})" if it.category == "room" else "")
             kinds[key] = kinds.get(key, 0) + 1
+        scale = self.geometry.scale if self.geometry else None
         return {
             "image_size_px": [self.graph.width, self.graph.height],
             "source": "ground-truth labels" if self.graph.source == "svg" else "image analysis (detector, segmentation, OCR)",
             "items_by_kind": dict(sorted(kinds.items())),
             "user_reviewed_items": sum(it.user_verified for it in self.graph.items),
             "user_correction_events": self.graph.user_correction_count,
-            "note": "No drawing scale is known: real-world lengths and areas (m, m²) cannot be computed.",
+            "note": ("Drawing scale is available for metric measurements." if scale else
+                     "No drawing scale is known: real-world lengths and areas (m, m²) cannot be computed."),
         }, ToolTrace()
 
     def count_template(self, template: str) -> tuple[dict, ToolTrace]:
@@ -234,14 +278,17 @@ class PlanTools:
         region = box
         if box.category == "room" and _kind(box) == "label":  # a label is a few words of text: use the room around it
             around = [it for it in self.graph.items
-                      if it.category == "room" and _kind(it) == "region" and _inside(box.bbox, it.bbox)]
+                      if it.category == "room" and _kind(it) == "region" and _contains(it, _shape(it), box)]
             if not around:
                 return {"error": f"{container_id} is a text label and no segmented room region contains it"}, ToolTrace()
             region = min(around, key=lambda it: _area(it.bbox))
+        shape = _shape(region)
         hits = [it for it in self.graph.items
-                if it.id != region.id and _match(it, category, type) and _inside(it.bbox, region.bbox)]
+                if it.id != region.id and _match(it, category, type) and _contains(region, shape, it)]
         out = {"container": _row(region), "count": len(hits), "items": [_row(it) for it in hits[:MAX_LIST]],
-               "note": "Containment uses the container's bounding box (item centre inside), so it is approximate."}
+               "note": ("Containment uses the container's outline: fixtures by their centre, doors and windows when "
+                        "they run along the outline." if shape is not None else
+                        "Containment uses the container's bounding box (item centre inside), so it is approximate.")}
         return out, ToolTrace(item_ids=[region.id] + [it.id for it in hits[:MAX_LIST]], numbers=[len(hits)])
 
     def _scale_note(self) -> str:
@@ -328,13 +375,70 @@ class PlanTools:
                     if v is not None]
         return out, ToolTrace(item_ids=[sg.id for sg in shown], numbers=numbers)
 
+    def covering_quantity(self, room_type: str, unit_width_m: float, unit_height_m: float,
+                          waste_percent: float = 10) -> tuple[dict, ToolTrace]:
+        """Estimate count of rectangular covering units for the matching room floors."""
+        if not self.geometry:
+            return {"error": "Room geometry is unavailable."}, ToolTrace()
+        if unit_width_m <= 0 or unit_height_m <= 0 or not 0 <= waste_percent <= 100:
+            return {"error": "Unit dimensions must be positive and waste_percent must be 0..100."}, ToolTrace()
+        rooms = [rm for rm in self.rooms.values() if rm.type == room_type and rm.tier != "unknown"]
+        if not self.geometry.scale and any(rm.area_m2 is not None for rm in rooms):
+            # area_m2 is normally populated only with a scale; keep this guard explicit for malformed geometry.
+            return {"error": "A drawing scale is required to calculate room area."}, ToolTrace()
+        missing = [rm.id for rm in rooms if rm.area_m2 is None and rm.labeled_area_m2 is None]
+        usable = [rm for rm in rooms if rm.area_m2 is not None or rm.labeled_area_m2 is not None]
+        if not usable:
+            return {"error": f"No measured or labeled areas available for {room_type} rooms."}, ToolTrace()
+        area = sum(rm.area_m2 if rm.area_m2 is not None else rm.labeled_area_m2 for rm in usable)
+        unit_area = unit_width_m * unit_height_m
+        base_count = math.ceil(area / unit_area)
+        quantity = math.ceil(base_count * (1 + waste_percent / 100))
+        ids = [rm.id for rm in usable]
+        result = {"room_type": room_type, "room_count": len(usable), "area_m2": round(area, 3),
+                  "unit_area_m2": round(unit_area, 5), "quantity_without_waste": base_count,
+                  "waste_percent": waste_percent, "quantity_with_waste": quantity,
+                  "area_sources": ["measured" if rm.area_m2 is not None else "written on drawing" for rm in usable]}
+        if missing:
+            result["rooms_without_area"] = missing
+        return result, ToolTrace(item_ids=ids, numbers=[area, unit_area, base_count, waste_percent, quantity])
+
+    def calculate(self, operation: str, operands: list) -> tuple[dict, ToolTrace]:
+        """Sum or difference of numbers earlier calls returned. The model supplies no numbers of its own."""
+        if operation not in ("add", "subtract"):
+            return {"error": "operation must be 'add' or 'subtract'"}, ToolTrace()
+        if not isinstance(operands, list) or len(operands) < 2 or any(
+                isinstance(v, bool) or not isinstance(v, int | float) for v in operands):
+            return {"error": "operands must be a list of at least two numbers"}, ToolTrace()
+        unknown = [v for v in operands if float(v) not in self.produced]
+        if unknown:
+            return {"error": f"{unknown} were not returned by a tool: every operand must be a number from an earlier "
+                             "tool result (call the tool that provides it first)"}, ToolTrace()
+        result = sum(operands) if operation == "add" else operands[0] - sum(operands[1:])
+        result = int(result) if float(result).is_integer() else round(result, 6)
+        sources = list({id(t): t for t in (self.produced[float(v)] for v in operands)}.values())
+        ids = list(dict.fromkeys(i for t in sources for i in t.item_ids))
+        return ({"operation": operation, "operands": operands, "result": result,
+                 "note": "subtract = first operand minus the others" if operation == "subtract" else ""},
+                ToolTrace(item_ids=ids, numbers=[result], derived_from=sources))
+
     # --- dispatch ----------------------------------------------------------------------------------------------
 
     def call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
+        result, trace = self._call(name, args)
+        for number in trace.numbers:  # a calibrated count keeps the claim on its number over raw item counts
+            known = self.produced.get(float(number))
+            if known is None or (known.template_answer is None and trace.template_answer is not None):
+                self.produced[float(number)] = trace
+        return result, trace
+
+    def _call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
         fn = {"plan_summary": self.plan_summary, "count_template": self.count_template,
-              "list_items": self.list_items, "items_in": self.items_in,
+              "list_items": self.list_items, "items_in": self.items_in, "calculate": self.calculate,
               **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls}
                  if self.geometry else {})}.get(name)
+        if name == "covering_quantity" and self.geometry:
+            fn = self.covering_quantity
         if fn is None:
             return {"error": f"unknown tool {name!r}"}, ToolTrace()
         try:
@@ -371,18 +475,42 @@ DECLARATIONS = [
         "name": "items_in",
         "description": ("Items of a category (optionally a type) located inside a container item, e.g. fixtures in a "
                         "bathroom or windows in a bedroom. container_id is a room or floor id from list_items; "
-                        "for a room label the segmented room region around it is used."),
+                        "for a room label the segmented room region around it is used. Uses the room's outline "
+                        "when it has one, so it also works for rooms that are not rectangular."),
         "parameters": {"type": "object", "properties": {
             "container_id": {"type": "string"},
             "category": {"type": "string", "enum": CATEGORIES},
             "type": {"type": "string", "enum": ROOM_TYPES + FIXTURE_TYPES},
         }, "required": ["container_id", "category"]},
     },
+    {
+        "name": "calculate",
+        "description": ("Add or subtract numbers that earlier tool calls returned, e.g. two count_template values: "
+                        "'how many X and Y in total' -> add, 'how many more X than Y' -> subtract (first operand "
+                        "minus the others). Every operand must be a number from an earlier tool result; the result "
+                        "may be given as the answer value."),
+        "parameters": {"type": "object", "properties": {
+            "operation": {"type": "string", "enum": ["add", "subtract"]},
+            "operands": {"type": "array", "items": {"type": "number"}, "minItems": 2},
+        }, "required": ["operation", "operands"]},
+    },
 ]
 
 
 # Only offered when the plan has stored room geometry (uploaded plans); the benchmark path keeps the tools above.
 ROOM_DECLARATIONS = [
+    {
+        "name": "covering_quantity",
+        "description": ("Calculate how many rectangular covering units are needed for floors of rooms of a given type. "
+                        "Uses detected room areas and drawing scale, or areas printed on the plan. Returns exact "
+                        "rounded-up unit count before and after waste, with citations to rooms. Use when asked for "
+                        "tiles, panels or similar area-covering materials; state the waste assumption."),
+        "parameters": {"type": "object", "properties": {
+            "room_type": {"type": "string", "enum": ROOM_TYPES},
+            "unit_width_m": {"type": "number"}, "unit_height_m": {"type": "number"},
+            "waste_percent": {"type": "number", "description": "waste allowance percentage; use 10 when not specified"},
+        }, "required": ["room_type", "unit_width_m", "unit_height_m"]},
+    },
     {
         "name": "list_rooms",
         "description": ("Rooms as spaces enclosed by the plan's walls. Each has a type from combined evidence (a label "

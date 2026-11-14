@@ -11,6 +11,7 @@ import json
 import random
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -55,9 +56,12 @@ def ocr_tokens(rel: str, img: Image.Image | None = None) -> dict:
     img = (img or Image.open(DATASET_DIR / rel)).convert("RGB")
     toks = [{"text": t, "bbox": [round(float(v), 1) for v in b], "score": round(float(s), 3)} for t, b, s in read_text(img)]
     out = {"width": img.width, "height": img.height, "ocr": toks}
-    tmp = js.with_suffix(".json.tmp")  # atomic: a crash must not leave a half-written cache
-    tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(js)
+    tmp = js.with_name(f"{js.name}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(js)
+    finally:
+        tmp.unlink(missing_ok=True)
     return out
 
 
@@ -72,17 +76,22 @@ def compute(rel: str, img: Image.Image | None = None) -> None:
         pred = cubinet.predict(img, max_side=MAX_SIDE)[0]
         rooms = torch.softmax(pred[21:33], 0)
         icons = torch.softmax(pred[33:44], 0)
-        np.savez_compressed(
-            npz,
-            heat=(pred[:21].clamp(0, 1) * 255).to(torch.uint8).numpy()[:, ::2, ::2],  # junction heatmaps, half res
-            rooms=rooms.argmax(0).to(torch.uint8).numpy(),
-            rooms_conf=(rooms.max(0).values * 255).to(torch.uint8).numpy(),
-            icons=icons.argmax(0).to(torch.uint8).numpy(),
-            icons_conf=(icons.max(0).values * 255).to(torch.uint8).numpy(),
-            # per-class probabilities: argmax loses symbols that sit on walls / touch each other
-            iprob=(icons[list(ICON_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
-            rprob=(rooms[list(ROOM_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
-        )
+        tmp = npz.with_name(f"{npz.name}.{uuid4().hex}.tmp.npz")
+        try:
+            np.savez_compressed(
+                tmp,
+                heat=(pred[:21].clamp(0, 1) * 255).to(torch.uint8).numpy()[:, ::2, ::2],  # junction heatmaps, half res
+                rooms=rooms.argmax(0).to(torch.uint8).numpy(),
+                rooms_conf=(rooms.max(0).values * 255).to(torch.uint8).numpy(),
+                icons=icons.argmax(0).to(torch.uint8).numpy(),
+                icons_conf=(icons.max(0).values * 255).to(torch.uint8).numpy(),
+                # per-class probabilities: argmax loses symbols that sit on walls / touch each other
+                iprob=(icons[list(ICON_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
+                rprob=(rooms[list(ROOM_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
+            )
+            tmp.replace(npz)
+        finally:
+            tmp.unlink(missing_ok=True)
     ocr_tokens(rel, img)
 
 
