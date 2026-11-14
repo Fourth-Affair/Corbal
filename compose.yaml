@@ -21,13 +21,20 @@ services:
     build:
       context: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    environment:
-      SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
-      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     ports:
       - "8000:8000"
+    environment:
+      DATASET_DIR: /dataset/junction-dataset
+      CUBICASA_ORIG_DIR: /dataset/cubicasa5k-original/cubicasa5k
+      CACHE_DIR: /dataset/cache
+      MODELS_DIR: /dataset/models
+      PLAN_SOURCE: ${PLAN_SOURCE:-model}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     volumes:
       - ./backend:/app
+      - ./dataset:/dataset
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
