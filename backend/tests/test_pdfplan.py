@@ -108,11 +108,21 @@ def test_uploaded_pdf_flow(tmp_path, monkeypatch):
             return None
         return [store[str(pid)]] if str(pid) in store else []
 
+    import time
+
     pdf = (DATASET_DIR / PLAN).read_bytes()
     monkeypatch.setattr(m, "_download_source", lambda pid: pdf)
     monkeypatch.setattr(m, "_knowledge_request", knowledge)
+    monkeypatch.setattr(m, "_corrections_request", lambda pid, body=None: [])  # no user corrections
     c, pid = TestClient(m.app), uuid.uuid4()
-    g = c.post(f"/api/plans/{pid}/analyze").json()
+    r = c.post(f"/api/plans/{pid}/analyze")  # starts the background job (202) or returns the saved graph (200)
+    deadline = time.monotonic() + 30
+    while r.status_code == 202 and time.monotonic() < deadline:
+        time.sleep(0.05)
+        r = c.get(f"/api/plans/{pid}/analysis")
+    body = r.json()
+    assert r.status_code == 200 and body.get("state", "done") == "done", body
+    g = body.get("graph", body)
     assert g["source"] == "pdf" and (g["width"], g["height"]) == (1191, 842)
     assert c.get(f"/api/plans/{pid}/image").headers["content-type"] == "image/png"
     a = c.post(f"/api/plans/{pid}/ask", json={"question": "How many rooms labelled 'Zimmer' are there on this floor?"}).json()
