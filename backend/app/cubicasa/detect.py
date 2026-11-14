@@ -26,7 +26,8 @@ from app.models import PlanGraph, PlanItem, PlanOutline
 
 ICON_ITEMS = {"window": ("window", ""), "door": ("door", ""), "toilet": ("fixture", "toilet"),
               "sink": ("fixture", "sink"), "bathtub": ("fixture", "bathtub"), "sauna_bench": ("fixture", "sauna_bench")}
-ROOM_ITEMS = {"bedroom": "bedroom", "bath": "bathroom", "kitchen": "kitchen", "outdoor": "balcony"}
+ROOM_ITEMS = {"bedroom": "bedroom", "bath": "bathroom", "kitchen": "kitchen", "living": "living",
+              "outdoor": "balcony", "entry": "entry", "storage": "storage", "garage": "garage"}
 
 
 @lru_cache(maxsize=1)
@@ -86,7 +87,7 @@ def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
                                       bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop))))
     for k, tok in enumerate(meta["ocr"]):
         t = room_type(tok["text"])
-        if t and t != "other":
+        if t:
             items.append(PlanItem(id=f"label-{k}", category="room", cls=t, text=tok["text"],
                                   score=tok["score"], bbox=tuple(tok["bbox"]), raw="ocr"))
     return items
@@ -150,8 +151,15 @@ def _room_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list[
     for class_name, (class_id, room_type, label_text) in labels.items():
         mask = ndimage.binary_opening(rooms == class_id, iterations=2)
         components_map, sizes, confidences, boxes = components(mask, confidence)
+        # Semantic segmentation often labels bits of text, furniture, or border noise
+        # as a room. Relative filtering removes those fragments while preserving
+        # multiple real rooms of the same type (for example, two similarly sized
+        # bedrooms). The absolute floor below still handles classes with only one
+        # small room, such as an entry or bathroom.
+        largest_component = max(sizes, default=0)
+        minimum_component = max(0.002 * H * W, 0.15 * largest_component)
         for component_id, (size, score, bounds) in enumerate(zip(sizes, confidences, boxes), 1):
-            if size < 0.002 * H * W:
+            if size < minimum_component:
                 continue
             ys, xs = bounds
             region = np.pad((components_map[ys, xs] == component_id).astype(np.uint8), 1)

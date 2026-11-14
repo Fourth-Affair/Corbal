@@ -14,10 +14,11 @@ ROOM_LABELS: dict[str, list[str]] = {
     "sauna": ["SAUNA", "S", "LH", "LÖYLYH", "LÖYLYHUONE", "BASTU"],
     "kitchen": ["K", "KK", "KT", "KEITTIÖ", "KEITTIO", "AVOK", "AVOKEITTIÖ", "KEITTOKOMERO", "KOK", "KÖK",
                 "KEITTIÖKOMERO", "TUPAK", "TUPAKEITTIÖ", "APUK", "APUKEITTIÖ", "KEITTIÖTILA", "RUOKAILU+K"],
+    "living": ["OH", "OLOH", "OLOHUONE", "LIVING", "LIVINGROOM", "VARDAGSRUM"],
     "balcony": ["PARVEKE", "PARV", "LASITETTUPARVEKE", "LASPARV", "LASITPARV", "RANSKALPARVEKE", "PARVEKKEET",
                 "PARVEKE1", "PARVEKE2", "BALKONG", "BALK", "VIHERHUONE"],
     # common non-target labels (kept so they are recognised as "room label, not ours")
-    "other": ["OH", "OLOH", "ET", "TK", "VH", "VAR", "VARASTO", "KHH", "AK", "TUPA", "RT", "RUOK", "H", "TEKN",
+    "other": ["ET", "TK", "VH", "VAR", "VARASTO", "KHH", "AK", "TUPA", "RT", "RUOK", "H", "TEKN",
               "TERASSI", "ULKOVAR", "AUTOK", "KATOS", "PORRAS", "KELLARI", "AULA", "TYÖH", "KIRJASTO", "ALK",
               "LVV", "VAATEH", "KUIVAUSH", "PYYKKIH", "SIIVK", "ULKOTILA", "PIHA", "VAR.", "ARKIH", "EHH", "RK"],
 }

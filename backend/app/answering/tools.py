@@ -29,7 +29,7 @@ TEMPLATE_DEFS = {
 assert set(TEMPLATE_DEFS) == set(TEMPLATES)
 
 CATEGORIES = ["room", "door", "window", "fixture", "floor"]
-ROOM_TYPES = ["bedroom", "bathroom", "wc", "sauna", "kitchen", "balcony", "other"]
+ROOM_TYPES = ["bedroom", "bathroom", "wc", "sauna", "kitchen", "living", "balcony", "entry", "storage", "garage", "other"]
 FIXTURE_TYPES = ["toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench", "other"]
 MAX_LIST = 50
 

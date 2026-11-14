@@ -30,7 +30,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | ME
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 8
-PROMPT_VERSION = "11"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "12"  # bump when prompt or tools change, so cached answers are not reused
 
 SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools and explicitly supplied user
 calibration are your only sources of facts about the plan; you cannot see the drawing.

@@ -21,7 +21,7 @@ ROOM = {"background": 0, "outdoor": 1, "wall": 2, "kitchen": 3, "living": 4, "be
         "entry": 7, "railing": 8, "storage": 9, "garage": 10, "undefined": 11}
 ICON_PROB = (1, 2, 5, 6, 7, 9)  # same order as features.ICON_PROB_CLASSES
 VARIANTS = ["colorful", "high_quality", "high_quality_architectural"]
-OCR_TYPES = ["bedroom", "bathroom", "wc", "sauna", "kitchen", "balcony", "other"]
+OCR_TYPES = ["bedroom", "bathroom", "wc", "sauna", "kitchen", "living", "balcony", "other"]
 
 
 def load(rel: str):
