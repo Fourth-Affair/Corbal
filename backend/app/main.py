@@ -113,19 +113,17 @@ def _saved_graph(plan_id: UUID) -> PlanGraph | None:
     try:
         graph = PlanGraph.model_validate(rows[0]["graph"])
         if graph.source == "model":
-            from app.cubicasa.detect import floor_outline_candidates, room_outline_candidates
+            from app.cubicasa.detect import floor_outline_candidates
 
             current_candidates = floor_outline_candidates(graph.image)
-            current_rooms = room_outline_candidates(graph.image)
             changed = (
                 (current_candidates and [item.model_dump(mode="json") for item in current_candidates] !=
                  [item.model_dump(mode="json") for item in graph.floor_outlines])
-                or (current_rooms and [item.model_dump(mode="json") for item in current_rooms] !=
-                    [item.model_dump(mode="json") for item in graph.room_outlines])
+                or bool(graph.room_outlines)
             )
             if changed:
                 graph.floor_outlines = current_candidates
-                graph.room_outlines = current_rooms
+                graph.room_outlines = []
                 graph.items = [item for item in graph.items if item.category != "floor"] + [
                     PlanItem(id=outline.id, category="floor", bbox=(min(x for x, _ in outline.polygon),
                         min(y for _, y in outline.polygon), max(x for x, _ in outline.polygon),
@@ -351,7 +349,9 @@ def get_plan_outline(plan_id: UUID) -> dict:
     graph = _saved_graph(plan_id)
     if graph is None:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
-    candidates = graph.floor_outlines + graph.room_outlines
+    # Room boundaries come from PlanGeometry everywhere in the product. This endpoint
+    # only serves the independent whole-floor outline suggestions.
+    candidates = graph.floor_outlines
     return {"candidates": [outline.model_dump(mode="json") for outline in candidates],
             "saved": _outline_request(plan_id)}
 
@@ -634,9 +634,10 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
                       ("hallway", "entry"), ("wc", "wc"), ("toilet room", "wc"))
         requested_room = next((room_type for term, room_type in room_terms if term in question), None)
         if requested_room:
+            geometry = _plan_geometry(plan_id, graph)
+            room_candidates = [room for room in geometry.rooms if room.type == requested_room]
             outlines = [outline for outline in req.floor_outlines if outline.scope == "room" and outline.room_type == requested_room and outline.decision != "rejected"]
-            suggested_ids = {outline.id for outline in graph.room_outlines
-                             if outline.scope == "room" and outline.room_type == requested_room}
+            suggested_ids = {room.id for room in room_candidates}
             reviewed_ids = {outline.id for outline in req.floor_outlines
                             if outline.scope == "room" and outline.room_type == requested_room
                             and outline.decision in ("accepted", "rejected")}

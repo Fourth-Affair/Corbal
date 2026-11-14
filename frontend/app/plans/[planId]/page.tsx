@@ -15,6 +15,7 @@ type PlanCitation = {
   bbox: [number, number, number, number];
   polygon?: Array<[number, number]> | null;
   raw?: string | null;
+  score?: number | null;
   user_verified?: boolean;
 };
 type EvidenceItem = PlanCitation & { category: string; cls: string; text?: string | null; score?: number | null; raw?: string | null; user_verified?: boolean };
@@ -90,6 +91,12 @@ function itemLabel(item: Pick<EvidenceItem, "category" | "cls" | "text">) {
   const type = item.cls?.replaceAll("_", " ").trim();
   if (item.category === "room") return type || item.text || "Room";
   return type || item.category;
+}
+
+function evidenceLabel(item: EvidenceItem, items: EvidenceItem[]) {
+  const base = itemLabel(item);
+  const peers = items.filter(candidate => itemLabel(candidate) === base);
+  return peers.length > 1 ? `${base}-${peers.indexOf(item) + 1}` : base;
 }
 
 function outlineBounds(outline: FloorOutline): EvidenceItem["bbox"] {
@@ -179,7 +186,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
   const [geometry, setGeometry] = useState<PlanGeometry | null>(null);
   const [geometryError, setGeometryError] = useState<string | null>(null);
-  const [showRooms, setShowRooms] = useState(true);
+  const [showRooms, setShowRooms] = useState(false);
   const [showUncertain, setShowUncertain] = useState(false);
   const [showWalls, setShowWalls] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -195,7 +202,20 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/geometry`, { cache: "no-store" });
         const body = await response.json();
         if (!response.ok) throw new Error(body.detail || "Rooms could not be loaded");
-        if (!cancelled) { setGeometry(body); setGeometryError(null); }
+        if (!cancelled) {
+          setGeometry(body);
+          setGeometryError(null);
+          const roomOutlines: FloorOutline[] = (body.rooms ?? []).map((room: RoomShape) => ({
+            id: room.id, polygon: room.polygon, scope: "room", room_type: room.type,
+            label: room.name || room.type.replaceAll("_", " "),
+          }));
+          const currentRoomIds = new Set(roomOutlines.map(outline => outline.id));
+          setSavedOutlines(current => current.filter(outline => outline.scope !== "room" || currentRoomIds.has(outline.id) || outline.id.endsWith("-user")));
+          roomBoundaryLinkRef.current = roomBoundaryLinks(evidenceItemsRef.current, roomOutlines);
+          const linkedItems = linkRoomBoundaries(evidenceItemsRef.current, roomOutlines);
+          evidenceItemsRef.current = linkedItems;
+          setEvidenceItems(linkedItems);
+        }
       } catch (geometryLoadError) {
         if (!cancelled) setGeometryError(geometryLoadError instanceof Error ? geometryLoadError.message : "Rooms could not be loaded");
       }
@@ -402,8 +422,14 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   }
 
   function getAllRoomOutlines() {
-    const byId = new Map([...floorOutlines, ...savedOutlines].filter(outline => outline.scope === "room").map(outline => [outline.id, outline]));
-    for (const outline of savedOutlines.filter(item => item.scope === "room")) byId.set(outline.id, outline);
+    const backendRooms: FloorOutline[] = (geometry?.rooms ?? []).map(room => ({
+      id: room.id, polygon: room.polygon, scope: "room", room_type: room.type,
+      label: room.name || room.type.replaceAll("_", " "),
+    }));
+    const currentRoomIds = new Set(backendRooms.map(outline => outline.id));
+    const relevantSavedRooms = savedOutlines.filter(outline => outline.scope === "room" && (currentRoomIds.has(outline.id) || outline.id.endsWith("-user")));
+    const byId = new Map([...backendRooms, ...relevantSavedRooms].map(outline => [outline.id, outline]));
+    for (const outline of relevantSavedRooms) byId.set(outline.id, outline);
     return [...byId.values()];
   }
 
@@ -418,7 +444,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     try {
       const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/ask`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale, floor_outlines: savedOutlines }),
+        body: JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale,
+          floor_outlines: savedOutlines.filter(outline => outline.scope !== "room" || geometry?.rooms.some(room => room.id === outline.id) || outline.id.endsWith("-user")) }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
@@ -516,7 +543,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   function getReviewOutlines(questionText?: string) {
     const targetRoom = questionText ? getRequestedRoomType(questionText) : null;
     const eligible = targetRoom
-      ? floorOutlines.filter(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
+      ? getAllRoomOutlines().filter(outline => outline.room_type === targetRoom.roomType)
       : floorOutlines.filter(outline => outline.scope !== "room");
     const byId = new Map(eligible.map(outline => [outline.id, outline]));
     for (const outline of savedOutlines) {
@@ -530,14 +557,18 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   function startOutlineReview(questionText?: string, outlineId?: string) {
     const targetRoom = questionText ? getRequestedRoomType(questionText) : null;
     const candidates = getReviewOutlines(questionText);
-    const requestedOutlineIndex = outlineId ? floorOutlines.findIndex(outline => outline.id === outlineId) :
+    const roomCandidates = targetRoom ? getAllRoomOutlines() : [];
+    const requestedOutlineIndex = outlineId ? candidates.findIndex(outline => outline.id === outlineId) :
       targetRoom
-        ? floorOutlines.findIndex(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
+        ? roomCandidates.findIndex(outline => outline.room_type === targetRoom.roomType)
         : floorOutlines.findIndex(outline => outline.scope !== "room");
     const index = requestedOutlineIndex >= 0 ? requestedOutlineIndex : Math.max(0, outlineCandidateIndex);
     const savedTarget = outlineId ? savedOutlines.find(outline => outline.id === outlineId) :
       candidates.find(outline => outline.decision !== "rejected") ?? null;
-    const suggestion = outlineId ? floorOutlines.find(outline => outline.id === outlineId) : requestedOutlineIndex >= 0 ? floorOutlines[index] : null;
+    const candidatesForScope = targetRoom ? roomCandidates : floorOutlines;
+    const suggestion = outlineId
+      ? [...getAllRoomOutlines(), ...floorOutlines].find(outline => outline.id === outlineId)
+      : requestedOutlineIndex >= 0 ? candidatesForScope[index] : null;
     const manualTarget = savedTarget ?? suggestion ?? (targetRoom
       ? { id: `room-${targetRoom.roomType}-user`, polygon: [], scope: "room" as const, room_type: targetRoom.roomType, label: targetRoom.label }
       : savedOutlines[0] ?? floorOutlines[index] ?? { id: "floor-user", polygon: [], scope: "floor" as const, label: "Whole floor" });
@@ -852,47 +883,64 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   {selectedEvidenceId === item.id && <rect className="correction-resize-handle" x={x1 - 9} y={y1 - 9} width="18" height="18" rx="3" onPointerDown={event => beginEvidenceDrag(event, item, "resize")} onClick={event => event.stopPropagation()} aria-label="Resize selected box" />}
                 </g>;
               })}
-              {geometry && showRooms && <g className="room-layer">
-                {geometry.rooms.filter(room => room.tier === "strong" || showUncertain).map(room => {
+              {geometry && (outlineMode
+                ? manualOutlineTarget?.scope === "room"
+                : showRooms || pendingAreaQuestion !== null) && !correctionMode && <g className="room-layer">
+                {geometry.rooms.filter(room => outlineMode && manualOutlineTarget?.scope === "room"
+                  ? room.id === editingOutlineId
+                  : pendingAreaQuestion
+                    ? room.type === getRequestedRoomType(pendingAreaQuestion)?.roomType
+                    : room.tier === "strong" || showUncertain).map(room => {
                   const colour = room.tier === "unknown" ? "#7a8a80" : (ROOM_COLOURS[room.type] ?? "#7a8a80");
                   const [x0, y0, x1, y1] = room.bbox;
                   const fontSize = Math.max(11, Math.min(imageSize.width, imageSize.height) / 45);
                   const caption = room.tier === "strong" ? roomCaption(room) : room.tier === "weak" ? `${room.type}?` : "?";
                   const tooltip = room.tier === "unknown" ? "Space with unknown purpose" : `${room.tier === "weak" ? "Probably " : ""}${room.name ?? room.type}: ${roomCaption(room)} (${roomWhy(room)})`;
+                  const editingRoom = outlineMode && room.id === editingOutlineId;
+                  const savedBoundary = savedOutlines.find(outline => outline.id === room.id);
+                  const polygon = editingRoom ? outlinePoints : savedBoundary?.polygon ?? room.polygon;
                   return <g key={room.id} className={`room-shape ${room.tier}`}>
-                    <polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.tier === "unknown" ? "none" : colour }}>
+                    <polygon points={polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.tier === "unknown" ? "none" : colour }}>
                       <title>{tooltip}</title>
                     </polygon>
                     <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{caption}</text>
+                    {editingRoom && outlinePoints.map(([x, y], pointIndex) => <g className="room-boundary-handle" key={`corner-${pointIndex}`} transform={`translate(${x} ${y})`} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(pointIndex); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} aria-label={`Move corner ${pointIndex + 1}`}><circle className="handle-outer" r="12"/><circle className="handle-center" r="3"/></g>)}
+                    {editingRoom && outlinePoints.map(([x, y], pointIndex) => {
+                      const [nextX, nextY] = outlinePoints[(pointIndex + 1) % outlinePoints.length];
+                      const insertAt = pointIndex + 1;
+                      return <g className="room-boundary-handle midpoint" key={`midpoint-${pointIndex}`} transform={`translate(${(x + nextX) / 2} ${(y + nextY) / 2})`} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setOutlinePoints(current => [...current.slice(0, insertAt), [(x + nextX) / 2, (y + nextY) / 2], ...current.slice(insertAt)]); setDraggingOutlinePoint(insertAt); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} aria-label={`Add and move boundary point ${insertAt}`}><circle className="handle-outer" r="8"/><circle className="handle-center" r="2"/></g>;
+                    })}
                   </g>;
                 })}
               </g>}
-              {geometry && showWalls && <g className="wall-layer">
+              {geometry && showWalls && !outlineMode && <g className="wall-layer">
                 {geometry.wall_segments.map(segment => <line key={segment.id} className={segment.exterior ? "exterior" : "interior"} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]}>
                   <title>{`${segment.exterior ? "Exterior" : "Interior"} wall · ${segment.length_m != null ? `${segment.length_m.toFixed(2)} m long, ${((segment.thickness_m ?? 0) * 100).toFixed(0)} cm thick` : `${Math.round(segment.length_px)} px long, ${Math.round(segment.thickness_px)} px thick`}`}</title>
                 </line>)}
               </g>}
-              {citations.map((item, index) => {
+              {!outlineMode && citations.map((item, index) => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 const fullItem = evidenceItems.find(candidate => candidate.id === item.id);
-                const label = fullItem ? itemLabel(fullItem) : item.raw?.replaceAll("_", " ") || "Evidence";
-                const labelWidth = Math.max(62, Math.min(190, label.length * 10 + 22));
+                const label = fullItem ? evidenceLabel(fullItem, evidenceItems) : item.raw?.replaceAll("_", " ") || "Evidence";
+                const confidence = fullItem?.user_verified || item.user_verified ? "reviewed" : item.score != null ? `${Math.round(item.score * 100)}%` : null;
+                const visibleLabel = confidence ? `${label} · ${confidence}` : label;
+                const labelWidth = Math.max(62, Math.min(220, visibleLabel.length * 8 + 22));
                 const labelX = Math.max(labelWidth / 2 + 3, Math.min(imageSize?.width ?? x0, (x0 + x1) / 2));
                 const labelY = Math.max(18, Math.min(imageSize?.height ?? y0, (y0 + y1) / 2));
                 return <g className={`citation-mark${item.user_verified ? " user-corrected" : ""}`} key={`${item.id}-${index}`}>
                   {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(1, x1 - x0)} height={Math.max(1, y1 - y0)} />}
                   <g className="citation-label" aria-label={label}>
                     <rect x={labelX - labelWidth / 2} y={labelY - 15} width={labelWidth} height="30" rx="8" />
-                    <text x={labelX} y={labelY + 1}>{label.length > 22 ? `${label.slice(0, 20)}…` : label}</text>
-                    <title>{`${label}${index + 1 ? ` · citation ${index + 1}` : ""}`}</title>
+                    <text x={labelX} y={labelY + 1}>{visibleLabel.length > 28 ? `${visibleLabel.slice(0, 26)}…` : visibleLabel}</text>
+                    <title>{visibleLabel}</title>
                   </g>
                 </g>;
               })}
               {scaleMode && scalePoints.length > 0 && <g className="scale-mark"><line x1={scalePoints[0][0]} y1={scalePoints[0][1]} x2={(scalePoints[1] ?? scalePoints[0])[0]} y2={(scalePoints[1] ?? scalePoints[0])[1]} />{scalePoints.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measurePoints.length > 0 && <g className="scale-mark measurement-mark"><line x1={measurePoints[0][0]} y1={measurePoints[0][1]} x2={(measurePoints[1] ?? measurePoints[0])[0]} y2={(measurePoints[1] ?? measurePoints[0])[1]} />{measurePoints.map(([x, y], index) => <g className="measurement-handle" key={index} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingMeasurePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingMeasurePoint(null); }} onClick={event => event.stopPropagation()}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measuredDistance !== null && measurePoints.length === 2 && <g className="measurement-label" pointerEvents="none"><rect x={(measurePoints[0][0] + measurePoints[1][0]) / 2 - Math.max(52, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 7)} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 - 15} width={Math.max(104, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 14)} height="30" rx="7"/><text x={(measurePoints[0][0] + measurePoints[1][0]) / 2} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 + 5}>{measuredDistance.toFixed(2)} {scale?.unit}</text></g>}
-              {displayOutlines.map((outline, index) => {
+              {displayOutlines.filter(outline => outlineMode ? outline.id === editingOutlineId : outline.scope !== "room").map((outline, index) => {
                 const editing = outlineMode && outline.id === editingOutlineId;
                 const polygon = editing ? outlinePoints : outline.polygon;
                 if (polygon.length < 3) return null;
@@ -906,8 +954,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   {editing && outlinePoints.map(([x, y], pointIndex) => <circle key={pointIndex} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(pointIndex); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}
                 </g>;
               })}
-              {outlineMode && outlinePoints.length >= 3 && !displayOutlines.some(outline => outline.id === editingOutlineId) && <g className="floor-outline-mark editing"><polygon points={outlinePoints.map(([x, y]) => `${x},${y}`).join(" ")} />{outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
-            </svg>}{(scaleMode || measureMode || outlineMode) && <div className="scale-hint">{outlineMode ? (addOutlinePointMode ? "Click the plan to add a boundary point" : "Drag boundary points to edit the suggested outline") : scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
+              {outlineMode && manualOutlineTarget?.scope !== "room" && outlinePoints.length >= 3 && !displayOutlines.some(outline => outline.id === editingOutlineId) && <g className="floor-outline-mark editing"><polygon points={outlinePoints.map(([x, y]) => `${x},${y}`).join(" ")} />{outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
+            </svg>}{(scaleMode || measureMode) && <div className="scale-hint">{scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
@@ -927,12 +975,12 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             <div className="room-review-footer">{scale ? `${reviewedAccepted.length} accepted · ${reviewedAcceptedArea.toFixed(1)} m² total` : "Set a drawing scale to show room areas"}{getReviewOutlines(pendingAreaQuestion).length === 0 && <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion)}>Draw room outline</button>}</div>
             {outlineError && <p role="alert">{outlineError}</p>}
           </section>}
-          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag the painted points or add/remove points, then save this room’s boundary.</span></div><div className="outline-actions"><button className="toolbar-button" type="button" onClick={() => setAddOutlinePointMode(true)}>{addOutlinePointMode ? "Click plan to add point" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{scale && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
+          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag the large corner handles to reshape the boundary. Drag a smaller midpoint handle to add a corner.</span></div><div className="outline-actions"><button className="toolbar-button" type="button" onClick={() => setAddOutlinePointMode(true)}>{addOutlinePointMode ? "Click plan to add point" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{scale && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
           {!pendingAreaQuestion && !outlineMode && savedOutlines.length > 0 && <div className="area-summary"><strong>Accepted outline areas</strong><span>{acceptedArea > 0 ? `Estimated total ${acceptedArea.toFixed(1)} m²` : "Set a drawing scale to calculate area"}</span><button className="toolbar-button" type="button" onClick={removeSavedOutline} disabled={outlineRemoving}>{outlineRemoving ? "Removing…" : "Remove outlines"}</button>{outlineError && <p role="alert">{outlineError}</p>}</div>}
           {correctionMode && <section className="correction-panel" aria-label="Review detected plan items">
             <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"} · used in this plan’s answers` : "Select a box, drag it to move, or drag its corner handle to resize it."}</span></div>
             {getAllRoomOutlines().length > 0 && <div className="correction-editor"><strong>Backend room boundaries</strong><span>These are the model’s suggested room shapes. Adjust a boundary to use your edit for both room answers and area estimates.</span>{getAllRoomOutlines().map((outline, index) => <div className="room-boundary-row" key={outline.id}><span>{outline.label || `Room ${index + 1}`}</span><button className="toolbar-button" type="button" onClick={() => startOutlineReview(undefined, outline.id)}>Adjust boundary</button></div>)}</div>}
-            <div className="correction-list">{evidenceItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{itemLabel(item)}</span><small>{item.text ? `${item.category} · label “${item.text}”` : item.category}{item.user_verified ? " · corrected" : item.score != null ? ` · ${Math.round(item.score * 100)}% confidence` : ""}</small></button>)}</div>
+            <div className="correction-list">{evidenceItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{evidenceLabel(item, evidenceItems)}</span><small>{item.text ? `${item.category} · label “${item.text}”` : item.category}{item.user_verified ? " · reviewed by you" : item.score != null ? ` · ${Math.round(item.score * 100)}% confidence` : ""}</small></button>)}</div>
             {selectedEvidence && <div className="correction-editor"><strong>Correct selected item</strong><span>Drag the box to move it, or drag its lower-right handle to resize it. If this says “toilet” but is actually a kitchen, choose room and kitchen. Save to keep the geometry and label correction with this plan.</span><label>Kind<select value={editCategory} onChange={event => { const category = event.target.value; setEditCategory(category); setEditClass(itemTypes[category][0]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Room or object type<select value={editClass} onChange={event => setEditClass(event.target.value)}>{(itemTypes[editCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><div className="correction-actions"><button className="toolbar-button primary-button" type="button" disabled={correctionSaving || (selectedEvidence.category === editCategory && selectedEvidence.cls === editClass)} onClick={() => void saveCorrection("update", selectedEvidence.id, { ...selectedEvidence, category: editCategory, cls: editClass })}>{correctionSaving ? "Saving…" : "Save correction"}</button><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => void saveCorrection("delete", selectedEvidence.id)}>Remove detection</button></div></div>}
             <div className="correction-editor"><strong>Add a missed item</strong><label>Kind<select value={addCategory} onChange={event => { const category = event.target.value; setAddCategory(category); setAddClass(itemTypes[category]?.[0] ?? "other"); setCorrectionAddPoints([]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Type<select value={addClass} onChange={event => setAddClass(event.target.value)}>{(itemTypes[addCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => { setCorrectionAddPoints([]); setCorrectionAddMode(true); }}>{correctionAddMode ? addCategory === "room" ? correctionAddPoints.length === 0 ? "Click first room corner" : "Click opposite room corner" : "Click its location on the plan" : addCategory === "room" ? "Mark missing room" : "Place missing item"}</button></div>
             {correctionError && <p className="correction-error" role="alert">{correctionError}</p>}

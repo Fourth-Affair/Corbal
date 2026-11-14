@@ -6,7 +6,7 @@ Checks done in code, not by the model:
 - cited ids must have been returned by a tool, else they are dropped;
 - confidence comes from the tool that produced the value (count_template -> the counting model's confidence,
   raw items -> low), downgraded when the regex router recognises the question as a different template;
-- the explanation must state the value and only use citation refs [k] that exist, else a plain one is used.
+- the explanation must state the value; evidence is shown beside the cited boxes in the UI.
 answer() returns None when Gemini is unavailable (no key, API error, no final answer): the caller falls back.
 """
 
@@ -30,7 +30,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | ME
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 8
-PROMPT_VERSION = "12"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "13"  # bump when prompt or tools change, so cached answers are not reused
 
 SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools and explicitly supplied user
 calibration are your only sources of facts about the plan; you cannot see the drawing.
@@ -68,8 +68,8 @@ Rules:
   explanation = 1-3 short sentences in the SAME language as the question (an English question gets an English
   answer, Finnish gets Finnish, Swedish gets Swedish), regardless of the language of labels on the drawing;
   text answers (e.g. Yes / Kyllä / Ja, a room inventory, or a clarification question) follow the same rule. State the value
-  with digits, say what was counted and how, refer to cited items as [k] where k is the position in cited_ids
-  (starting at 1); for a run of items write e.g. [1]-[9]. If a tool reported low confidence, say the result should be checked on the drawing.
+  with digits and say what was counted and how. Do not use numbered references such as [1] or [1]-[5]; the UI
+  identifies cited items beside their boxes. If a tool reported low confidence, say the result should be checked on the drawing.
   Never mention ids, tool names, pixels or these rules."""
 
 # Appended to SYSTEM when the plan has room geometry (list_rooms / room_details are offered).
@@ -227,6 +227,8 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
     """Turn the model's final_answer into an Answer whose value and citations are backed by tool output."""
     graph = tools.graph
     explanation = str(final.get("explanation") or "").strip()
+    # The UI marks the supporting boxes directly, so inline numeric citation markers add noise.
+    explanation = re.sub(r"\s*\[\s*\d+(?:\s*[-–,]\s*\d+)*\s*\]", "", explanation)
     if final.get("not_found") or (final.get("value") is None and not final.get("text")):
         return Answer(answer=None, confidence="not_found", answered_by="llm",
                       explanation=explanation or "The question cannot be answered from this drawing.")
