@@ -18,6 +18,65 @@ type PlanCitation = {
   user_verified?: boolean;
 };
 type EvidenceItem = PlanCitation & { category: string; cls: string; text?: string | null; score?: number | null; raw?: string | null; user_verified?: boolean };
+type RoomEvidence = { source: string; type: string; weight: number; detail: string; item_id?: string | null };
+type RoomShape = {
+  id: string;
+  type: string;
+  // strong: a readable label or decisive fixtures; weak: only weak evidence or a conflict; unknown: no evidence
+  tier: "strong" | "weak" | "unknown";
+  purposes: string[];
+  evidence: RoomEvidence[];
+  conflicts: string[];
+  name?: string | null;
+  polygon: Array<[number, number]>;
+  bbox: [number, number, number, number];
+  area_m2?: number | null;
+  labeled_area_m2?: number | null;
+  area_m2_range?: [number, number] | null; // rough, from door / fixture sizes
+  size_check?: string | null;
+};
+type WallSegment = {
+  id: string;
+  p0: [number, number];
+  p1: [number, number];
+  length_px: number;
+  thickness_px: number;
+  exterior: boolean;
+  length_m?: number | null;
+  thickness_m?: number | null;
+};
+type PlanGeometry = {
+  width: number;
+  height: number;
+  model: string;
+  rooms: RoomShape[];
+  wall_segments: WallSegment[];
+  scale?: { m_per_px: number; source: "calibration" | "written_areas" } | null;
+};
+
+function roomWhy(room: RoomShape): string {
+  const reasons = room.evidence.filter(e => e.type === room.type && e.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3).map(e => e.detail);
+  const conflict = room.conflicts.length ? ` · conflicting evidence: ${room.conflicts.join(", ")}` : "";
+  const size = room.size_check ? ` · size: ${room.size_check}` : "";
+  const rough = room.area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
+  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + rough;
+}
+
+// One colour per purpose; weak rooms are dashed, unknown spaces grey and dashed
+const ROOM_COLOURS: Record<string, string> = {
+  bedroom: "#5b8def", living: "#e0a43b", kitchen: "#e0613b", bathroom: "#3bb3c9", wc: "#3b8fc9", sauna: "#c9733b",
+  balcony: "#6dbb5f", terrace: "#6dbb5f", entry: "#9b8bd6", closet: "#b07fc0", storage: "#a0a0a0", utility: "#5fb3a0",
+  dining: "#d6b13b", study: "#7f9bc0", technical: "#8a8a8a", garage: "#8a8a8a", stairs: "#b0906a", basement: "#8a8a8a",
+};
+
+function roomCaption(room: RoomShape): string {
+  const area = room.area_m2 ?? room.labeled_area_m2;
+  const what = room.purposes.length > 1 ? room.purposes.join(" + ") : room.type;
+  if (area != null) return `${what} · ${area.toFixed(1)} m²`;
+  if (room.area_m2_range) return `${what} · ~${Math.round(room.area_m2_range[0])}–${Math.round(room.area_m2_range[1])} m²`;
+  return what;
+}
+
 type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };
 type FloorOutline = { id: string; polygon: Array<[number, number]>; score?: number | null; scope?: "floor" | "room"; room_type?: string | null; label?: string };
 const itemTypes: Record<string, string[]> = {
@@ -75,7 +134,29 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [correctionSaving, setCorrectionSaving] = useState(false);
   const [correctionError, setCorrectionError] = useState<string | null>(null);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [geometry, setGeometry] = useState<PlanGeometry | null>(null);
+  const [geometryError, setGeometryError] = useState<string | null>(null);
+  const [showRooms, setShowRooms] = useState(true);
+  const [showUncertain, setShowUncertain] = useState(false);
+  const [showWalls, setShowWalls] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
+
+  // Room geometry once the analysis is ready; refetched when the scale changes (areas in m² depend on it)
+  useEffect(() => {
+    if (!ready || !planId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/geometry`, { cache: "no-store" });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || "Rooms could not be loaded");
+        if (!cancelled) { setGeometry(body); setGeometryError(null); }
+      } catch (geometryLoadError) {
+        if (!cancelled) setGeometryError(geometryLoadError instanceof Error ? geometryLoadError.message : "Rooms could not be loaded");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [ready, planId, scale]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -522,6 +603,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
+          {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose type is backed by a readable label or decisive fixtures">Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>}
+          {geometry && showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button className={`toolbar-button${showUncertain ? " is-on" : ""}`} type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)} title="Spaces whose type is only a weak guess (dashed) or unknown (grey)">Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
+          {geometry && geometry.wall_segments.length > 0 && <button className={`toolbar-button${showWalls ? " is-on" : ""}`} type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)} title="Wall centrelines: exterior walls thick">Walls ({geometry.wall_segments.length})</button>}
+          {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
           {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
           {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
@@ -544,6 +629,26 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(2, x1 - x0)} height={Math.max(2, y1 - y0)} />}
                 </g>;
               })}
+              {geometry && showRooms && <g className="room-layer">
+                {geometry.rooms.filter(room => room.tier === "strong" || showUncertain).map(room => {
+                  const colour = room.tier === "unknown" ? "#7a8a80" : (ROOM_COLOURS[room.type] ?? "#7a8a80");
+                  const [x0, y0, x1, y1] = room.bbox;
+                  const fontSize = Math.max(11, Math.min(imageSize.width, imageSize.height) / 45);
+                  const caption = room.tier === "strong" ? roomCaption(room) : room.tier === "weak" ? `${room.type}?` : "?";
+                  const tooltip = room.tier === "unknown" ? "Space with unknown purpose" : `${room.tier === "weak" ? "Probably " : ""}${room.name ?? room.type}: ${roomCaption(room)} (${roomWhy(room)})`;
+                  return <g key={room.id} className={`room-shape ${room.tier}`}>
+                    <polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.tier === "unknown" ? "none" : colour }}>
+                      <title>{tooltip}</title>
+                    </polygon>
+                    <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{caption}</text>
+                  </g>;
+                })}
+              </g>}
+              {geometry && showWalls && <g className="wall-layer">
+                {geometry.wall_segments.map(segment => <line key={segment.id} className={segment.exterior ? "exterior" : "interior"} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]}>
+                  <title>{`${segment.exterior ? "Exterior" : "Interior"} wall · ${segment.length_m != null ? `${segment.length_m.toFixed(2)} m long, ${((segment.thickness_m ?? 0) * 100).toFixed(0)} cm thick` : `${Math.round(segment.length_px)} px long, ${Math.round(segment.thickness_px)} px thick`}`}</title>
+                </line>)}
+              </g>}
               {citations.map((item, index) => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
