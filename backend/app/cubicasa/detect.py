@@ -102,8 +102,7 @@ def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list
         if size < 0.03 * H * W:
             continue
         ys, xs = bounds
-        # pad by 1 px: the crop is the region's bounding box, and find_contours cannot close a boundary that lies on
-        # the array edge (a rectangular region would get no contour at all)
+        # Padding closes contours when the component touches its cropped bounding-box edge.
         region = np.pad((labels[ys, xs] == label).astype(np.uint8), 1)
         contours = find_contours(region, 0.5)
         polygons = []
@@ -130,7 +129,55 @@ def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list
             id=f"floor-{label - 1}",
             polygon=[(round(x, 2), round(y, 2)) for x, y in coords],
             score=round(float(score), 3),
+            scope="floor",
+            label="Whole floor",
         ))
+    return outlines
+
+
+def _room_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list[PlanOutline]:
+    """Create separate editable room contours from the semantic room-class maps."""
+    H, W = rooms.shape
+    labels = {"outdoor": (ROOM["outdoor"], "balcony", "Balcony"),
+              "kitchen": (ROOM["kitchen"], "kitchen", "Kitchen"),
+              "living": (ROOM["living"], "living", "Living room"),
+              "bedroom": (ROOM["bedroom"], "bedroom", "Bedroom"),
+              "bath": (ROOM["bath"], "bathroom", "Bathroom"),
+              "entry": (ROOM["entry"], "entry", "Entry"),
+              "storage": (ROOM["storage"], "storage", "Storage"),
+              "garage": (ROOM["garage"], "garage", "Garage")}
+    outlines: list[PlanOutline] = []
+    for class_name, (class_id, room_type, label_text) in labels.items():
+        mask = ndimage.binary_opening(rooms == class_id, iterations=2)
+        components_map, sizes, confidences, boxes = components(mask, confidence)
+        for component_id, (size, score, bounds) in enumerate(zip(sizes, confidences, boxes), 1):
+            if size < 0.002 * H * W:
+                continue
+            ys, xs = bounds
+            region = np.pad((components_map[ys, xs] == component_id).astype(np.uint8), 1)
+            contours = find_contours(region, 0.5)
+            polygons = [Polygon([(float(x + xs.start - 1), float(y + ys.start - 1)) for y, x in contour])
+                        for contour in contours]
+            polygons = [polygon for polygon in polygons if polygon.is_valid and polygon.area > 0]
+            if not polygons:
+                continue
+            polygon = max(polygons, key=lambda candidate: candidate.area).simplify(max(H, W) * 0.0015, preserve_topology=True)
+            if not polygon.is_valid or len(polygon.exterior.coords) < 4:
+                continue
+            coords = list(polygon.exterior.coords)[:-1]
+            if len(coords) > 500:
+                stride = (len(coords) + 498) // 499
+                coords = coords[::stride]
+            if len(coords) < 3:
+                continue
+            outlines.append(PlanOutline(
+                id=f"room-{room_type}-{component_id - 1}",
+                polygon=[(round(x, 2), round(y, 2)) for x, y in coords],
+                score=round(float(score), 3),
+                scope="room",
+                room_type=room_type,
+                label=label_text,
+            ))
     return outlines
 
 
@@ -141,6 +188,14 @@ def floor_outline_candidates(rel: str) -> list[PlanOutline]:
         return []
     with np.load(npz) as z:
         return _floor_outline_candidates(z["rooms"], z["rooms_conf"])
+
+
+def room_outline_candidates(rel: str) -> list[PlanOutline]:
+    npz, _ = feature_paths(rel)
+    if not npz.is_file():
+        return []
+    with np.load(npz) as z:
+        return _room_outline_candidates(z["rooms"], z["rooms_conf"])
 
 
 def graph_from_image(rel: str, path) -> PlanGraph:
@@ -158,6 +213,7 @@ def graph_from_image(rel: str, path) -> PlanGraph:
         counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
     with np.load(feature_paths(rel)[0]) as z:
         floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
+        room_outlines = _room_outline_candidates(z["rooms"], z["rooms_conf"])
     floor_items = []
     for outline in floor_outlines:
         xs, ys = zip(*outline.polygon)
@@ -170,4 +226,4 @@ def graph_from_image(rel: str, path) -> PlanGraph:
         ))
     items = _evidence(rel, dets) + floor_items
     return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
-                     counts=counts, floor_outlines=floor_outlines)
+                     counts=counts, floor_outlines=floor_outlines, room_outlines=room_outlines)

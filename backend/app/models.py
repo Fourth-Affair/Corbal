@@ -23,12 +23,16 @@ class PlanItem(BaseModel):
     score: float | None = None  # model confidence; None for ground-truth labels
     text: str | None = None  # label text on the drawing (OCR at runtime, NameLabel in SVG ground truth)
     raw: str | None = None  # source-format class, e.g. SVG "Space Bath Shower" (debugging / rule fitting)
+    user_verified: bool = False  # true when a person added or corrected this evidence
 
 
 class PlanOutline(BaseModel):
     id: str
     polygon: list[tuple[float, float]] = Field(min_length=3, max_length=500)
     score: float | None = None
+    scope: Literal["floor", "room"] = "floor"
+    room_type: str | None = None
+    label: str = "Floor"
 
 
 class PlanGraph(BaseModel):
@@ -40,6 +44,8 @@ class PlanGraph(BaseModel):
     # model source only: per-template counts from the fusion models (items are the supporting evidence)
     counts: dict[str, int] = Field(default_factory=dict)
     floor_outlines: list[PlanOutline] = Field(default_factory=list)
+    room_outlines: list[PlanOutline] = Field(default_factory=list)
+    user_correction_count: int = 0  # number of append-only human correction events applied to this copy
 
 
 class AskRequest(BaseModel):
@@ -57,10 +63,25 @@ class PlanOutlinesRequest(BaseModel):
     outlines: list[PlanOutline] = Field(min_length=1, max_length=20)
 
 
+class PlanCorrectionRequest(BaseModel):
+    action: Literal["add", "update", "delete"]
+    item_id: str | None = None
+    item: PlanItem | None = None
+
+
+class PlanFeedbackRequest(BaseModel):
+    question: str = Field(max_length=4000)
+    answer: str = Field(max_length=4000)
+    feedback: Literal["helpful", "incorrect", "unclear"]
+    reason: str | None = Field(default=None, max_length=500)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
 class PlanQuestionRequest(BaseModel):
     question: str
     history: list["ChatTurn"] = Field(default_factory=list, max_length=40)
     scale: PlanScaleCalibration | None = None
+    floor_outlines: list[PlanOutline] = Field(default_factory=list, max_length=20)
 
 
 class ChatTurn(BaseModel):

@@ -30,7 +30,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | ME
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 8
-PROMPT_VERSION = "10"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "11"  # bump when prompt or tools change, so cached answers are not reused
 
 SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools and explicitly supplied user
 calibration are your only sources of facts about the plan; you cannot see the drawing.
@@ -57,6 +57,8 @@ Rules:
 - Never fill gaps with a plausible-sounding guess. For real-world sizes or areas that the analysis cannot compute,
   objects or text not detected, or unsupported combinations, explain the specific limitation and say what information
   would make progress possible. Be direct about uncertainty; do not describe an estimate or weak detection as certain.
+- Some evidence may be marked as user-reviewed. Treat that as a correction supplied by the user, not as a model
+  detection; when it supports the answer, make clear that the result uses a user correction.
 - If a user calibration is supplied with the latest question, treat the drawing scale as known and never say it is
   missing. A scale can support measurements, but it does not by itself establish room boundaries or floor area.
 - Finish by calling final_answer exactly once:

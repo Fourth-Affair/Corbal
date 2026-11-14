@@ -61,8 +61,9 @@ def count(graph: PlanGraph, template: str) -> Answer:
         scores = [it.score for it in ev[:n] if it.score is not None]
         confidence = "medium" if len(ev) == n and (not scores or min(scores) >= 0.6) else "low"
         note = "" if len(ev) == n else f" ({len(ev)} candidate regions highlighted; count adjusted by the fusion model)"
+        reviewed_note = " Includes user-reviewed corrections." if graph.user_correction_count or any(it.user_verified for it in ev) else ""
         return Answer(answer=n, unit="count", template=template, confidence=confidence,
-                      explanation=f"Estimated {n} {COUNTERS.get(template, (None, template))[1]}{note}.",
+                      explanation=f"Estimated {n} {COUNTERS.get(template, (None, template))[1]}{note}.{reviewed_note}",
                       citations=ev)
 
     if template == "saunas":
@@ -77,11 +78,12 @@ def count(graph: PlanGraph, template: str) -> Answer:
         confidence = "low"
     else:
         confidence = "medium"
+    reviewed_note = " Includes user-reviewed corrections." if graph.user_correction_count or any(it.user_verified for it in hits) else ""
     return Answer(
         answer=len(hits),
         unit="count",
         template=template,
         confidence=confidence,
-        explanation=f"Found {len(hits)} {noun} ({graph.source} parse); each is highlighted.",
+        explanation=f"Found {len(hits)} {noun} ({graph.source} parse); each is highlighted.{reviewed_note}",
         citations=hits,
     )

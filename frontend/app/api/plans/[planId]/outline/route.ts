@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-async function proxy(request: Request, planId: string, method: "GET" | "PUT") {
+async function proxy(request: Request, planId: string, method: "GET" | "PUT" | "DELETE") {
   const backendUrl = process.env.BACKEND_URL || "http://localhost:8000";
   try {
     const response = await fetch(`${backendUrl}/api/plans/${encodeURIComponent(planId)}/outline`, {
@@ -20,4 +20,8 @@ export async function GET(request: Request, { params }: { params: Promise<{ plan
 
 export async function PUT(request: Request, { params }: { params: Promise<{ planId: string }> }) {
   return proxy(request, (await params).planId, "PUT");
+}
+
+export async function DELETE(request: Request, { params }: { params: Promise<{ planId: string }> }) {
+  return proxy(request, (await params).planId, "DELETE");
 }
