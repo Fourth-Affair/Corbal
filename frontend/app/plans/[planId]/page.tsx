@@ -21,10 +21,27 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     let cancelled = false;
     void params.then(async ({ planId: id }) => {
       setPlanId(id);
+      const uploadError = new URLSearchParams(window.location.search).get("uploadError");
+      if (uploadError) {
+        setError(uploadError);
+        return;
+      }
       try {
-        const planResponse = await fetch(`/api/plans/${encodeURIComponent(id)}`, { cache: "no-store" });
-        const record = await planResponse.json();
-        if (!planResponse.ok) throw new Error(record.detail || "Plan could not be loaded");
+        let record: PlanRecord | null = null;
+        for (let attempt = 0; attempt < 90; attempt++) {
+          const planResponse = await fetch(`/api/plans/${encodeURIComponent(id)}`, { cache: "no-store" });
+          if (planResponse.ok) {
+            record = await planResponse.json();
+            const status = record?.plan_images?.find(image => image.role === "source")?.upload_status;
+            if (status === "failed") throw new Error("The image upload failed. Go back and try again.");
+            if (status === "uploaded") break;
+          }
+          if (cancelled) return;
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        if (!record || record.plan_images?.find(image => image.role === "source")?.upload_status !== "uploaded") {
+          throw new Error("Upload is taking longer than expected. Please try again.");
+        }
         if (cancelled) return;
         setPlan(record);
         const imageResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/image`, { cache: "no-store" });
