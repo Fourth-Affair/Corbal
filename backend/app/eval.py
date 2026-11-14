@@ -19,7 +19,7 @@ from app.router import route
 
 def load_questions() -> list[dict]:
     out = []
-    with open(DATASET_DIR / "questions.jsonl") as f:
+    with open(DATASET_DIR / "questions.jsonl", encoding="utf-8") as f:
         for line in f:
             q = json.loads(line)
             if q["path"].startswith("data/cubicasa5k/"):
@@ -33,7 +33,7 @@ def _orig_split() -> dict[str, str]:
     for split in ("train", "val", "test"):
         f = CUBICASA_ORIG_DIR / f"{split}.txt"
         if f.is_file():
-            for line in f.read_text().split():
+            for line in f.read_text(encoding="utf-8").split():
                 parts = line.strip("/").split("/")
                 if len(parts) >= 2:
                     m[f"{parts[-2]}-{parts[-1]}"] = split

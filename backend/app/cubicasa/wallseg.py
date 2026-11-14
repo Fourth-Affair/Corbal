@@ -76,7 +76,7 @@ def prepare(holdout_files: list[Path], workers: int) -> None:
         raise SystemExit(f"official split files not found under {CUBICASA_ORIG_DIR}")
     held = set()
     for f in holdout_files:
-        held |= {Path(json.loads(line)["path"]).stem for line in f.read_text().splitlines()}
+        held |= {Path(json.loads(line)["path"]).stem for line in f.read_text(encoding="utf-8").splitlines()}
     from app.config import DATASET_DIR
 
     # label geometry is read against the challenge PNG (same pixels as F1_original.png)
@@ -263,7 +263,7 @@ def train(args) -> None:
     import torch.nn.functional as F
     from torch.utils.data import DataLoader
 
-    idx = json.loads((MASK_DIR / "index.json").read_text())
+    idx = json.loads((MASK_DIR / "index.json").read_text(encoding="utf-8"))
     tr, va = idx["train"], idx["val"]
     if args.limit:
         tr, va = tr[: args.limit], va[: max(8, args.limit // 8)]

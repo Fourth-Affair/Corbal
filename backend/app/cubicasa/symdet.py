@@ -80,7 +80,7 @@ def cached(rel: str) -> list[dict] | None:
     p = det_path(rel)
     if not p.is_file():
         return None
-    d = json.loads(p.read_text())
+    d = json.loads(p.read_text(encoding="utf-8"))
     return d["dets"] if d.get("weights") == fingerprint() else None
 
 
@@ -128,7 +128,7 @@ def main() -> None:
 
     featured = None
     if args.only_featured and TABLE.exists():
-        featured = {json.loads(line)["path"] for line in TABLE.read_text().splitlines()}
+        featured = {json.loads(line)["path"] for line in TABLE.read_text(encoding="utf-8").splitlines()}
     paths = sorted({q["path"] for q in load_questions()})
     todo = [p for p in paths if split_of(p) in args.splits and (featured is None or p in featured)]
     t0 = time.time()

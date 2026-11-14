@@ -61,7 +61,7 @@ def _det_items(dets: list[dict]) -> list[PlanItem]:
 def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
     npz, js = feature_paths(rel)
     z = np.load(npz)
-    meta = json.loads(js.read_text())
+    meta = json.loads(js.read_text(encoding="utf-8"))
     icons, iconf, rooms, rconf = z["icons"], z["icons_conf"], z["rooms"], z["rooms_conf"]
     H, W = icons.shape
     items: list[PlanItem] = []
@@ -107,7 +107,9 @@ def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list
         contours = find_contours(region, 0.5)
         polygons = []
         for contour in contours:
-            polygon = Polygon([(float(x + xs.start - 1), float(y + ys.start - 1)) for y, x in contour])
+            if len(contour) < 4:  # degenerate (a few pixels): shapely needs >= 4 coordinates for a ring
+                continue
+            polygon = Polygon([(float(x - 1 + xs.start), float(y - 1 + ys.start)) for y, x in contour])
             if polygon.is_valid and polygon.area > 0:
                 polygons.append(polygon)
         if not polygons:

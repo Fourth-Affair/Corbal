@@ -19,8 +19,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ pla
   }
   const file = form.get("file");
   const filename = form.get("filename");
-  if (!(file instanceof File) || typeof filename !== "string" || !["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
-    return NextResponse.json({ detail: "Please upload a valid image file." }, { status: 400 });
+  if (!(file instanceof File) || typeof filename !== "string" || !["application/pdf", "image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+    return NextResponse.json({ detail: "Please upload a PDF or an image file." }, { status: 400 });
   }
 
   const bucket = process.env.NEXT_PUBLIC_SUPABASE_BUCKET || "plans";

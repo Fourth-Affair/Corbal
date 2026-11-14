@@ -156,3 +156,18 @@ def test_api_layers():
     assert r.status_code == (200 if symdet.available() else 503)
     assert client.get("/api/render", params={"path": SAMPLE}).status_code == 400  # layer=answer needs a question
     assert client.get("/api/walls", params={"path": "data/cubicasa5k/../../questions.jsonl"}).status_code == 400
+
+
+def test_floor_outline_rectangular_region_and_tiny_contours():
+    """A region filling its bounding box still gets an outline; a 1-px hole (tiny contour) must not crash."""
+    import numpy as np
+
+    from app.cubicasa.detect import _floor_outline_candidates
+
+    rooms = np.zeros((200, 200), int)
+    rooms[20:180, 20:180] = 4
+    rooms[100, 100] = 0
+    outlines = _floor_outline_candidates(rooms, np.full(rooms.shape, 255.0))
+    assert len(outlines) == 1
+    xs, ys = zip(*outlines[0].polygon)
+    assert (min(xs), min(ys), max(xs), max(ys)) == (19.5, 19.5, 179.5, 179.5)

@@ -37,7 +37,8 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     from tool output, confidence from the producing tool (count_template → counting model; raw items → low; router
     disagreement → low), explanation must state the value and use existing `[k]` refs. Answers cached in
     `CACHE_DIR/agent`. `GEMINI_THINKING` (default `LOW`: 2-3x faster than the model default, same answers;
-    `MINIMAL` is rejected by gemini-3.8-flash). Yes/no answers are linked to, and checked against, a count_template
+    `MINIMAL` is rejected by gemini-3.8-flash). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
+    (`GEMINI_TIMEOUT_S` per call, default 30). Yes/no answers are linked to, and checked against, a count_template
     result. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
   - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
     counts), `list_items`, `items_in` (bbox containment; a room label uses the room region around it).
@@ -59,7 +60,22 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
       `Layer` response shape; cached per image and weights).
     - ground truth: `labels_from_svg.py`.
-  - `app/eval.py` — exact-match eval per template.
+  - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
+    `app/pdfplan/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
+    saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.
+  - `app/pdfplan/` — vector PDF plans, no vision. `text.py`: text runs with boxes (pdfium). `parse.py`: rooms from
+    centred "name / number / area" stacks and apartment tags ("Whg. A") in the PDF text; if a same-name `.dxf` sits
+    next to the PDF, room/apartment outlines and door / window / fixture symbols from it (layers matched by keyword,
+    FIXTURE outline + inner marks -> toilet/washbasin/bathtub/shower/kitchen/stairs), joined to the PDF through shared
+    texts with an affine fit. Without a DXF, symbol counts use the image detector on the rendered page (low
+    confidence) and apartment areas say not found. `answer.py`: EN/DE/FR/IT questions -> 12 templates.
+    `python -m app.pdfplan.eval [--prefix data/swiss_dwellings/] [--split eval] [--no-dxf]`.
+  - `app/eval.py` — exact-match eval per template (counting models only, bypasses the agent).
+  - `app/bench.py` — benchmark of the real `/api/ask` path: fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
+    test split EN+FI, paraphrases/traps from `app/answering/paraphrases.py`, samples of every other dataset), runs in
+    `dataset/runs/bench/` (meta: git sha, set hash, graph cache, Gemini model/prompt version), metrics: accuracy with
+    image-bootstrap CI, coverage, precision, calibration per confidence, citation validity, EN/FI consistency,
+    latency. `diff` gives paired deltas with CIs and the flipped questions.
 - `frontend/` — Next.js 15 / React 19 / TypeScript. Calls backend via `BACKEND_URL`.
 - `compose.yaml` — runs both with hot reload; mounts `./dataset` at `/dataset`.
 - `dataset/` (gitignored, never commit) — `junction-dataset/` (full challenge data + `questions.jsonl`),
@@ -85,6 +101,12 @@ uv run python -m app.cubicasa.features --splits val test     # cache net maps + 
 uv run python -m app.cubicasa.fit --test --fit-on train+val          # CV on val, score on test
 uv run python -m app.cubicasa.fit --test --final --fit-on train+val  # + save fusion models -> models/
 uv run python -m app.eval --method model --split test       # end-to-end score through the runtime path
+
+# benchmark (every pipeline change): fast ≈ 390 q (~6 min with the agent, CI ±6 pts), full ≈ 7.4k q
+uv run python -m app.bench build                            # once (deterministic)
+uv run python -m app.bench run --set fast                   # API path: agent + fallback (--answerer template = offline)
+uv run python -m app.bench run --set fast --no-cache --label rerun   # fresh Gemini answers: measures noise
+uv run python -m app.bench diff <runA.jsonl> <runB.jsonl>   # paired delta, 95% CI, broke/fixed questions
 
 # symbol detector on a Verda GPU VM (VERDA_CLIENT_ID/SECRET in .env). The VM downloads CubiCasa5K itself;
 # the challenge preview images (= test) are held out. VM is deleted at the end unless --keep.
@@ -127,6 +149,14 @@ Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: 
 segmentation. The symbol detector (`symdet.py`) is trained; refitting the counting models with its `det_*`
 features is the next step. 197 of the 241 preview plans are in the official *train* split, so preview scores of
 the counting models are optimistic: report on the official test split.
+
+## Current PDF results (preview set; counts exact, areas within 2%)
+
+swiss_dwellings (65 plans / 2358 questions), rules designed on the even-indexed plans (sorted by path): dev 99.5%,
+held-out odd half **99.0%**. All counts, room labels and per-room areas are 100% on both halves; the misses are
+apartment / floor area totals 3–10% too high (unnamed numbered rooms counted as indoor). PDF only (`--no-dxf`):
+52.8% — room labels 100%, but many plans print no areas and symbol counts fall back to the CubiCasa-trained
+detector. All 71 preview PDFs (2644 questions, incl. IFC renders and drawing sets): 88.5%.
 
 ## Conventions
 

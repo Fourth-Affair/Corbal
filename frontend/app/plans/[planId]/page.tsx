@@ -98,7 +98,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           if (planResponse.ok) {
             record = await planResponse.json();
             const status = record?.plan_images?.find(image => image.role === "source")?.upload_status;
-            if (status === "failed") throw new Error("The image upload failed. Go back and try again.");
+            if (status === "failed") throw new Error("The upload failed. Go back and try again.");
             if (status === "uploaded") break;
           }
           if (cancelled) return;

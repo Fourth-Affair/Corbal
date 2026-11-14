@@ -56,7 +56,7 @@ def _holdout(files: list[Path]) -> set[str]:
     """Image paths listed in question files (e.g. the challenge preview = our test data): never trained on."""
     out = set()
     for f in files:
-        for line in f.read_text().splitlines():
+        for line in f.read_text(encoding="utf-8").splitlines():
             path = json.loads(line)["path"]
             if path.startswith("data/cubicasa5k/"):
                 out.add(path)

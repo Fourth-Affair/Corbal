@@ -10,7 +10,6 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
-from app.config import DATASET_DIR
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
 from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanGraph, PlanItem,
@@ -24,15 +23,26 @@ PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
 # "llm" = Gemini agent with tools over the plan (falls back to "template" without GEMINI_API_KEY or on API errors).
 ANSWERER = os.environ.get("ANSWERER", "llm")
 
+# Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser.
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
 
-def _check_path(path: str):
+
+def _is_pdf(path: str) -> bool:
+    return path.lower().endswith(".pdf")
+
+
+def _check_path(path: str, pdf_ok: bool = False):
+    """Resolve a dataset-relative path to a plan file: an image, or (where supported) a PDF."""
     try:
         p = resolve_dataset_path(path)
     except FileNotFoundError:
         raise HTTPException(404, f"File not found: {path}") from None
-    if p.parent != (DATASET_DIR / "data" / "cubicasa5k").resolve() or p.suffix != ".png":
-        raise HTTPException(400, "Only data/cubicasa5k/*.png files are supported so far.")
-    return p
+    suffix = p.suffix.lower()
+    if suffix in IMAGE_SUFFIXES or (pdf_ok and suffix == ".pdf"):
+        return p
+    kinds = "an image (.png, .jpg)" + (" or a .pdf" if pdf_ok else "")
+    raise HTTPException(400, f"Expected {kinds}, got {p.name}.")
 
 
 @app.get("/health")
@@ -355,57 +365,89 @@ def delete_plan_outline(plan_id: UUID) -> dict:
     return {"saved": []}
 
 
-@app.get("/api/plans/{plan_id}/image")
-def get_plan_image(plan_id: UUID) -> Response:
-    """Stream the private source image for a plan to its frontend viewer."""
+def _download_source(plan_id: UUID) -> bytes:
+    """The plan's uploaded source file (image or PDF) from Supabase Storage."""
     plan = get_plan(plan_id)
     images = [image for image in plan.get("plan_images", []) if image.get("role") == "source"]
     if not images:
-        raise HTTPException(status_code=404, detail="Plan has no source image")
+        raise HTTPException(status_code=409, detail="Plan has no source file")
     supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     image_ref = images[0]
     object_path = "/".join(quote(part, safe="") for part in image_ref["object_path"].split("/"))
     bucket = quote(image_ref["bucket_id"], safe="")
-    request = Request(
-        f"{supabase_url}/storage/v1/object/{bucket}/{object_path}",
-        headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
-    )
+    request = Request(f"{supabase_url}/storage/v1/object/{bucket}/{object_path}",
+                      headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"})
     try:
-        with urlopen(request, timeout=30) as upstream:
-            content = upstream.read()
-            media_type = upstream.headers.get("Content-Type", "application/octet-stream")
+        with urlopen(request, timeout=60) as upstream:
+            return upstream.read()
     except HTTPError as error:
-        raise HTTPException(status_code=502, detail="Could not download the uploaded plan image") from error
+        raise HTTPException(status_code=502, detail="Could not download the uploaded plan file") from error
     except (URLError, TimeoutError) as error:
         raise HTTPException(status_code=502, detail="Could not reach Supabase Storage") from error
+
+
+def _is_pdf_bytes(content: bytes) -> bool:
+    return content[:5] == b"%PDF-"
+
+
+def _upload_pdf(plan_id: UUID, content: bytes | None = None):
+    """Local copy of an uploaded PDF (the PDF parser reads files); downloaded again if the cache was cleared."""
+    from app.config import CACHE_DIR
+
+    path = CACHE_DIR / "uploads" / f"{plan_id}.pdf"
+    if not path.is_file():
+        content = content if content is not None else _download_source(plan_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pdf.tmp")
+        tmp.write_bytes(content)
+        tmp.replace(path)
+    return path
+
+
+def _render_pdf_page(path_or_bytes, scale: float = 2.0):
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(path_or_bytes)
+    try:
+        return pdf[0].render(scale=scale).to_pil().convert("RGB")
+    finally:
+        pdf.close()
+
+
+@app.get("/api/plans/{plan_id}/image")
+def get_plan_image(plan_id: UUID) -> Response:
+    """The plan's source image for the frontend viewer; a PDF is served as its first page rendered to PNG."""
+    content = _download_source(plan_id)
+    if _is_pdf_bytes(content):
+        buf = io.BytesIO()
+        _render_pdf_page(content).save(buf, format="PNG")
+        content, media_type = buf.getvalue(), "image/png"
+    else:
+        from PIL import Image, UnidentifiedImageError
+
+        try:
+            media_type = Image.MIME.get(Image.open(io.BytesIO(content)).format, "application/octet-stream")
+        except (UnidentifiedImageError, OSError):
+            media_type = "application/octet-stream"
     return Response(content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
 
 
 @app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
 def analyze_plan(plan_id: UUID) -> PlanGraph:
-    """Download the uploaded source image from Supabase and analyze it with the plan models."""
+    """Download the uploaded source file from Supabase and analyze it (image pipeline, or the PDF parser)."""
     if graph := _saved_graph(plan_id):
         return graph
-    plan = get_plan(plan_id)
-    images = [image for image in plan.get("plan_images", []) if image.get("role") == "source"]
-    if not images:
-        raise HTTPException(status_code=409, detail="Plan has no source image")
+    image_bytes = _download_source(plan_id)
+    if _is_pdf_bytes(image_bytes):  # vector PDF: deterministic parser, coordinates in PDF points
+        from app.pdfplan.answer import plan_graph
 
-    image_ref = images[0]
-    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    object_path = "/".join(quote(part, safe="") for part in image_ref["object_path"].split("/"))
-    bucket = quote(image_ref["bucket_id"], safe="")
-    image_url = f"{supabase_url}/storage/v1/object/{bucket}/{object_path}"
-    request = Request(image_url, headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"})
-    try:
-        with urlopen(request, timeout=60) as response:
-            image_bytes = response.read()
-    except HTTPError as error:
-        raise HTTPException(status_code=502, detail="Could not download the uploaded plan image") from error
-    except (URLError, TimeoutError) as error:
-        raise HTTPException(status_code=502, detail="Could not reach Supabase Storage") from error
+        try:
+            graph = plan_graph(str(_upload_pdf(plan_id, image_bytes)), image=f"uploads/{plan_id}.pdf")
+        except Exception as error:  # noqa: BLE001  unreadable or encrypted PDF
+            raise HTTPException(status_code=422, detail=f"Uploaded PDF could not be read: {error}") from error
+        _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+        return graph
 
     # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
     # cache key prevents unrelated uploads from sharing feature files.
@@ -471,6 +513,10 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
         return Answer(answer=round(area, 1), unit="m²", confidence="low",
                       explanation=f"Estimated {outlines[0].label.lower()} area from the saved scale and user-accepted outline. Check the highlighted boundary before relying on this area.",
                       answered_by="template")
+    if graph.source == "pdf":
+        from app.pdfplan.answer import answer_question
+
+        return answer_question(str(_upload_pdf(plan_id)), req.question)
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
@@ -489,7 +535,14 @@ def _template_answer(question: str, graph) -> Answer:
 
 @app.post("/api/ask")
 def ask(req: AskRequest) -> Answer:
-    _check_path(req.path)
+    _check_path(req.path, pdf_ok=True)
+    if _is_pdf(req.path):  # vector plan: deterministic parser, citations in PDF points
+        from app.pdfplan.answer import answer_question
+
+        try:
+            return answer_question(req.path, req.question)
+        except FileNotFoundError as error:
+            return Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {error}")
     try:
         graph = get_graph(req.path, PLAN_SOURCE)
     except FileNotFoundError as error:  # e.g. model weights or original labels missing
@@ -505,7 +558,8 @@ def ask(req: AskRequest) -> Answer:
 
 @app.get("/api/image")
 def image(path: str = Query(...)):
-    return FileResponse(_check_path(path), media_type="image/png")
+    p = _check_path(path, pdf_ok=True)
+    return FileResponse(p, media_type=MEDIA[p.suffix.lower()])
 
 
 def _layer(name: str, path: str) -> Layer:
@@ -544,19 +598,28 @@ def render(path: str = Query(...), question: str | None = Query(None),
 
     from app.cubicasa import layers
 
-    p = _check_path(path)
+    p = _check_path(path, pdf_ok=layer == "answer")
     if layer == "answer":
         if not question:
             raise HTTPException(400, "layer=answer needs question")
         answer = ask(AskRequest(path=path, question=question))
-        img = Image.open(p).convert("RGB")
+        k = 1.0
+        if _is_pdf(path):  # citations are PDF points: render page 1 at 2x
+            import pypdfium2 as pdfium
+
+            k = 2.0
+            pdf = pdfium.PdfDocument(str(p))
+            img = pdf[0].render(scale=k).to_pil().convert("RGB")
+            pdf.close()
+        else:
+            img = Image.open(p).convert("RGB")
         draw = ImageDraw.Draw(img)
         for i, item in enumerate(answer.citations, 1):
             if item.polygon:
-                draw.polygon(item.polygon, outline=(220, 30, 30), width=4)
+                draw.polygon([(x * k, y * k) for x, y in item.polygon], outline=(220, 30, 30), width=4)
             else:
-                draw.rectangle(item.bbox, outline=(220, 30, 30), width=4)
-            draw.text((item.bbox[0] + 4, item.bbox[1] + 2), str(i), fill=(220, 30, 30))
+                draw.rectangle([v * k for v in item.bbox], outline=(220, 30, 30), width=4)
+            draw.text((item.bbox[0] * k + 4, item.bbox[1] * k + 2), str(i), fill=(220, 30, 30))
     else:
         try:
             img = layers.render(layer, path, p)

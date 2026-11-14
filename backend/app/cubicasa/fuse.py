@@ -27,7 +27,7 @@ OCR_TYPES = ["bedroom", "bathroom", "wc", "sauna", "kitchen", "balcony", "other"
 def load(rel: str):
     npz, js = feature_paths(rel)
     z = np.load(npz)
-    meta = json.loads(js.read_text())
+    meta = json.loads(js.read_text(encoding="utf-8"))
     return z, meta
 
 
