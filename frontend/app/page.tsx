@@ -44,34 +44,53 @@ export default function Home() {
     const safeName = selected.name.replace(/[^a-zA-Z0-9._-]/g, "-");
     const planId = crypto.randomUUID();
     const path = `${planId}/${crypto.randomUUID()}-${safeName}`;
+    const { error: recordError } = await supabase.rpc("create_plan_with_image", {
+      p_plan_id: planId,
+      p_bucket_id: bucket,
+      p_object_path: path,
+      p_role: "source",
+    });
+    if (recordError) {
+      setUploadStatus(null);
+      setUploadError(`Plan record could not be created, so the image was not uploaded: ${recordError.message}`);
+      return;
+    }
+
     const { error } = await supabase.storage.from(bucket).upload(path, selected, {
       contentType: selected.type,
       upsert: false,
     });
 
     if (error) {
+      await supabase.rpc("set_plan_image_upload_status", {
+        p_plan_id: planId,
+        p_object_path: path,
+        p_status: "failed",
+      });
       setUploadStatus(null);
       setUploadError(`Upload failed: ${error.message}`);
       return;
     }
-    const { error: planError } = await supabase.from("plans").insert({ id: planId });
-    if (planError) {
-      setUploadStatus(null);
-      setUploadError(`Image uploaded, but its plan record could not be saved: ${planError.message}`);
-      return;
-    }
-    const { error: imageError } = await supabase.from("plan_images").insert({
-      plan_id: planId,
-      bucket_id: bucket,
-      object_path: path,
-      role: "source",
+    const { error: statusError } = await supabase.rpc("set_plan_image_upload_status", {
+      p_plan_id: planId,
+      p_object_path: path,
+      p_status: "uploaded",
     });
-    if (imageError) {
+    setUploadStatus(`Upload complete${statusError ? " (status confirmation pending)" : ""}. Analyzing plan…`);
+    try {
+      const response = await fetch(`/api/plans/${planId}/analyze`, { method: "POST" });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.detail || "Plan analysis failed");
+      }
+      const counts = Object.entries(result.counts ?? {})
+        .map(([name, count]) => `${name.replaceAll("_", " ")}: ${count}`)
+        .join(", ");
+      setUploadStatus(`Analysis complete. ${counts || "Plan parsed"}${statusError ? " · Upload status pending" : ""} · ID: ${planId}`);
+    } catch (error) {
       setUploadStatus(null);
-      setUploadError(`Plan ${planId} was created, but its image link could not be saved: ${imageError.message}`);
-      return;
+      setUploadError(`Plan ${planId} was uploaded, but analysis failed: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
-    setUploadStatus(`Saved to Supabase. Plan ID: ${planId}`);
   };
 
   const handleDrop = (event: DragEvent<HTMLElement>) => {

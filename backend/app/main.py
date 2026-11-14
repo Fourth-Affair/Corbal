@@ -3,7 +3,7 @@ import json
 import os
 from typing import Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from uuid import UUID
 
@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, Response
 from app.config import DATASET_DIR
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import Answer, AskRequest, Layer
+from app.models import Answer, AskRequest, Layer, PlanGraph
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
@@ -66,6 +66,52 @@ def get_plan(plan_id: UUID) -> dict:
     if not plans:
         raise HTTPException(status_code=404, detail="Plan not found")
     return plans[0]
+
+
+@app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
+def analyze_plan(plan_id: UUID) -> PlanGraph:
+    """Download the uploaded source image from Supabase and analyze it with the plan models."""
+    plan = get_plan(plan_id)
+    images = [image for image in plan.get("plan_images", []) if image.get("role") == "source"]
+    if not images:
+        raise HTTPException(status_code=409, detail="Plan has no source image")
+
+    image_ref = images[0]
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    object_path = "/".join(quote(part, safe="") for part in image_ref["object_path"].split("/"))
+    bucket = quote(image_ref["bucket_id"], safe="")
+    image_url = f"{supabase_url}/storage/v1/object/{bucket}/{object_path}"
+    request = Request(image_url, headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"})
+    try:
+        with urlopen(request, timeout=60) as response:
+            image_bytes = response.read()
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail="Could not download the uploaded plan image") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase Storage") from error
+
+    # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
+    # cache key prevents unrelated uploads from sharing feature files.
+    from PIL import Image, UnidentifiedImageError
+    from app.cubicasa.detect import graph_from_image
+
+    from app.config import CACHE_DIR
+
+    cache_key = f"uploads/{plan_id}.png"
+    cache_path = CACHE_DIR / cache_key
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.verify()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image.save(cache_path, format="PNG")
+    except (UnidentifiedImageError, OSError) as error:
+        raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
+    try:
+        return graph_from_image(cache_key, cache_path)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
 
 
 @app.post("/api/ask")

@@ -131,9 +131,9 @@ This setup uses the anon key, which is intended to be exposed in browser apps. T
 
 ## Plan records and image associations
 
-The migration in `supabase/migrations/` creates `plans` and `plan_images`. Each uploaded image gets a plan UUID; `plan_images` stores the Supabase bucket and object path, and the plan has a JSONB `metadata` field for future data. The frontend displays the plan UUID after it saves the association.
+The migrations in `supabase/migrations/` create `plans` and `plan_images`, then add RPCs that create the plan and image-link rows in one database transaction. The frontend calls the RPC before uploading the file, so a missing table or RPC stops the upload. The image row tracks `pending`, `uploaded`, or `failed`. Storage is a separate service, so its upload cannot share the database transaction; the initial RPC ensures the backend has the image path linked to a plan before upload starts. Each uploaded image gets a plan UUID, and `plans.metadata` is JSONB for future plan data.
 
-Apply the migration with the Supabase CLI from the repository root:
+Apply both migrations with the Supabase CLI from the repository root:
 
 ```sh
 supabase login
@@ -141,6 +141,8 @@ supabase link --project-ref your-project-ref
 supabase db push
 ```
 
-Or paste the migration SQL into Supabase **SQL Editor** and run it. Keep the migration file in source control either way.
+Or paste the migration SQL files into Supabase **SQL Editor** in timestamp order. Keep the migration files in source control either way. If you already ran the first migration manually, run only the second migration in SQL Editor.
 
 Set `SUPABASE_SERVICE_ROLE_KEY` in the root `.env` for Docker Compose, using the service role secret from **Project Settings → API**. This key is only passed to FastAPI and must never use a `NEXT_PUBLIC_` prefix. The backend lookup endpoint is `GET /api/plans/{plan_id}`; it returns the plan and linked image metadata, including each `bucket_id` and `object_path`. It uses the service key to read the RLS-protected tables.
+
+After saving the plan and its source image association, the frontend calls `POST /api/plans/{plan_id}/analyze`. The backend downloads that source image from private Supabase Storage, runs the image-only plan pipeline, and returns a `PlanGraph` with image dimensions, detected items, and predicted counts. The frontend proxies this request through its `/api/plans/{planId}/analyze` route so the browser does not need direct backend network access. The request is synchronous and may take a while while the models load or analyze a large plan.
