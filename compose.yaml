@@ -2,6 +2,7 @@ services:
   frontend:
     build:
       context: ./frontend
+      target: dev
     # Refresh the persistent node_modules volume after dependency changes.
     command: sh -c "npm ci && npm run dev"
     environment:

@@ -96,6 +96,7 @@ class Answer(BaseModel):
     template: str | None = None
     confidence: Literal["high", "medium", "low", "not_found"]
     explanation: str
+    clarification_needed: bool = False
     citations: list[PlanItem] = Field(default_factory=list)
     answered_by: Literal["template", "llm"] = "template"  # template = router + counter, llm = Gemini agent (values still tool-computed)
 

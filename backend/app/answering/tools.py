@@ -5,6 +5,7 @@ produced, so the agent can check that the final answer and its citations are bac
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 from app.cubicasa.answer import count
@@ -178,13 +179,15 @@ class PlanTools:
         for it in self.graph.items:
             key = it.category + (f":{it.cls}" if it.cls else "") + (f" ({_kind(it)})" if it.category == "room" else "")
             kinds[key] = kinds.get(key, 0) + 1
+        scale = self.geometry.scale if self.geometry else None
         return {
             "image_size_px": [self.graph.width, self.graph.height],
             "source": "ground-truth labels" if self.graph.source == "svg" else "image analysis (detector, segmentation, OCR)",
             "items_by_kind": dict(sorted(kinds.items())),
             "user_reviewed_items": sum(it.user_verified for it in self.graph.items),
             "user_correction_events": self.graph.user_correction_count,
-            "note": "No drawing scale is known: real-world lengths and areas (m, m²) cannot be computed.",
+            "note": ("Drawing scale is available for metric measurements." if scale else
+                     "No drawing scale is known: real-world lengths and areas (m, m²) cannot be computed."),
         }, ToolTrace()
 
     def count_template(self, template: str) -> tuple[dict, ToolTrace]:
@@ -328,6 +331,34 @@ class PlanTools:
                     if v is not None]
         return out, ToolTrace(item_ids=[sg.id for sg in shown], numbers=numbers)
 
+    def covering_quantity(self, room_type: str, unit_width_m: float, unit_height_m: float,
+                          waste_percent: float = 10) -> tuple[dict, ToolTrace]:
+        """Estimate count of rectangular covering units for the matching room floors."""
+        if not self.geometry:
+            return {"error": "Room geometry is unavailable."}, ToolTrace()
+        if unit_width_m <= 0 or unit_height_m <= 0 or not 0 <= waste_percent <= 100:
+            return {"error": "Unit dimensions must be positive and waste_percent must be 0..100."}, ToolTrace()
+        rooms = [rm for rm in self.rooms.values() if rm.type == room_type and rm.tier != "unknown"]
+        if not self.geometry.scale and any(rm.area_m2 is not None for rm in rooms):
+            # area_m2 is normally populated only with a scale; keep this guard explicit for malformed geometry.
+            return {"error": "A drawing scale is required to calculate room area."}, ToolTrace()
+        missing = [rm.id for rm in rooms if rm.area_m2 is None and rm.labeled_area_m2 is None]
+        usable = [rm for rm in rooms if rm.area_m2 is not None or rm.labeled_area_m2 is not None]
+        if not usable:
+            return {"error": f"No measured or labeled areas available for {room_type} rooms."}, ToolTrace()
+        area = sum(rm.area_m2 if rm.area_m2 is not None else rm.labeled_area_m2 for rm in usable)
+        unit_area = unit_width_m * unit_height_m
+        base_count = math.ceil(area / unit_area)
+        quantity = math.ceil(base_count * (1 + waste_percent / 100))
+        ids = [rm.id for rm in usable]
+        result = {"room_type": room_type, "room_count": len(usable), "area_m2": round(area, 3),
+                  "unit_area_m2": round(unit_area, 5), "quantity_without_waste": base_count,
+                  "waste_percent": waste_percent, "quantity_with_waste": quantity,
+                  "area_sources": ["measured" if rm.area_m2 is not None else "written on drawing" for rm in usable]}
+        if missing:
+            result["rooms_without_area"] = missing
+        return result, ToolTrace(item_ids=ids, numbers=[area, unit_area, base_count, waste_percent, quantity])
+
     # --- dispatch ----------------------------------------------------------------------------------------------
 
     def call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
@@ -335,6 +366,8 @@ class PlanTools:
               "list_items": self.list_items, "items_in": self.items_in,
               **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls}
                  if self.geometry else {})}.get(name)
+        if name == "covering_quantity" and self.geometry:
+            fn = self.covering_quantity
         if fn is None:
             return {"error": f"unknown tool {name!r}"}, ToolTrace()
         try:
@@ -383,6 +416,18 @@ DECLARATIONS = [
 
 # Only offered when the plan has stored room geometry (uploaded plans); the benchmark path keeps the tools above.
 ROOM_DECLARATIONS = [
+    {
+        "name": "covering_quantity",
+        "description": ("Calculate how many rectangular covering units are needed for floors of rooms of a given type. "
+                        "Uses detected room areas and drawing scale, or areas printed on the plan. Returns exact "
+                        "rounded-up unit count before and after waste, with citations to rooms. Use when asked for "
+                        "tiles, panels or similar area-covering materials; state the waste assumption."),
+        "parameters": {"type": "object", "properties": {
+            "room_type": {"type": "string", "enum": ROOM_TYPES},
+            "unit_width_m": {"type": "number"}, "unit_height_m": {"type": "number"},
+            "waste_percent": {"type": "number", "description": "waste allowance percentage; use 10 when not specified"},
+        }, "required": ["room_type", "unit_width_m", "unit_height_m"]},
+    },
     {
         "name": "list_rooms",
         "description": ("Rooms as spaces enclosed by the plan's walls. Each has a type from combined evidence (a label "

@@ -221,7 +221,6 @@ def graph_from_image(rel: str, path) -> PlanGraph:
         counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
     with np.load(feature_paths(rel)[0]) as z:
         floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
-        room_outlines = _room_outline_candidates(z["rooms"], z["rooms_conf"])
     floor_items = []
     for outline in floor_outlines:
         xs, ys = zip(*outline.polygon)
@@ -234,4 +233,4 @@ def graph_from_image(rel: str, path) -> PlanGraph:
         ))
     items = _evidence(rel, dets) + floor_items
     return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
-                     counts=counts, floor_outlines=floor_outlines, room_outlines=room_outlines)
+                     counts=counts, floor_outlines=floor_outlines)
