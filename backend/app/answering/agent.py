@@ -35,7 +35,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
-PROMPT_VERSION = "17"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "18"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
@@ -78,10 +78,12 @@ Use the prior conversation to resolve follow-up references (for example, "what a
 latest question as the request to answer. Prior assistant replies are context only; verify plan facts with tools.
 
 Rules:
-- You may count, add, subtract, and make reasonable estimates from the evidence returned by tools. Do not invent
-  inputs or fill evidence gaps with plausible-sounding facts. For derived quantities, show the inputs and calculation
-  briefly; label estimates as approximate and state important assumptions. Separate measured quantities from
-  assumptions such as waste allowance.
+- Never count, add, subtract or estimate yourself. Use a calculation tool for derived quantities; every numeric answer
+  must exactly match a tool result. Separate quantities that are measured from assumptions such as waste allowance.
+- For a total or a difference of two quantities ("how many toilets and sinks altogether", "how many more windows than
+  doors"), get each quantity from its tool first, then call calculate with those numbers and answer with its result;
+  cite the items of both quantities. Do not refuse such questions because no single tool returns the combined number.
+  Deciding which of two tool numbers is larger ("are there more X than Y?") needs no tool: answer yes or no.
 - For a whole-plan count that matches a count_template template, use count_template (it is calibrated); do not
   count raw items from list_items for those.
 - "Is there a ...?" questions about something count_template covers: answer from count_template only (yes if its
@@ -321,8 +323,11 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
     cited = [tools.by_id[i] for i in dict.fromkeys(final.get("cited_ids") or []) if i in citable and i in tools.by_id]
     value = final.get("value")
     template = None
+    combined: set[str] = set()  # templates a calculated value was built from
     if value is not None:
-        source = next((t for t in traces if t.template_answer is not None and value in t.numbers), None) \
+        # a calculated value belongs to the calculation, even when a single count happens to equal it
+        source = next((t for t in reversed(traces) if t.derived_from is not None and value in t.numbers), None) \
+            or next((t for t in traces if t.template_answer is not None and value in t.numbers), None) \
             or next((t for t in traces if value in t.numbers), None)
         if source is None and not any(t.numbers for t in traces):
             log.warning("value %r has no numeric evidence in tool output", value)
@@ -337,7 +342,15 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
             if not cited:
                 cited = [tools.by_id[i] for t in traces for i in t.item_ids if i in tools.by_id]
         value = int(value) if float(value).is_integer() else value
-        if source is not None and source.template_answer is not None:
+        raw_confidence = "high" if graph.source == "svg" else "low"
+        if source is not None and source.derived_from is not None:  # as reliable as its least reliable operand
+            parts = [t.template_answer.confidence if t.template_answer is not None else raw_confidence
+                     for t in source.derived_from]
+            confidence = min(parts, key=["not_found", "low", "medium", "high"].index, default="low")
+            combined = {t.template_answer.template for t in source.derived_from if t.template_answer is not None}
+            if not cited:
+                cited = [tools.by_id[i] for i in source.item_ids if i in tools.by_id]
+        elif source is not None and source.template_answer is not None:
             template = source.template_answer.template
             confidence = source.template_answer.confidence
             if not cited:
@@ -378,7 +391,7 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
             cited = [tools.by_id[i] for t in traces for i in t.item_ids if i in tools.by_id]
 
     routed = route(question)
-    if routed and template != routed and confidence in ("high", "medium"):
+    if routed and template != routed and routed not in combined and confidence in ("high", "medium"):
         log.warning("router says %s, agent used %s: confidence lowered", routed, template)
         confidence = "low"
     if value is not None and value != 0 and not cited:

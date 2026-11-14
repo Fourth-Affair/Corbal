@@ -82,18 +82,40 @@ def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
                                       bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop))))
     for name, cls in ROOM_ITEMS.items():
         m = ndimage.binary_opening(rooms == ROOM[name], iterations=2)
-        _, sizes, mconf, boxes = components(m, rconf)
+        labels, sizes, mconf, boxes = components(m, rconf)
         for k, (sz, c, sl) in enumerate(zip(sizes, mconf, boxes)):
             if sz >= 2e-3 * H * W:
                 ys, xs = sl
                 items.append(PlanItem(id=f"room-{name}-{k}", category="room", cls=cls, score=round(float(c), 3),
-                                      bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop))))
+                                      bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop)),
+                                      polygon=_region_outline(labels[ys, xs] == k + 1, xs.start, ys.start,
+                                                              max(H, W) * 0.0015)))
     for k, tok in enumerate(meta["ocr"]):
         t = room_type(tok["text"])
         if t:
             items.append(PlanItem(id=f"label-{k}", category="room", cls=t, text=tok["text"],
                                   score=tok["score"], bbox=tuple(tok["bbox"]), raw="ocr"))
     return items
+
+
+def _region_outline(region: np.ndarray, x0: int, y0: int, tolerance: float) -> list[tuple[float, float]] | None:
+    """Outer contour of one segmented region (a crop at x0, y0) as a simplified polygon in image pixels.
+
+    The outline lets containment tests follow the room's real shape: an L-shaped room's bounding box also covers
+    whatever sits in its notch."""
+    contours = find_contours(np.pad(region.astype(np.uint8), 1), 0.5)
+    polygons = [Polygon([(float(x - 1 + x0), float(y - 1 + y0)) for y, x in contour])
+                for contour in contours if len(contour) >= 4]
+    polygons = [p for p in polygons if p.is_valid and p.area > 0]
+    if not polygons:
+        return None
+    polygon = max(polygons, key=lambda p: p.area).simplify(tolerance, preserve_topology=True)
+    coords = list(polygon.exterior.coords)[:-1]
+    if not polygon.is_valid or len(coords) < 3:
+        return None
+    if len(coords) > 200:
+        coords = coords[::(len(coords) + 198) // 199]
+    return [(round(x, 1), round(y, 1)) for x, y in coords]
 
 
 def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list[PlanOutline]:

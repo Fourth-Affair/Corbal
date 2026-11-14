@@ -238,3 +238,48 @@ def test_hourly_cap_falls_back(monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "run_loop", lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(RuntimeError("x")))
     assert agent.answer("how many sinks?", GRAPH) is None and len(calls) == 1
     assert agent.answer("how many doors?", GRAPH) is None and len(calls) == 1  # cap reached: Gemini not called
+
+
+def test_calculate_only_combines_tool_numbers(tools):
+    assert "error" in tools.call("calculate", {"operation": "add", "operands": [2, 2]})[0]  # nothing returned yet
+    _, sinks = tools.call("count_template", {"template": "sinks"})
+    _, doors = tools.call("count_template", {"template": "doors"})
+    out, trace = tools.call("calculate", {"operation": "add", "operands": [2, 2]})
+    assert out["result"] == 4 and trace.numbers == [4] and trace.derived_from == [sinks]  # both 2s are the sinks count
+    assert "error" in tools.call("calculate", {"operation": "add", "operands": [2, 7]})[0]  # 7 is the model's own
+    assert "error" in tools.call("calculate", {"operation": "times", "operands": [2, 2]})[0]
+    assert "error" in tools.call("calculate", {"operation": "add", "operands": [2]})[0]
+    out, _ = tools.call("calculate", {"operation": "subtract", "operands": [4, 2]})  # a result can be reused
+    assert out["result"] == 2
+
+
+def test_calculated_answer_is_validated_and_cited(tools):
+    _, sinks = tools.call("count_template", {"template": "sinks"})
+    _, doors = tools.call("count_template", {"template": "doors"})
+    _, total = tools.call("calculate", {"operation": "add", "operands": [2, 2]})
+    ans = agent.validate("How many sinks and doors are there in total?", _final(value=4, explanation="4 in total."),
+                   [sinks, doors, total], tools)
+    assert ans.answer == 4 and ans.template is None and ans.confidence != "not_found"
+    assert {c.id for c in ans.citations} == {"sink-0", "sink-1"}  # the items behind the operands
+    # a sum the tool never produced is still rejected
+    assert agent.validate("total?", _final(value=5, explanation="5."), [sinks, doors, total], tools).answer is None
+
+
+def test_items_in_follows_the_room_outline():
+    """L-shaped kitchen: its bounding box covers the notch where the WC is; the outline does not."""
+    ell = [(0, 0), (100, 0), (100, 40), (40, 40), (40, 100), (0, 100)]
+    graph = PlanGraph(image="x.png", width=200, height=200, source="svg", items=[
+        PlanItem(id="kitchen", category="room", cls="kitchen", bbox=(0, 0, 100, 100), polygon=ell),
+        _item("sink-kitchen", "fixture", (10, 10, 20, 20), "sink"),
+        _item("sink-wc", "fixture", (60, 60, 70, 70), "sink"),  # in the notch
+        _item("sink-edge", "fixture", (34, 80, 44, 90), "sink"),  # against the wall: centre inside
+        _item("window-top", "window", (30, -4, 70, 0)),  # in the wall above the kitchen
+        _item("window-notch", "window", (60, 100, 90, 104)),  # in the wall below the notch
+        _item("door-side", "door", (-12, 40, 0, 52)),
+    ])
+    t = PlanTools(graph)
+    assert {r["id"] for r in t.items_in("kitchen", "fixture", "sink")[0]["items"]} == {"sink-kitchen", "sink-edge"}
+    assert [r["id"] for r in t.items_in("kitchen", "window")[0]["items"]] == ["window-top"]
+    assert t.items_in("kitchen", "door")[0]["count"] == 1
+    graph.items[0].polygon = None  # no outline: the old bounding-box rule
+    assert PlanTools(graph).items_in("kitchen", "fixture", "sink")[0]["count"] == 3
