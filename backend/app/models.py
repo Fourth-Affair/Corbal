@@ -73,7 +73,7 @@ class PlanCorrectionRequest(BaseModel):
 class PlanFeedbackRequest(BaseModel):
     question: str = Field(max_length=4000)
     answer: str = Field(max_length=4000)
-    feedback: Literal["helpful", "incorrect", "unclear"]
+    feedback: Literal["helpful", "incorrect", "unclear", "trusted", "rejected"]
     reason: str | None = Field(default=None, max_length=500)
     evidence_ids: list[str] = Field(default_factory=list, max_length=100)
 

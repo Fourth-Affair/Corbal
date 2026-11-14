@@ -14,6 +14,7 @@ import os
 import time
 from functools import lru_cache
 from pathlib import Path
+from uuid import uuid4
 
 from PIL import Image
 
@@ -184,7 +185,12 @@ def detect(rel: str, img: Image.Image | None = None) -> list[dict]:
     meta = weights_meta()
     p = det_path(rel)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"weights": fingerprint(), **meta, "dets": dets}))
+    tmp = p.with_name(f"{p.name}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps({"weights": fingerprint(), **meta, "dets": dets}))
+        tmp.replace(p)
+    finally:
+        tmp.unlink(missing_ok=True)
     return dets
 
 

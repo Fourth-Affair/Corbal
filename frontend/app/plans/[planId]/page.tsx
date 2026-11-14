@@ -9,9 +9,12 @@ type PlanRecord = {
   plan_images?: Array<{ upload_status?: string; role?: string }>;
 };
 
-type ChatMessage = { role: "user" | "assistant"; text: string; evidence_ids?: string[]; feedback?: string };
+type ChatMessage = { role: "user" | "assistant"; text: string; originalText?: string; evidence_ids?: string[]; evidence?: PlanCitation[]; confidence?: string; feedback?: string; evidenceDecision?: "trusted" | "rejected" };
 type PlanCitation = {
   id: string;
+  category?: string;
+  cls?: string | null;
+  text?: string | null;
   bbox: [number, number, number, number];
   polygon?: Array<[number, number]> | null;
   raw?: string | null;
@@ -425,7 +428,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     } finally { setCorrectionSaving(false); }
   }
 
-  async function submitFeedback(messageIndex: number, feedback: "helpful" | "incorrect" | "unclear") {
+  async function submitFeedback(messageIndex: number, feedback: "helpful" | "incorrect" | "unclear" | "trusted" | "rejected") {
     if (!planId) return;
     const answer = messages[messageIndex];
     const question = [...messages.slice(0, messageIndex)].reverse().find(message => message.role === "user");
@@ -438,10 +441,18 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not save feedback");
-      setMessages(current => current.map((message, index) => index === messageIndex ? { ...message, feedback } : message));
+      setMessages(current => current.map((message, index) => index === messageIndex ? {
+        ...message, feedback,
+        ...(feedback === "trusted" ? { evidenceDecision: feedback, text: message.originalText ?? message.text } : {}),
+        ...(feedback === "rejected" ? { evidenceDecision: feedback, text: "You rejected the supporting evidence, so I’m withdrawing this provisional answer. Review or correct the highlighted items before relying on a new answer." } : {}),
+      } : message));
     } catch (error) {
       setFeedbackError(error instanceof Error ? error.message : "Could not save feedback");
     }
+  }
+
+  function showMessageEvidence(message: ChatMessage) {
+    if (message.evidence?.length) setCitations(message.evidence);
   }
 
   function beginCorrection(item: EvidenceItem) {
@@ -480,11 +491,16 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setMessages(current => [...current, { role: "user", text: submitted }]);
     setSending(true);
     try {
-      const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/ask`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale,
-          floor_outlines: savedOutlines.filter(outline => outline.scope !== "room" || geometry?.rooms.some(room => room.id === outline.id) || outline.id.endsWith("-user")) }),
-      });
+      const requestBody = JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale,
+        floor_outlines: savedOutlines.filter(outline => outline.scope !== "room" || geometry?.rooms.some(room => room.id === outline.id) || outline.id.endsWith("-user")) });
+      let response: Response;
+      for (let attempt = 0; ; attempt++) {
+        response = await fetch(`/api/plans/${encodeURIComponent(planId)}/ask`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: requestBody,
+        });
+        if (attempt >= 1 || ![502, 503].includes(response.status)) break;
+        await new Promise(resolve => setTimeout(resolve, 700));
+      }
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
       const explanation = typeof result.explanation === "string" ? result.explanation : "";
@@ -505,7 +521,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
               : "I couldn’t detect a clear floor boundary. Draw or edit the outline, then accept it to calculate an area estimate."
         : result.answer === null ? result.explanation : `${result.answer}${result.unit ? ` ${result.unit}` : ""}. ${result.explanation}`;
       setCitations(Array.isArray(result.citations) ? result.citations : []);
-      setMessages(current => [...current, { role: "assistant", text: answer, evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id) }]);
+      const provisional = result.confidence === "low";
+      setMessages(current => [...current, { role: "assistant", text: provisional ? `Possible answer: ${answer}` : answer, ...(provisional ? { originalText: answer } : {}), evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id), evidence: result.citations ?? [], confidence: result.confidence }]);
       if (needsScale) {
         setPendingAreaQuestion(submitted);
         startScaleCalibration();
@@ -517,7 +534,11 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     } catch (askError) {
       setCitations([]);
       const message = askError instanceof Error ? askError.message : "Could not answer that question";
-      setMessages(current => [...current, { role: "assistant", text: message }]);
+      const userMessage = /supabase|analysis backend/i.test(message)
+        ? "I couldn't load the saved plan just now. Your question is still in the chat; please try again in a moment."
+        : message;
+      setQuestion(submitted);
+      setMessages(current => [...current, { role: "assistant", text: userMessage }]);
     } finally {
       setSending(false);
     }
@@ -960,7 +981,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 const fullItem = evidenceItems.find(candidate => candidate.id === item.id);
-                const label = fullItem ? evidenceLabel(fullItem, evidenceItems) : item.raw?.replaceAll("_", " ") || "Evidence";
+                const label = fullItem ? evidenceLabel(fullItem, evidenceItems)
+                  : item.category === "room" ? `${item.text || item.cls?.replaceAll("_", " ") || "Room"} boundary`
+                  : item.category === "wall" ? "Wall boundary"
+                  : item.raw?.replaceAll("_", " ") || "Evidence";
                 const confidence = fullItem?.user_verified || item.user_verified ? "reviewed" : item.score != null ? `${Math.round(item.score * 100)}%` : null;
                 const visibleLabel = confidence ? `${label} · ${confidence}` : label;
                 const labelWidth = Math.max(62, Math.min(220, visibleLabel.length * 8 + 22));
@@ -1024,7 +1048,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             {correctionError && <p className="correction-error" role="alert">{correctionError}</p>}
           </section>}
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
-          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
+          <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && message.confidence === "low" && <><small className="answer-confidence">Lower confidence · check the highlighted evidence on the drawing</small>{message.evidence?.length ? <section className="evidence-review" aria-label="Evidence to review"><strong>Evidence behind this answer</strong><button type="button" className="evidence-focus" onClick={() => showMessageEvidence(message)}>Show {message.evidence.length} item{message.evidence.length === 1 ? "" : "s"} on drawing</button><ul>{message.evidence.map((item, evidenceIndex) => <li key={`${item.id}-${evidenceIndex}`}>{itemLabel({ category: item.category ?? "item", cls: item.cls ?? "", text: item.text })}{item.text ? ` · “${item.text}”` : ""}{item.score != null ? ` · ${Math.round(item.score * 100)}% model confidence` : ""}</li>)}</ul>{message.evidenceDecision ? <small className={`evidence-decision ${message.evidenceDecision}`}>{message.evidenceDecision === "trusted" ? "You trust this evidence." : "You rejected this evidence."}</small> : <div className="evidence-actions"><button type="button" onClick={() => void submitFeedback(index, "trusted")}>Trust</button><button type="button" onClick={() => void submitFeedback(index, "rejected")}>Don’t trust</button></div>}</section> : null}</>}{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
           {feedbackError && <p className="feedback-error" role="alert">{feedbackError}</p>}
           {measurementRequested && <section className="requested-action" aria-label="Requested measurement">
             <div><strong>Measure a distance</strong><span>Choose the two points you want measured on the plan.</span></div>

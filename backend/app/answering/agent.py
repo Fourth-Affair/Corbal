@@ -2,7 +2,7 @@
 
 Gemini plans and words the answer; the tools (app.answering.tools) compute every number and supply every citation.
 Checks done in code, not by the model:
-- the answer value must equal a number some tool returned in this session, else "not_found";
+- numeric answers are checked against tool evidence; derived values are allowed when grounded in returned numbers;
 - cited ids must have been returned by a tool, else they are dropped;
 - confidence comes from the tool that produced the value (count_template -> the counting model's confidence,
   raw items -> low), downgraded when the regex router recognises the question as a different template;
@@ -11,13 +11,16 @@ answer() returns None when Gemini is unavailable (no key, API error, no final an
 """
 
 import hashlib
+import ast
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 from collections import deque
+from uuid import uuid4
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
@@ -32,7 +35,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
-PROMPT_VERSION = "16"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "18"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
@@ -119,6 +122,9 @@ ROOM_RULES = """
 Room and wall geometry is available:
 - For which rooms exist, what a room is for, room sizes, which rooms connect, or where something is, use list_rooms
   and room_details; for wall lengths, thicknesses and exterior walls use list_walls (or the walls in room_details).
+- Cite the room or wall segments used as the basis for the answer so their boundaries are highlighted on the plan. State
+  the evidence for a room type (such as its printed label, fixtures inside, or weak segmentation evidence); say when
+  the boundary or type is uncertain.
 - Room types carry a tier. strong: state the type plainly. weak: say "probably <type>" and give the reason from the
   tool ("because ..."). unknown: the purpose was not determined; never guess it; if relevant say there are N further
   spaces whose purpose could not be determined. Report conflicting evidence when a tool lists it.
@@ -137,7 +143,7 @@ FINAL = {
     "parameters": {"type": "object", "properties": {
         "not_found": {"type": "boolean", "description": "true if evidence is unavailable"},
         "clarification_needed": {"type": "boolean", "description": "true when the response asks the user a focused follow-up"},
-        "value": {"type": "number", "description": "numeric answer, exactly as returned by a tool"},
+        "value": {"type": "number", "description": "numeric answer, directly supported by evidence or calculated from it"},
         "unit": {"type": "string", "description": "e.g. count"},
         "text": {"type": "string", "description": "short non-numeric answer, e.g. Yes / No"},
         "cited_ids": {"type": "array", "items": {"type": "string"}},
@@ -253,6 +259,37 @@ def explanation_problem(explanation: str, value, n_citations: int) -> str | None
     return None
 
 
+def _verified_arithmetic(explanation: str, evidence_numbers: set[float], expected: float) -> bool:
+    """Accept a derived answer only when its written equation uses tool values and evaluates correctly."""
+    equation = re.compile(r"(?<![\w.])((?:\d+(?:\.\d+)?|\.\d+)(?:\s*[+*/-]\s*(?:\d+(?:\.\d+)?|\.\d+))+)\s*=\s*(-?(?:\d+(?:\.\d+)?|\.\d+))")
+
+    def calculate(node):
+        if isinstance(node, ast.Expression):
+            return calculate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left, right = calculate(node.left), calculate(node.right)
+            return {ast.Add: lambda: left + right, ast.Sub: lambda: left - right,
+                    ast.Mult: lambda: left * right, ast.Div: lambda: left / right}[type(node.op)]()
+        return math.nan
+
+    for match in equation.finditer(explanation):
+        expression, stated = match.groups()
+        operands = [float(number) for number in re.findall(r"(?:\d+(?:\.\d+)?|\.\d+)", expression)]
+        if not all(any(math.isclose(number, evidence, rel_tol=1e-9, abs_tol=1e-9)
+                       for evidence in evidence_numbers) for number in operands):
+            continue
+        try:
+            result = calculate(ast.parse(expression, mode="eval"))
+        except (SyntaxError, ZeroDivisionError):
+            continue
+        if math.isfinite(result) and math.isclose(result, float(stated), rel_tol=1e-6, abs_tol=1e-6) \
+                and math.isclose(result, float(expected), rel_tol=1e-6, abs_tol=1e-6):
+            return True
+    return False
+
+
 _YES = {"yes", "kyllä", "joo", "on", "ja", "jo"}
 _NO = {"no", "ei", "nej", "none", "not"}
 
@@ -270,7 +307,7 @@ def _fmt(v) -> str:
 
 
 def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanTools) -> Answer:
-    """Turn the model's final_answer into an Answer whose value and citations are backed by tool output."""
+    """Turn the model's final_answer into an Answer grounded in tool output."""
     graph = tools.graph
     explanation = str(final.get("explanation") or "").strip()
     # The UI marks the supporting boxes directly, so inline numeric citation markers add noise.
@@ -292,26 +329,39 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
         source = next((t for t in reversed(traces) if t.derived_from is not None and value in t.numbers), None) \
             or next((t for t in traces if t.template_answer is not None and value in t.numbers), None) \
             or next((t for t in traces if value in t.numbers), None)
-        if source is None:
-            log.warning("value %r not returned by any tool; numbers were %s", value, [t.numbers for t in traces])
+        if source is None and not any(t.numbers for t in traces):
+            log.warning("value %r has no numeric evidence in tool output", value)
             return Answer(answer=None, confidence="not_found", answered_by="llm",
                           explanation="The answer could not be verified against the drawing analysis.")
+        if source is None:
+            evidence_numbers = {float(n) for trace in traces for n in trace.numbers}
+            if not _verified_arithmetic(explanation, evidence_numbers, float(value)):
+                log.warning("derived value %r has no verifiable equation using tool values", value)
+                return Answer(answer=None, confidence="not_found", answered_by="llm",
+                              explanation="The answer could not be verified against the drawing analysis.")
+            if not cited:
+                cited = [tools.by_id[i] for t in traces for i in t.item_ids if i in tools.by_id]
         value = int(value) if float(value).is_integer() else value
         raw_confidence = "high" if graph.source == "svg" else "low"
-        if source.derived_from is not None:  # as reliable as its least reliable operand
+        if source is not None and source.derived_from is not None:  # as reliable as its least reliable operand
             parts = [t.template_answer.confidence if t.template_answer is not None else raw_confidence
                      for t in source.derived_from]
             confidence = min(parts, key=["not_found", "low", "medium", "high"].index, default="low")
             combined = {t.template_answer.template for t in source.derived_from if t.template_answer is not None}
             if not cited:
                 cited = [tools.by_id[i] for i in source.item_ids if i in tools.by_id]
-        elif source.template_answer is not None:
+        elif source is not None and source.template_answer is not None:
             template = source.template_answer.template
             confidence = source.template_answer.confidence
             if not cited:
                 cited = list(source.template_answer.citations)
+        elif source is None:
+            # The model calculated a derived value from numeric tool evidence. Keep this conservative.
+            confidence = "low"
         else:
             confidence = "high" if graph.source == "svg" else "low"  # raw items, not a calibrated count
+        if not cited:
+            cited = [tools.by_id[i] for t in traces for i in t.item_ids if i in tools.by_id]
         answer, unit = value, final.get("unit") or "count"
     else:
         answer, unit = str(final["text"]), None
@@ -337,6 +387,8 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
             template, confidence = basis.template, basis.confidence
             if not cited:
                 cited = list(basis.citations)
+        if not cited:
+            cited = [tools.by_id[i] for t in traces for i in t.item_ids if i in tools.by_id]
 
     routed = route(question)
     if routed and template != routed and routed not in combined and confidence in ("high", "medium"):
@@ -372,7 +424,10 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     history = history or []
     cache = _cache_path(question, graph, scale, geometry) if not history else None
     if use_cache and cache and cache.is_file():
-        return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
+        try:
+            return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            log.warning("invalid answer cache %s (%s); regenerating", cache.name, error)
     if not _take_budget():
         log.warning("Gemini hourly cap (%d) reached: falling back to the template answerer", GEMINI_MAX_PER_HOUR)
         return None
@@ -386,7 +441,12 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     try:
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(result.model_dump_json(), encoding="utf-8")
+            tmp = cache.with_name(f"{cache.name}.{uuid4().hex}.tmp")
+            try:
+                tmp.write_text(result.model_dump_json(), encoding="utf-8")
+                os.replace(tmp, cache)
+            finally:
+                tmp.unlink(missing_ok=True)
     except OSError:
         pass
     return result
