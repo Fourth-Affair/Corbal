@@ -100,7 +100,7 @@ evaluate() {
 for name in ${SWEEP:-A}; do
   # a rerun skips training a config whose weights exist (evaluation reruns: detections are cached)
   if [ "$name" = current ]; then
-    evaluate current "$ROOT/data/current/symbol-det.onnx"
+    evaluate current "$(ls "$ROOT"/data/current/symbol-det.pt "$ROOT"/data/current/symbol-det.onnx 2>/dev/null | head -1)"
     continue
   fi
   read -r base imgsz tile rot scale < <(preset "$name")

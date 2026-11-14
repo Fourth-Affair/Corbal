@@ -26,3 +26,4 @@ junction-dataset*.zip
 models/cubicasa-net.pkl
 models/sam2.1-tiny/
 !models/wallseg.pt
+!models/symbol-det.pt

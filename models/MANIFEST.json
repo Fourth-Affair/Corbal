@@ -1,19 +1,24 @@
 {
   "files": {
     "cubicasa-fusion.joblib": {
-      "sha256": "9589dad00974afcf47610eab143348f6b2ca9c32fc4640c0e7e6e98c2de538d7",
-      "bytes": 2782971,
-      "what": "per-template counting models, fit on train+val with det_* features; test 81.4% exact"
+      "sha256": "acf55e09962bfd2e5983d960d0779603754955e602b5447168c2c3451df8a986",
+      "bytes": 6828756,
+      "what": "per-template counting models, fit on train+val with det_* features of symbol-det.pt (preset B); test 81.8% exact"
     },
     "ocr_token_table.json": {
       "sha256": "f6f13149b5e9a599c50fd12708cfc397f94fd9645d00ce91eb99af6bedca0a9d",
       "bytes": 1767,
       "what": "OCR token -> room-type table"
     },
-    "symbol-det.onnx": {
-      "sha256": "c963f239d1d3acbfb767ac3fdf495109623e56d57ac9849d7162d1de7568333c",
-      "bytes": 38443506,
-      "what": "YOLO11s symbol detector, imgsz 1280; val mAP50 0.87"
+    "symbol-det.json": {
+      "sha256": "839f7da5adcb5047699a44f8575b858cad9b825977afdb0d42a1bb324972a36e",
+      "bytes": 738,
+      "what": "detector sidecar: imgsz 1600, tile 0 (read by symdet.weights_meta)"
+    },
+    "symbol-det.pt": {
+      "sha256": "555e1ef3ea6f4cf9cbbf94a39e5d624c19b25123c02ce14ff7e25a21b6d82921",
+      "bytes": 19291610,
+      "what": "YOLO11s symbol detector, sweep preset B: imgsz 1600, rot90 aug, 80 epochs; test recall door 0.957, window 0.917 (AP50 0.937 / 0.865)"
     },
     "wallseg.pt": {
       "sha256": "e54133e81b455663a5b0a18f0131d98edc8690fb0b5690a08205016f56a9ea8b",
