@@ -59,6 +59,16 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
       `Layer` response shape; cached per image and weights).
     - ground truth: `labels_from_svg.py`.
+  - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
+    `app/pdfplan/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
+    saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.
+  - `app/pdfplan/` — vector PDF plans, no vision. `text.py`: text runs with boxes (pdfium). `parse.py`: rooms from
+    centred "name / number / area" stacks and apartment tags ("Whg. A") in the PDF text; if a same-name `.dxf` sits
+    next to the PDF, room/apartment outlines and door / window / fixture symbols from it (layers matched by keyword,
+    FIXTURE outline + inner marks -> toilet/washbasin/bathtub/shower/kitchen/stairs), joined to the PDF through shared
+    texts with an affine fit. Without a DXF, symbol counts use the image detector on the rendered page (low
+    confidence) and apartment areas say not found. `answer.py`: EN/DE/FR/IT questions -> 12 templates.
+    `python -m app.pdfplan.eval [--prefix data/swiss_dwellings/] [--split eval] [--no-dxf]`.
   - `app/eval.py` — exact-match eval per template.
 - `frontend/` — Next.js 15 / React 19 / TypeScript. Calls backend via `BACKEND_URL`.
 - `compose.yaml` — runs both with hot reload; mounts `./dataset` at `/dataset`.
@@ -127,6 +137,14 @@ Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: 
 segmentation. The symbol detector (`symdet.py`) is trained; refitting the counting models with its `det_*`
 features is the next step. 197 of the 241 preview plans are in the official *train* split, so preview scores of
 the counting models are optimistic: report on the official test split.
+
+## Current PDF results (preview set; counts exact, areas within 2%)
+
+swiss_dwellings (65 plans / 2358 questions), rules designed on the even-indexed plans (sorted by path): dev 99.5%,
+held-out odd half **99.0%**. All counts, room labels and per-room areas are 100% on both halves; the misses are
+apartment / floor area totals 3–10% too high (unnamed numbered rooms counted as indoor). PDF only (`--no-dxf`):
+52.8% — room labels 100%, but many plans print no areas and symbol counts fall back to the CubiCasa-trained
+detector. All 71 preview PDFs (2644 questions, incl. IFC renders and drawing sets): 88.5%.
 
 ## Conventions
 

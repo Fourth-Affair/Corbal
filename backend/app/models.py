@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-Category = Literal["floor", "room", "door", "window", "fixture", "wall", "opening"]
+Category = Literal["floor", "room", "door", "window", "fixture", "wall", "opening", "unit"]  # unit = apartment
 
 # Canonical classes. Rooms: bedroom, bathroom, wc, sauna, kitchen, balcony, other.
 # Fixtures: toilet, sink, double_sink, shower, bathtub, sauna_stove, other.
@@ -12,7 +12,8 @@ Category = Literal["floor", "room", "door", "window", "fixture", "wall", "openin
 
 
 class PlanItem(BaseModel):
-    """One addressable thing on a plan. Coordinates are pixels of the challenge PNG, origin top-left."""
+    """One addressable thing on a plan. Coordinates: pixels of the PNG for image plans, PDF points of page 1 for
+    PDF plans (e.g. data/swiss_dwellings/*.pdf); origin top-left in both."""
 
     id: str
     category: Category
@@ -25,10 +26,10 @@ class PlanItem(BaseModel):
 
 
 class PlanGraph(BaseModel):
-    image: str  # dataset-relative path, e.g. data/cubicasa5k/colorful-10052.png
+    image: str  # dataset-relative path, e.g. data/cubicasa5k/colorful-10052.png (or uploads/<plan id>.pdf)
     width: int
     height: int
-    source: Literal["svg", "model"]  # svg = ground-truth labels, model = detector + OCR
+    source: Literal["svg", "model", "pdf"]  # svg = ground-truth labels, model = detector + OCR, pdf = vector PDF parser
     items: list[PlanItem] = Field(default_factory=list)
     # model source only: per-template counts from the fusion models (items are the supporting evidence)
     counts: dict[str, int] = Field(default_factory=dict)
