@@ -2,7 +2,8 @@ services:
   frontend:
     build:
       context: ./frontend
-    command: npm run dev
+    # Refresh the persistent node_modules volume after dependency changes.
+    command: sh -c "npm ci && npm run dev"
     environment:
       BACKEND_URL: http://backend:8000
       NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
