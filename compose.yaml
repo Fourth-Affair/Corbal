@@ -20,8 +20,15 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
+    environment:
+      DATASET_DIR: /dataset/junction-dataset
+      CUBICASA_ORIG_DIR: /dataset/cubicasa5k-original/cubicasa5k
+      CACHE_DIR: /dataset/cache
+      CUBICASA_WEIGHTS: /dataset/models/cubicasa-seg.pt
+      PLAN_SOURCE: ${PLAN_SOURCE:-model}
     volumes:
       - ./backend:/app
+      - ./dataset:/dataset
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s

@@ -15,3 +15,5 @@ __pycache__/
 !.env.example
 
 dataset/
+# Model weights
+*.pt
