@@ -18,13 +18,113 @@ type PlanCitation = {
   user_verified?: boolean;
 };
 type EvidenceItem = PlanCitation & { category: string; cls: string; text?: string | null; score?: number | null; raw?: string | null; user_verified?: boolean };
+type EvidenceDrag = { id: string; mode: "move" | "resize"; start: [number, number]; bbox: EvidenceItem["bbox"]; polygon: EvidenceItem["polygon"]; moved: boolean };
+type RoomEvidence = { source: string; type: string; weight: number; detail: string; item_id?: string | null };
+type RoomShape = {
+  id: string;
+  type: string;
+  // strong: a readable label or decisive fixtures; weak: only weak evidence or a conflict; unknown: no evidence
+  tier: "strong" | "weak" | "unknown";
+  purposes: string[];
+  evidence: RoomEvidence[];
+  conflicts: string[];
+  name?: string | null;
+  polygon: Array<[number, number]>;
+  bbox: [number, number, number, number];
+  area_m2?: number | null;
+  labeled_area_m2?: number | null;
+  area_m2_range?: [number, number] | null; // rough, from door / fixture sizes
+  size_check?: string | null;
+};
+type WallSegment = {
+  id: string;
+  p0: [number, number];
+  p1: [number, number];
+  length_px: number;
+  thickness_px: number;
+  exterior: boolean;
+  length_m?: number | null;
+  thickness_m?: number | null;
+};
+type PlanGeometry = {
+  width: number;
+  height: number;
+  model: string;
+  rooms: RoomShape[];
+  wall_segments: WallSegment[];
+  scale?: { m_per_px: number; source: "calibration" | "written_areas" } | null;
+};
+
+function roomWhy(room: RoomShape): string {
+  const reasons = room.evidence.filter(e => e.type === room.type && e.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3).map(e => e.detail);
+  const conflict = room.conflicts.length ? ` · conflicting evidence: ${room.conflicts.join(", ")}` : "";
+  const size = room.size_check ? ` · size: ${room.size_check}` : "";
+  const rough = room.area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
+  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + rough;
+}
+
+// One colour per purpose; weak rooms are dashed, unknown spaces grey and dashed
+const ROOM_COLOURS: Record<string, string> = {
+  bedroom: "#5b8def", living: "#e0a43b", kitchen: "#e0613b", bathroom: "#3bb3c9", wc: "#3b8fc9", sauna: "#c9733b",
+  balcony: "#6dbb5f", terrace: "#6dbb5f", entry: "#9b8bd6", closet: "#b07fc0", storage: "#a0a0a0", utility: "#5fb3a0",
+  dining: "#d6b13b", study: "#7f9bc0", technical: "#8a8a8a", garage: "#8a8a8a", stairs: "#b0906a", basement: "#8a8a8a",
+};
+
+function roomCaption(room: RoomShape): string {
+  const area = room.area_m2 ?? room.labeled_area_m2;
+  const what = room.purposes.length > 1 ? room.purposes.join(" + ") : room.type;
+  if (area != null) return `${what} · ${area.toFixed(1)} m²`;
+  if (room.area_m2_range) return `${what} · ~${Math.round(room.area_m2_range[0])}–${Math.round(room.area_m2_range[1])} m²`;
+  return what;
+}
+
 type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };
-type FloorOutline = { id: string; polygon: Array<[number, number]>; score?: number | null; scope?: "floor" | "room"; room_type?: string | null; label?: string };
+type FloorOutline = { id: string; polygon: Array<[number, number]>; score?: number | null; scope?: "floor" | "room"; room_type?: string | null; label?: string; decision?: "accepted" | "rejected" | null };
 const itemTypes: Record<string, string[]> = {
-  room: ["bedroom", "bathroom", "wc", "sauna", "kitchen", "balcony", "other"],
+  room: ["bedroom", "bathroom", "wc", "sauna", "kitchen", "living", "balcony", "entry", "storage", "garage", "other"],
   fixture: ["toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench", "other"],
   door: ["door"], window: ["window"],
 };
+
+function itemLabel(item: Pick<EvidenceItem, "category" | "cls" | "text">) {
+  const type = item.cls?.replaceAll("_", " ").trim();
+  if (item.category === "room") return type || item.text || "Room";
+  return type || item.category;
+}
+
+function outlineBounds(outline: FloorOutline): EvidenceItem["bbox"] {
+  const xs = outline.polygon.map(([x]) => x);
+  const ys = outline.polygon.map(([, y]) => y);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+function roomBoundaryLinks(items: EvidenceItem[], outlines: FloorOutline[]) {
+  const links: Record<string, string> = {};
+  for (const item of items) {
+    if (item.category !== "room" || item.raw === "ocr") continue;
+    const typed = outlines.filter(outline => outline.scope === "room" && outline.room_type === item.cls);
+    const candidates = typed.length ? typed : outlines.filter(outline => outline.scope === "room");
+    const [ax0, ay0, ax1, ay1] = item.bbox;
+    const best = candidates.map(outline => {
+      const [bx0, by0, bx1, by1] = outlineBounds(outline);
+      const overlap = Math.max(0, Math.min(ax1, bx1) - Math.max(ax0, bx0)) * Math.max(0, Math.min(ay1, by1) - Math.max(ay0, by0));
+      const union = (ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - overlap;
+      return { outline, score: union > 0 ? overlap / union : 0 };
+    }).sort((a, b) => b.score - a.score)[0];
+    if (best && best.score > 0.25) links[item.id] = best.outline.id;
+  }
+  return links;
+}
+
+function linkRoomBoundaries(items: EvidenceItem[], outlines: FloorOutline[]) {
+  const links = roomBoundaryLinks(items, outlines);
+  return items.map(item => {
+    const matched = outlines.find(outline => outline.id === links[item.id]);
+    return matched
+      ? { ...item, bbox: outlineBounds(matched), polygon: matched.polygon }
+      : item;
+  });
+}
 
 export default function PlanPage({ params }: { params: Promise<{ planId: string }> }) {
   const [planId, setPlanId] = useState("");
@@ -56,6 +156,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [outlinePoints, setOutlinePoints] = useState<Array<[number, number]>>([]);
   const [outlineCandidateIndex, setOutlineCandidateIndex] = useState(0);
   const [manualOutlineTarget, setManualOutlineTarget] = useState<FloorOutline | null>(null);
+  const [editingOutlineId, setEditingOutlineId] = useState<string | null>(null);
   const [addOutlinePointMode, setAddOutlinePointMode] = useState(false);
   const [draggingOutlinePoint, setDraggingOutlinePoint] = useState<number | null>(null);
   const [outlineSaving, setOutlineSaving] = useState(false);
@@ -68,6 +169,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [correctionAddMode, setCorrectionAddMode] = useState(false);
   const [correctionAddPoints, setCorrectionAddPoints] = useState<Array<[number, number]>>([]);
   const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | null>(null);
+  const [draggingEvidence, setDraggingEvidence] = useState<EvidenceDrag | null>(null);
   const [editCategory, setEditCategory] = useState("room");
   const [editClass, setEditClass] = useState("bedroom");
   const [addCategory, setAddCategory] = useState("room");
@@ -75,7 +177,31 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [correctionSaving, setCorrectionSaving] = useState(false);
   const [correctionError, setCorrectionError] = useState<string | null>(null);
   const [feedbackError, setFeedbackError] = useState<string | null>(null);
+  const [geometry, setGeometry] = useState<PlanGeometry | null>(null);
+  const [geometryError, setGeometryError] = useState<string | null>(null);
+  const [showRooms, setShowRooms] = useState(true);
+  const [showUncertain, setShowUncertain] = useState(false);
+  const [showWalls, setShowWalls] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const roomBoundaryLinkRef = useRef<Record<string, string>>({});
+  const evidenceItemsRef = useRef<EvidenceItem[]>([]);
+
+  // Room geometry once the analysis is ready; refetched when the scale changes (areas in m² depend on it)
+  useEffect(() => {
+    if (!ready || !planId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/geometry`, { cache: "no-store" });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || "Rooms could not be loaded");
+        if (!cancelled) { setGeometry(body); setGeometryError(null); }
+      } catch (geometryLoadError) {
+        if (!cancelled) setGeometryError(geometryLoadError instanceof Error ? geometryLoadError.message : "Rooms could not be loaded");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [ready, planId, scale]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -142,12 +268,15 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             if (!cancelled) {
               if (result.width && result.height) setImageSize({ width: result.width, height: result.height });
               setEvidenceItems(Array.isArray(result.items) ? result.items : []);
+              evidenceItemsRef.current = Array.isArray(result.items) ? result.items : [];
               setFloorOutlines(Array.isArray(result.floor_outlines) ? result.floor_outlines : []);
               try {
                 const correctionResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/corrections`, { cache: "no-store" });
                 if (correctionResponse.ok) {
                   const corrections = await correctionResponse.json();
-                  setEvidenceItems(Array.isArray(corrections.items) ? corrections.items : result.items ?? []);
+                  const correctedItems = Array.isArray(corrections.items) ? corrections.items : result.items ?? [];
+                  setEvidenceItems(correctedItems);
+                  evidenceItemsRef.current = correctedItems;
                   setCorrectionEvents(Array.isArray(corrections.events) ? corrections.events : []);
                 }
               } catch { /* Keep the plan usable if correction history is temporarily unavailable. */ }
@@ -155,8 +284,14 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 const outlineResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/outline`, { cache: "no-store" });
                 if (outlineResponse.ok) {
                   const outlineData = await outlineResponse.json();
-                  setFloorOutlines(Array.isArray(outlineData.candidates) ? outlineData.candidates : []);
-                  setSavedOutlines(Array.isArray(outlineData.saved) ? outlineData.saved : []);
+                  const candidates = Array.isArray(outlineData.candidates) ? outlineData.candidates : [];
+                  const saved = Array.isArray(outlineData.saved) ? outlineData.saved.map((outline: FloorOutline) => ({ ...outline, decision: outline.decision ?? "accepted" })) : [];
+                  setFloorOutlines(candidates);
+                  setSavedOutlines(saved);
+                  roomBoundaryLinkRef.current = roomBoundaryLinks(evidenceItemsRef.current, [...candidates, ...saved]);
+                  const linkedItems = linkRoomBoundaries(evidenceItemsRef.current, [...candidates, ...saved]);
+                  evidenceItemsRef.current = linkedItems;
+                  setEvidenceItems(linkedItems);
                 }
               } catch { /* Keep the scanned plan usable if saved outlines are temporarily unavailable. */ }
               setAnalysisStatus("Floor plan ready");
@@ -190,8 +325,40 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not save correction");
-      setEvidenceItems(result.items ?? []);
+      const updatedItems = result.items ?? [];
+      setEvidenceItems(updatedItems);
+      evidenceItemsRef.current = updatedItems;
       setCorrectionEvents(result.events ?? []);
+      if (action === "update" && item?.category === "room") {
+        const linkedOutlines = getAllRoomOutlines();
+        const linkedId = itemId ? roomBoundaryLinkRef.current[itemId] : undefined;
+        const linkedOutline = linkedOutlines.find(outline => outline.id === linkedId);
+        const source = evidenceItems.find(existing => existing.id === itemId);
+        const matched = linkedOutline ? { outline: linkedOutline, score: 1 } : source && linkedOutlines.map(outline => {
+          const [ax0, ay0, ax1, ay1] = source.bbox;
+          const [bx0, by0, bx1, by1] = outlineBounds(outline);
+          const overlap = Math.max(0, Math.min(ax1, bx1) - Math.max(ax0, bx0)) * Math.max(0, Math.min(ay1, by1) - Math.max(ay0, by0));
+          const union = (ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - overlap;
+          return { outline, score: union > 0 ? overlap / union : 0 };
+        }).sort((a, b) => b.score - a.score)[0];
+        if (matched && matched.score > 0.25) {
+          const geometry = item.polygon?.length ? item.polygon : matched.outline.polygon;
+          const bounds = item.polygon?.length ? item.bbox as EvidenceItem["bbox"] : outlineBounds(matched.outline);
+          const roomType = item.cls ?? "room";
+          const updatedOutline = { ...matched.outline, room_type: roomType, label: roomType.replaceAll("_", " "), polygon: geometry, decision: "accepted" as const };
+          const next = [...savedOutlines.filter(outline => outline.id !== updatedOutline.id), updatedOutline];
+          const outlineResponse = await fetch(`/api/plans/${encodeURIComponent(planId)}/outline`, {
+            method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ outlines: next }),
+          });
+          const outlineResult = await outlineResponse.json();
+          if (!outlineResponse.ok) throw new Error(outlineResult.detail || "Room type saved, but its boundary could not be updated");
+          setSavedOutlines(outlineResult.saved ?? next);
+          setFloorOutlines(current => current.map(outline => outline.id === updatedOutline.id ? updatedOutline : outline));
+          if (itemId) roomBoundaryLinkRef.current[itemId] = updatedOutline.id;
+          setEvidenceItems(current => current.map(candidate => candidate.id === itemId ? { ...candidate, bbox: bounds, polygon: geometry } : candidate));
+          evidenceItemsRef.current = evidenceItemsRef.current.map(candidate => candidate.id === itemId ? { ...candidate, bbox: bounds, polygon: geometry } : candidate);
+        }
+      }
       setCorrectionAddMode(false);
       setCorrectionAddPoints([]);
       if (action === "add") setSelectedEvidenceId(null);
@@ -234,6 +401,12 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setMeasureMode(false);
   }
 
+  function getAllRoomOutlines() {
+    const byId = new Map([...floorOutlines, ...savedOutlines].filter(outline => outline.scope === "room").map(outline => [outline.id, outline]));
+    for (const outline of savedOutlines.filter(item => item.scope === "room")) byId.set(outline.id, outline);
+    return [...byId.values()];
+  }
+
   async function submitQuestion(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const submitted = question.trim();
@@ -273,7 +446,6 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         startScaleCalibration();
       } else if (needsOutline) {
         setPendingAreaQuestion(submitted);
-        startOutlineReview(submitted);
       } else if (needsMeasurement) {
         setMeasurementRequested(true);
       }
@@ -316,38 +488,61 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     const normalized = text.toLowerCase();
     const rooms = [
       { roomType: "kitchen", label: "Kitchen", terms: ["kitchen"] },
-      { roomType: "bathroom", label: "Bathroom", terms: ["bathroom", "bath"] },
+      { roomType: "bathroom", label: "Bathroom", terms: ["bathroom", "washroom", "bath"] },
       { roomType: "bedroom", label: "Bedroom", terms: ["bedroom", "bed room"] },
-      { roomType: "living", label: "Living room", terms: ["living room", "living area"] },
+      { roomType: "living", label: "Living room", terms: ["living room", "livingroom", "living area"] },
       { roomType: "balcony", label: "Balcony", terms: ["balcony"] },
       { roomType: "entry", label: "Entry", terms: ["entry", "hallway"] },
       { roomType: "storage", label: "Storage", terms: ["storage"] },
       { roomType: "garage", label: "Garage", terms: ["garage"] },
+      { roomType: "wc", label: "WC", terms: ["wc", "toilet room"] },
+      { roomType: "sauna", label: "Sauna", terms: ["sauna"] },
     ];
     return rooms.find(room => room.terms.some(term => normalized.includes(term))) ?? null;
   }
 
   function hasRequiredOutline(text: string) {
     const targetRoom = getRequestedRoomType(text);
+    const candidates = getReviewOutlines(text);
+    if (targetRoom && candidates.length) {
+      return candidates.every(outline => outline.decision === "accepted" || outline.decision === "rejected") &&
+        candidates.some(outline => outline.decision === "accepted");
+    }
     return targetRoom
-      ? savedOutlines.some(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
-      : savedOutlines.some(outline => outline.scope !== "room");
+      ? savedOutlines.some(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType && outline.decision !== "rejected")
+      : savedOutlines.some(outline => outline.scope !== "room" && outline.decision !== "rejected");
   }
 
-  function startOutlineReview(questionText?: string) {
+  function getReviewOutlines(questionText?: string) {
     const targetRoom = questionText ? getRequestedRoomType(questionText) : null;
-    const requestedOutlineIndex = targetRoom
-      ? floorOutlines.findIndex(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
-      : floorOutlines.findIndex(outline => outline.scope !== "room");
-    const savedTarget = targetRoom
-      ? savedOutlines.find(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
-      : savedOutlines.find(outline => outline.scope !== "room");
+    const eligible = targetRoom
+      ? floorOutlines.filter(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
+      : floorOutlines.filter(outline => outline.scope !== "room");
+    const byId = new Map(eligible.map(outline => [outline.id, outline]));
+    for (const outline of savedOutlines) {
+      if ((!targetRoom && outline.scope !== "room") || (targetRoom && outline.scope === "room" && outline.room_type === targetRoom.roomType)) {
+        byId.set(outline.id, outline);
+      }
+    }
+    return [...byId.values()];
+  }
+
+  function startOutlineReview(questionText?: string, outlineId?: string) {
+    const targetRoom = questionText ? getRequestedRoomType(questionText) : null;
+    const candidates = getReviewOutlines(questionText);
+    const requestedOutlineIndex = outlineId ? floorOutlines.findIndex(outline => outline.id === outlineId) :
+      targetRoom
+        ? floorOutlines.findIndex(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType)
+        : floorOutlines.findIndex(outline => outline.scope !== "room");
     const index = requestedOutlineIndex >= 0 ? requestedOutlineIndex : Math.max(0, outlineCandidateIndex);
-    const suggestion = requestedOutlineIndex >= 0 ? floorOutlines[index] : null;
+    const savedTarget = outlineId ? savedOutlines.find(outline => outline.id === outlineId) :
+      candidates.find(outline => outline.decision !== "rejected") ?? null;
+    const suggestion = outlineId ? floorOutlines.find(outline => outline.id === outlineId) : requestedOutlineIndex >= 0 ? floorOutlines[index] : null;
     const manualTarget = savedTarget ?? suggestion ?? (targetRoom
       ? { id: `room-${targetRoom.roomType}-user`, polygon: [], scope: "room" as const, room_type: targetRoom.roomType, label: targetRoom.label }
       : savedOutlines[0] ?? floorOutlines[index] ?? { id: "floor-user", polygon: [], scope: "floor" as const, label: "Whole floor" });
     setManualOutlineTarget(manualTarget);
+    setEditingOutlineId(manualTarget.id);
     setOutlineCandidateIndex(index);
     setOutlinePoints((manualTarget.polygon ?? []).map(([x, y]) => [x, y]));
     setOutlineMode(true);
@@ -357,15 +552,97 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setOutlineError(null);
   }
 
-  function planPoint(event: React.MouseEvent<SVGSVGElement> | React.PointerEvent<SVGSVGElement>): [number, number] | null {
+  async function saveOutlineDecision(outline: FloorOutline, decision: "accepted" | "rejected") {
+    if (!planId) return;
+    setOutlineError(null);
+    setOutlineSaving(true);
+    const updated = { ...outline, decision };
+    const next = [...savedOutlines.filter(item => item.id !== outline.id), updated];
+    try {
+      const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/outline`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ outlines: next }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Could not save the room review");
+      const saved = result.saved ?? next;
+      setSavedOutlines(saved);
+      if (pendingAreaQuestion) {
+        const reviewed = getReviewOutlines(pendingAreaQuestion).map(item => saved.find((entry: FloorOutline) => entry.id === item.id) ?? item);
+        if (reviewed.length > 0 && reviewed.every(item => item.decision === "accepted" || item.decision === "rejected") && reviewed.some(item => item.decision === "accepted")) {
+          const accepted = reviewed.filter(item => item.decision === "accepted");
+          const areas = accepted.map(item => areaM2(item.polygon));
+          if (areas.every((area): area is number => area !== null)) {
+            const details = accepted.map((item, index) => `${item.label ?? "Room"} ${index + 1}: ${areas[index].toFixed(1)} m²`);
+            const total = areas.reduce((sum, area) => sum + area, 0);
+            setMessages(current => [...current, { role: "assistant", text: `${details.join("; ")}. Total: ${total.toFixed(1)} m².` }]);
+            setPendingAreaQuestion(null);
+          }
+        }
+      }
+    } catch (error) {
+      setOutlineError(error instanceof Error ? error.message : "Could not save the room review");
+    } finally { setOutlineSaving(false); }
+  }
+
+  function planPoint(event: React.MouseEvent<SVGGraphicsElement> | React.PointerEvent<SVGGraphicsElement> | React.PointerEvent<SVGSVGElement>): [number, number] | null {
     if (!imageSize) return null;
-    const transform = event.currentTarget.getScreenCTM();
+    const svg = event.currentTarget instanceof SVGSVGElement ? event.currentTarget : event.currentTarget.ownerSVGElement;
+    const transform = svg?.getScreenCTM();
     if (!transform) return null;
-    const point = event.currentTarget.createSVGPoint();
+    const point = svg!.createSVGPoint();
     point.x = event.clientX;
     point.y = event.clientY;
     const mapped = point.matrixTransform(transform.inverse());
     return [Math.max(0, Math.min(imageSize.width, mapped.x)), Math.max(0, Math.min(imageSize.height, mapped.y))];
+  }
+
+  function beginEvidenceDrag(event: React.PointerEvent<SVGGraphicsElement>, item: EvidenceItem, mode: EvidenceDrag["mode"]) {
+    if (!correctionMode || !imageSize) return;
+    event.stopPropagation();
+    event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId);
+    const start = planPoint(event);
+    if (!start) return;
+    beginCorrection(item);
+    setDraggingEvidence({ id: item.id, mode, start, bbox: item.bbox, polygon: item.polygon, moved: false });
+  }
+
+  function evidenceGeometry(drag: EvidenceDrag, point: [number, number]) {
+    if (!imageSize) return null;
+    const [x0, y0, x1, y1] = drag.bbox;
+    let bbox: EvidenceItem["bbox"];
+    if (drag.mode === "move") {
+      const dx = Math.max(-x0, Math.min(imageSize.width - x1, point[0] - drag.start[0]));
+      const dy = Math.max(-y0, Math.min(imageSize.height - y1, point[1] - drag.start[1]));
+      bbox = [x0 + dx, y0 + dy, x1 + dx, y1 + dy];
+    } else {
+      bbox = [x0, y0, Math.max(x0 + 8, Math.min(imageSize.width, point[0])), Math.max(y0 + 8, Math.min(imageSize.height, point[1]))];
+    }
+    const polygon = drag.polygon?.map(([x, y]) => drag.mode === "move"
+      ? [x + bbox[0] - x0, y + bbox[1] - y0] as [number, number]
+      : [bbox[0] + (x - x0) * (bbox[2] - bbox[0]) / Math.max(1, x1 - x0), bbox[1] + (y - y0) * (bbox[3] - bbox[1]) / Math.max(1, y1 - y0)] as [number, number]);
+    return { bbox, polygon };
+  }
+
+  function moveEvidenceBox(event: React.PointerEvent<SVGSVGElement>) {
+    if (!draggingEvidence) return;
+    const point = planPoint(event);
+    if (!point) return;
+    const moved = draggingEvidence.moved || Math.hypot(point[0] - draggingEvidence.start[0], point[1] - draggingEvidence.start[1]) > 2;
+    if (moved && !draggingEvidence.moved) setDraggingEvidence(current => current ? { ...current, moved: true } : null);
+    const geometry = evidenceGeometry(draggingEvidence, point);
+    if (geometry) setEvidenceItems(current => current.map(item => item.id === draggingEvidence.id ? { ...item, ...geometry, user_verified: true } : item));
+  }
+
+  function finishEvidenceBox(event: React.PointerEvent<SVGSVGElement>) {
+    if (!draggingEvidence) return;
+    const drag = draggingEvidence;
+    const point = planPoint(event);
+    const geometry = point ? evidenceGeometry(drag, point) : null;
+    setDraggingEvidence(null);
+    if (!drag.moved || !geometry) return;
+    const item = evidenceItems.find(candidate => candidate.id === drag.id);
+    if (item) void saveCorrection("update", drag.id, { ...item, ...geometry });
   }
 
   function handlePlanClick(event: React.MouseEvent<SVGSVGElement>) {
@@ -389,7 +666,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       }
       return;
     }
-    if (correctionMode) return;
+    if (correctionMode && !outlineMode) return;
     if (outlineMode) {
       if (addOutlinePointMode) {
         const point = planPoint(event);
@@ -409,24 +686,40 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     try {
       const target = manualOutlineTarget ?? floorOutlines[outlineCandidateIndex];
       const outline = {
-        id: target?.id ?? "floor-user",
+        id: target?.id ?? editingOutlineId ?? "floor-user",
         polygon: outlinePoints,
         scope: target?.scope ?? "floor",
         room_type: target?.room_type ?? null,
         label: target?.label ?? "Whole floor",
+        decision: "accepted" as const,
       };
+      const next = [...savedOutlines.filter(item => item.id !== outline.id), outline];
       const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/outline`, {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ outlines: [outline] }),
+        body: JSON.stringify({ outlines: next }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not save the floor outline");
-      setSavedOutlines(result.saved ?? [outline]);
+      setSavedOutlines(result.saved ?? next);
       setOutlineMode(false);
-      const estimatedArea = areaM2(outlinePoints);
-      if (pendingAreaQuestion && estimatedArea !== null) {
-        setMessages(current => [...current, { role: "assistant", text: `Estimated ${outline.label.toLowerCase()} area: ${estimatedArea.toFixed(1)} m². This uses the scale and the outline you accepted; check the highlighted boundary before relying on it.` }]);
-        setPendingAreaQuestion(null);
+      setEditingOutlineId(null);
+      if (outline.scope === "room") {
+        const [x0, y0, x1, y1] = outlineBounds(outline);
+        const linkedEvidenceId = Object.entries(roomBoundaryLinkRef.current).find(([, outlineId]) => outlineId === outline.id)?.[0];
+        const linkedEvidence = evidenceItems.find(item => item.id === linkedEvidenceId);
+        const matchedRoom = linkedEvidence ? { item: linkedEvidence, score: 1 } : evidenceItems.filter(item => item.category === "room" && item.raw !== "ocr").map(item => {
+          const [ax0, ay0, ax1, ay1] = item.bbox;
+          const overlap = Math.max(0, Math.min(ax1, x1) - Math.max(ax0, x0)) * Math.max(0, Math.min(ay1, y1) - Math.max(ay0, y0));
+          const union = (ax1 - ax0) * (ay1 - ay0) + (x1 - x0) * (y1 - y0) - overlap;
+          return { item, score: union > 0 ? overlap / union : 0 };
+        }).sort((a, b) => b.score - a.score)[0];
+        if (matchedRoom && matchedRoom.score > 0.25) {
+          void saveCorrection("update", matchedRoom.item.id, {
+            ...matchedRoom.item, category: "room", cls: outline.room_type ?? matchedRoom.item.cls,
+            bbox: outlineBounds(outline), polygon: outline.polygon,
+          });
+          roomBoundaryLinkRef.current[matchedRoom.item.id] = outline.id;
+        }
       }
     } catch (saveError) {
       setOutlineError(saveError instanceof Error ? saveError.message : "Could not save the floor outline");
@@ -444,6 +737,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       setSavedOutlines([]);
       setOutlinePoints([]);
       setOutlineMode(false);
+      setEditingOutlineId(null);
       setPendingAreaQuestion(null);
     } catch (removeError) {
       setOutlineError(removeError instanceof Error ? removeError.message : "Could not remove the outline");
@@ -488,7 +782,6 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       setScalePoints(result.points);
       setScaleDistance(String(result.distance));
       setScaleUnit(result.unit);
-      if (pendingAreaQuestion) startOutlineReview(pendingAreaQuestion);
     } catch (saveError) {
       setScaleError(saveError instanceof Error ? saveError.message : "Could not save scale");
     } finally { setScaleSaving(false); }
@@ -510,7 +803,17 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     }, 0)) / 2;
     return pixelArea * metersPerPixel * metersPerPixel;
   };
-  const acceptedArea = savedOutlines.reduce((sum, outline) => sum + (areaM2(outline.polygon) ?? 0), 0);
+  const acceptedArea = savedOutlines.filter(outline => outline.decision !== "rejected")
+    .reduce((sum, outline) => sum + (areaM2(outline.polygon) ?? 0), 0);
+  const displayOutlines = pendingAreaQuestion
+    ? getReviewOutlines(pendingAreaQuestion).filter(outline => outline.decision !== "rejected")
+    : correctionMode ? getAllRoomOutlines().filter(outline => outline.decision !== "rejected")
+      : savedOutlines.filter(outline => outline.decision !== "rejected");
+  const reviewedOutlines = pendingAreaQuestion ? getReviewOutlines(pendingAreaQuestion) : [];
+  const reviewedAccepted = reviewedOutlines.filter(outline => outline.decision === "accepted");
+  const reviewedAcceptedArea = reviewedAccepted.reduce((sum, outline) => sum + (areaM2(outline.polygon) ?? 0), 0);
+  const outlineLabelPoint = (polygon: Array<[number, number]>): [number, number] => polygon.reduce(
+    ([sumX, sumY], [x, y]) => [sumX + x / polygon.length, sumY + y / polygon.length], [0, 0] as [number, number]);
   const selectedEvidence = evidenceItems.find(item => item.id === selectedEvidenceId) ?? null;
 
   const imageStatus = plan?.plan_images?.find(image => image.role === "source")?.upload_status;
@@ -522,6 +825,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
+          {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose type is backed by a readable label or decisive fixtures">Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>}
+          {geometry && showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button className={`toolbar-button${showUncertain ? " is-on" : ""}`} type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)} title="Spaces whose type is only a weak guess (dashed) or unknown (grey)">Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
+          {geometry && geometry.wall_segments.length > 0 && <button className={`toolbar-button${showWalls ? " is-on" : ""}`} type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)} title="Wall centrelines: exterior walls thick">Walls ({geometry.wall_segments.length})</button>}
+          {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
           {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
           {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
@@ -536,37 +843,97 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       <div className="work-area">
         <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
-            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerMove={event => { if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={() => { setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerMove={event => { if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
               {correctionMode && evidenceItems.map(item => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 return <g className={`correction-mark${selectedEvidenceId === item.id ? " selected" : ""}${item.user_verified ? " user-corrected" : ""}`} key={item.id} onClick={event => { event.stopPropagation(); beginCorrection(item); }} role="button" aria-label={`${item.category} ${item.cls}`}>
-                  {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(2, x1 - x0)} height={Math.max(2, y1 - y0)} />}
+                  {points ? <polygon points={points} onPointerDown={event => beginEvidenceDrag(event, item, "move")} /> : <rect x={x0} y={y0} width={Math.max(2, x1 - x0)} height={Math.max(2, y1 - y0)} onPointerDown={event => beginEvidenceDrag(event, item, "move")} />}
+                  {selectedEvidenceId === item.id && <rect className="correction-resize-handle" x={x1 - 9} y={y1 - 9} width="18" height="18" rx="3" onPointerDown={event => beginEvidenceDrag(event, item, "resize")} onClick={event => event.stopPropagation()} aria-label="Resize selected box" />}
                 </g>;
               })}
+              {geometry && showRooms && <g className="room-layer">
+                {geometry.rooms.filter(room => room.tier === "strong" || showUncertain).map(room => {
+                  const colour = room.tier === "unknown" ? "#7a8a80" : (ROOM_COLOURS[room.type] ?? "#7a8a80");
+                  const [x0, y0, x1, y1] = room.bbox;
+                  const fontSize = Math.max(11, Math.min(imageSize.width, imageSize.height) / 45);
+                  const caption = room.tier === "strong" ? roomCaption(room) : room.tier === "weak" ? `${room.type}?` : "?";
+                  const tooltip = room.tier === "unknown" ? "Space with unknown purpose" : `${room.tier === "weak" ? "Probably " : ""}${room.name ?? room.type}: ${roomCaption(room)} (${roomWhy(room)})`;
+                  return <g key={room.id} className={`room-shape ${room.tier}`}>
+                    <polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.tier === "unknown" ? "none" : colour }}>
+                      <title>{tooltip}</title>
+                    </polygon>
+                    <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{caption}</text>
+                  </g>;
+                })}
+              </g>}
+              {geometry && showWalls && <g className="wall-layer">
+                {geometry.wall_segments.map(segment => <line key={segment.id} className={segment.exterior ? "exterior" : "interior"} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]}>
+                  <title>{`${segment.exterior ? "Exterior" : "Interior"} wall · ${segment.length_m != null ? `${segment.length_m.toFixed(2)} m long, ${((segment.thickness_m ?? 0) * 100).toFixed(0)} cm thick` : `${Math.round(segment.length_px)} px long, ${Math.round(segment.thickness_px)} px thick`}`}</title>
+                </line>)}
+              </g>}
               {citations.map((item, index) => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
+                const fullItem = evidenceItems.find(candidate => candidate.id === item.id);
+                const label = fullItem ? itemLabel(fullItem) : item.raw?.replaceAll("_", " ") || "Evidence";
+                const labelWidth = Math.max(62, Math.min(190, label.length * 10 + 22));
+                const labelX = Math.max(labelWidth / 2 + 3, Math.min(imageSize?.width ?? x0, (x0 + x1) / 2));
+                const labelY = Math.max(18, Math.min(imageSize?.height ?? y0, (y0 + y1) / 2));
                 return <g className={`citation-mark${item.user_verified ? " user-corrected" : ""}`} key={`${item.id}-${index}`}>
                   {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(1, x1 - x0)} height={Math.max(1, y1 - y0)} />}
-                  <circle cx={x0} cy={y0} r="18" /><text x={x0} y={y0}>{index + 1}</text>
+                  <g className="citation-label" aria-label={label}>
+                    <rect x={labelX - labelWidth / 2} y={labelY - 15} width={labelWidth} height="30" rx="8" />
+                    <text x={labelX} y={labelY + 1}>{label.length > 22 ? `${label.slice(0, 20)}…` : label}</text>
+                    <title>{`${label}${index + 1 ? ` · citation ${index + 1}` : ""}`}</title>
+                  </g>
                 </g>;
               })}
               {scaleMode && scalePoints.length > 0 && <g className="scale-mark"><line x1={scalePoints[0][0]} y1={scalePoints[0][1]} x2={(scalePoints[1] ?? scalePoints[0])[0]} y2={(scalePoints[1] ?? scalePoints[0])[1]} />{scalePoints.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measurePoints.length > 0 && <g className="scale-mark measurement-mark"><line x1={measurePoints[0][0]} y1={measurePoints[0][1]} x2={(measurePoints[1] ?? measurePoints[0])[0]} y2={(measurePoints[1] ?? measurePoints[0])[1]} />{measurePoints.map(([x, y], index) => <g className="measurement-handle" key={index} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingMeasurePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingMeasurePoint(null); }} onClick={event => event.stopPropagation()}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measuredDistance !== null && measurePoints.length === 2 && <g className="measurement-label" pointerEvents="none"><rect x={(measurePoints[0][0] + measurePoints[1][0]) / 2 - Math.max(52, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 7)} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 - 15} width={Math.max(104, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 14)} height="30" rx="7"/><text x={(measurePoints[0][0] + measurePoints[1][0]) / 2} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 + 5}>{measuredDistance.toFixed(2)} {scale?.unit}</text></g>}
-              {(outlineMode ? outlinePoints : savedOutlines[0]?.polygon ?? []).length >= 3 && <g className="floor-outline-mark"><polygon points={(outlineMode ? outlinePoints : savedOutlines[0].polygon).map(([x, y]) => `${x},${y}`).join(" ")} />{outlineMode && outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
+              {displayOutlines.map((outline, index) => {
+                const editing = outlineMode && outline.id === editingOutlineId;
+                const polygon = editing ? outlinePoints : outline.polygon;
+                if (polygon.length < 3) return null;
+                const [labelX, labelY] = outlineLabelPoint(polygon);
+                const area = areaM2(polygon);
+                const label = area !== null ? `${area.toFixed(1)} m²` : `${outline.label ?? `Room ${index + 1}`} · scale needed`;
+                const width = Math.max(104, label.length * 12);
+                return <g className={`floor-outline-mark${outline.decision === "accepted" ? " accepted" : ""}${editing ? " editing" : ""}`} key={outline.id}>
+                  <polygon points={polygon.map(([x, y]) => `${x},${y}`).join(" ")} />
+                  <g className="room-outline-label" pointerEvents="none"><rect x={labelX - width / 2} y={labelY - 18} width={width} height="36" rx="8"/><text x={labelX} y={labelY + 1}>{label}</text></g>
+                  {editing && outlinePoints.map(([x, y], pointIndex) => <circle key={pointIndex} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(pointIndex); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}
+                </g>;
+              })}
+              {outlineMode && outlinePoints.length >= 3 && !displayOutlines.some(outline => outline.id === editingOutlineId) && <g className="floor-outline-mark editing"><polygon points={outlinePoints.map(([x, y]) => `${x},${y}`).join(" ")} />{outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
             </svg>}{(scaleMode || measureMode || outlineMode) && <div className="scale-hint">{outlineMode ? (addOutlinePointMode ? "Click the plan to add a boundary point" : "Drag boundary points to edit the suggested outline") : scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
           {scaleMode && scalePoints.length === 2 && <form className="scale-form" onSubmit={saveScale}><div><strong>Enter the printed distance</strong><span>Use the value shown between the points on the plan, then choose its unit.</span></div><input aria-label="Known distance" type="number" min="0.001" step="any" placeholder="Distance" value={scaleDistance} onChange={event => setScaleDistance(event.target.value)} required /><select aria-label="Distance unit" value={scaleUnit} onChange={event => setScaleUnit(event.target.value as ScaleCalibration["unit"])}><option value="m">metres</option><option value="cm">centimetres</option><option value="ft">feet</option><option value="in">inches</option></select><button className="toolbar-button primary-button" disabled={scaleSaving || !scaleDistance}>{scaleSaving ? "Saving…" : "Save scale"}</button>{scaleError && <p role="alert">{scaleError}</p>}</form>}
-          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Review ${manualOutlineTarget.label?.toLowerCase() ?? "room"} outline` : "Review whole-floor outline"}</strong><span>{manualOutlineTarget?.polygon?.length ? "Suggested from the plan analysis · Drag points to edit, then accept the boundary." : "No matching outline was detected. Click Add point and mark the boundary, then accept it."}</span></div>{floorOutlines.length > 1 && !(manualOutlineTarget?.scope === "room" && !manualOutlineTarget.polygon.length) && <label>Detected outline<select aria-label="Detected outline" value={outlineCandidateIndex} onChange={event => { const index = Number(event.target.value); setOutlineCandidateIndex(index); setManualOutlineTarget(floorOutlines[index]); setOutlinePoints((floorOutlines[index]?.polygon ?? []).map(([x, y]) => [x, y])); }}><option value={0}>{`${floorOutlines[0].label ?? "Outline 1"}${floorOutlines[0].room_type ? ` · ${floorOutlines[0].room_type}` : ""}`}</option>{floorOutlines.slice(1).map((outline, index) => <option key={outline.id} value={index + 1}>{`${outline.label ?? `Outline ${index + 2}`}${outline.room_type ? ` · ${outline.room_type}` : ""}`}</option>)}</select></label>}<div className="outline-actions"><button className="toolbar-button" type="button" onClick={() => setAddOutlinePointMode(true)}>{addOutlinePointMode ? "Click plan to add point" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : `Accept ${manualOutlineTarget?.label?.toLowerCase() ?? "outline"}`}</button></div>{scale && areaM2(outlinePoints) !== null && <p>Estimated area: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
-          {!outlineMode && savedOutlines.length > 0 && <div className="area-summary"><strong>Accepted {savedOutlines[0].label?.toLowerCase() ?? "outline"}</strong><span>{acceptedArea > 0 ? `Estimated area ${acceptedArea.toFixed(1)} m²` : "Set a drawing scale to calculate its area"}</span><button className="toolbar-button" type="button" onClick={removeSavedOutline} disabled={outlineRemoving}>{outlineRemoving ? "Removing…" : "Remove outline"}</button>{outlineError && <p role="alert">{outlineError}</p>}</div>}
+          {pendingAreaQuestion && <section className="room-review" aria-label="Review room areas">
+            <div className="room-review-heading"><strong>Review detected {getRequestedRoomType(pendingAreaQuestion)?.label.toLowerCase() ?? "room"} areas</strong><span>Each outline is separate. Check the painted area; adjust points only where needed.</span></div>
+            {getReviewOutlines(pendingAreaQuestion).map((outline, index) => {
+              const area = areaM2(outline.polygon);
+              return <article className={`room-review-row${outline.decision === "accepted" ? " is-accepted" : outline.decision === "rejected" ? " is-rejected" : ""}`} key={outline.id}>
+                <div className="room-review-info"><strong>{outline.label ?? `Room ${index + 1}`}{getReviewOutlines(pendingAreaQuestion).length > 1 ? ` ${index + 1}` : ""}</strong><span>{area === null ? "Set drawing scale to calculate area" : `${area.toFixed(1)} m²`}{outline.score != null ? ` · model score ${Math.round(outline.score * 100)}%` : " · review boundary"}</span></div>
+                <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion, outline.id)}>Adjust</button>
+                <button className="toolbar-button primary-button" type="button" disabled={outlineSaving || outline.decision === "accepted"} onClick={() => void saveOutlineDecision(outline, "accepted")}>{outline.decision === "accepted" ? "Accepted" : "Accept"}</button>
+                <button className="toolbar-button reject-button" type="button" disabled={outlineSaving || outline.decision === "rejected"} onClick={() => void saveOutlineDecision(outline, "rejected")}>{outline.decision === "rejected" ? "Rejected" : "Reject"}</button>
+              </article>;
+            })}
+            {getReviewOutlines(pendingAreaQuestion).length === 0 && <p className="room-review-empty">No room outline was detected. You can draw one on the plan.</p>}
+            <div className="room-review-footer">{scale ? `${reviewedAccepted.length} accepted · ${reviewedAcceptedArea.toFixed(1)} m² total` : "Set a drawing scale to show room areas"}{getReviewOutlines(pendingAreaQuestion).length === 0 && <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion)}>Draw room outline</button>}</div>
+            {outlineError && <p role="alert">{outlineError}</p>}
+          </section>}
+          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag the painted points or add/remove points, then save this room’s boundary.</span></div><div className="outline-actions"><button className="toolbar-button" type="button" onClick={() => setAddOutlinePointMode(true)}>{addOutlinePointMode ? "Click plan to add point" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{scale && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
+          {!pendingAreaQuestion && !outlineMode && savedOutlines.length > 0 && <div className="area-summary"><strong>Accepted outline areas</strong><span>{acceptedArea > 0 ? `Estimated total ${acceptedArea.toFixed(1)} m²` : "Set a drawing scale to calculate area"}</span><button className="toolbar-button" type="button" onClick={removeSavedOutline} disabled={outlineRemoving}>{outlineRemoving ? "Removing…" : "Remove outlines"}</button>{outlineError && <p role="alert">{outlineError}</p>}</div>}
           {correctionMode && <section className="correction-panel" aria-label="Review detected plan items">
-            <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"}` : "Model detections are shown on the plan."}</span></div>
-            <div className="correction-list">{evidenceItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{item.cls.replaceAll("_", " ") || item.category}</span><small>{item.category}{item.user_verified ? " · verified" : item.score != null ? ` · ${Math.round(item.score * 100)}%` : ""}</small></button>)}</div>
-            {selectedEvidence && <div className="correction-editor"><strong>Correct selected item</strong><label>Kind<select value={editCategory} onChange={event => { const category = event.target.value; setEditCategory(category); setEditClass(itemTypes[category][0]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Type<select value={editClass} onChange={event => setEditClass(event.target.value)}>{(itemTypes[editCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><div className="correction-actions"><button className="toolbar-button primary-button" type="button" disabled={correctionSaving || (selectedEvidence.category === editCategory && selectedEvidence.cls === editClass)} onClick={() => void saveCorrection("update", selectedEvidence.id, { ...selectedEvidence, category: editCategory, cls: editClass })}>{correctionSaving ? "Saving…" : "Save correction"}</button><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => void saveCorrection("delete", selectedEvidence.id)}>Remove detection</button></div></div>}
+            <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"} · used in this plan’s answers` : "Select a box, drag it to move, or drag its corner handle to resize it."}</span></div>
+            {getAllRoomOutlines().length > 0 && <div className="correction-editor"><strong>Backend room boundaries</strong><span>These are the model’s suggested room shapes. Adjust a boundary to use your edit for both room answers and area estimates.</span>{getAllRoomOutlines().map((outline, index) => <div className="room-boundary-row" key={outline.id}><span>{outline.label || `Room ${index + 1}`}</span><button className="toolbar-button" type="button" onClick={() => startOutlineReview(undefined, outline.id)}>Adjust boundary</button></div>)}</div>}
+            <div className="correction-list">{evidenceItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{itemLabel(item)}</span><small>{item.text ? `${item.category} · label “${item.text}”` : item.category}{item.user_verified ? " · corrected" : item.score != null ? ` · ${Math.round(item.score * 100)}% confidence` : ""}</small></button>)}</div>
+            {selectedEvidence && <div className="correction-editor"><strong>Correct selected item</strong><span>Drag the box to move it, or drag its lower-right handle to resize it. If this says “toilet” but is actually a kitchen, choose room and kitchen. Save to keep the geometry and label correction with this plan.</span><label>Kind<select value={editCategory} onChange={event => { const category = event.target.value; setEditCategory(category); setEditClass(itemTypes[category][0]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Room or object type<select value={editClass} onChange={event => setEditClass(event.target.value)}>{(itemTypes[editCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><div className="correction-actions"><button className="toolbar-button primary-button" type="button" disabled={correctionSaving || (selectedEvidence.category === editCategory && selectedEvidence.cls === editClass)} onClick={() => void saveCorrection("update", selectedEvidence.id, { ...selectedEvidence, category: editCategory, cls: editClass })}>{correctionSaving ? "Saving…" : "Save correction"}</button><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => void saveCorrection("delete", selectedEvidence.id)}>Remove detection</button></div></div>}
             <div className="correction-editor"><strong>Add a missed item</strong><label>Kind<select value={addCategory} onChange={event => { const category = event.target.value; setAddCategory(category); setAddClass(itemTypes[category]?.[0] ?? "other"); setCorrectionAddPoints([]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Type<select value={addClass} onChange={event => setAddClass(event.target.value)}>{(itemTypes[addCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => { setCorrectionAddPoints([]); setCorrectionAddMode(true); }}>{correctionAddMode ? addCategory === "room" ? correctionAddPoints.length === 0 ? "Click first room corner" : "Click opposite room corner" : "Click its location on the plan" : addCategory === "room" ? "Mark missing room" : "Place missing item"}</button></div>
             {correctionError && <p className="correction-error" role="alert">{correctionError}</p>}
           </section>}

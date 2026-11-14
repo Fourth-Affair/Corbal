@@ -46,7 +46,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .citation-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .citation-overlay.scale-selecting { pointer-events: auto; cursor: crosshair; }
 .citation-overlay.correction-active { pointer-events: auto; cursor: crosshair; }
-.correction-mark { cursor: pointer; }
+.correction-mark { cursor: grab; touch-action: none; }
+.correction-mark:active { cursor: grabbing; }
+.correction-mark .correction-resize-handle { fill: #fff; stroke: #247044; stroke-width: 3; vector-effect: non-scaling-stroke; cursor: nwse-resize; pointer-events: all; }
 .correction-mark rect, .correction-mark polygon { fill: rgba(213, 141, 52, .12); stroke: #d58d34; stroke-width: 4; vector-effect: non-scaling-stroke; }
 .correction-mark.selected rect, .correction-mark.selected polygon { fill: rgba(36, 112, 68, .2); stroke: #247044; stroke-width: 6; }
 .correction-mark.user-corrected rect, .correction-mark.user-corrected polygon { stroke: #247044; stroke-dasharray: 7 5; }
@@ -54,6 +56,10 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .citation-mark.user-corrected rect, .citation-mark.user-corrected polygon { fill: rgba(36, 112, 68, .16); stroke: #247044; stroke-dasharray: 8 5; }
 .citation-mark circle { fill: #d94727; stroke: white; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .citation-mark text { fill: #fff; font: 700 20px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
+.citation-mark .citation-label rect { fill: #fff; stroke: #b84025; stroke-width: 1.5; vector-effect: non-scaling-stroke; filter: drop-shadow(0 2px 3px rgba(34, 45, 37, .25)); }
+.citation-mark .citation-label text { fill: #85321f; font: 700 13px 'DM Sans', sans-serif; dominant-baseline: central; }
+.citation-mark.user-corrected .citation-label rect { fill: #edf7ef; stroke: #247044; }
+.citation-mark.user-corrected .citation-label text { fill: #205c37; }
 .upload-empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; }
 .loading-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; }
 .loading-state h1 { margin: 16px 0 0; color: #33443a; font: 700 17px Manrope, sans-serif; }
@@ -129,7 +135,11 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .scale-form p { flex-basis: 100%; margin: 0; color: #a1483c; }
 .floor-outline-mark { pointer-events: none; }
 .floor-outline-mark polygon { fill: rgba(56, 142, 90, .13); stroke: #348253; stroke-width: 6; vector-effect: non-scaling-stroke; }
+.floor-outline-mark.accepted polygon { fill: rgba(38, 127, 73, .2); stroke: #207541; }
+.floor-outline-mark.editing polygon { fill: rgba(37, 114, 190, .16); stroke: #2474b8; }
 .floor-outline-mark circle { pointer-events: auto; cursor: move; fill: #fff; stroke: #247044; stroke-width: 4; vector-effect: non-scaling-stroke; }
+.room-outline-label rect { fill: #fff; stroke: #247044; stroke-width: 2; vector-effect: non-scaling-stroke; filter: drop-shadow(0 1px 3px rgba(0,0,0,.22)); }
+.room-outline-label text { fill: #244d32; font: 700 16px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
 .outline-form { margin: 12px 14px 0; padding: 12px; display: flex; flex-direction: column; gap: 10px; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
 .outline-copy { display: flex; flex-direction: column; gap: 4px; }
 .outline-copy strong, .area-summary strong { color: #385b43; font-size: 12px; }
@@ -140,6 +150,17 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .outline-actions .toolbar-button { flex: 1; padding: 0 8px; }
 .outline-form p { margin: 0; }
 .area-summary { margin: 12px 14px 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
+.room-review { margin: 12px 14px 0; padding: 12px; display: flex; flex-direction: column; gap: 8px; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
+.room-review-heading, .room-review-info { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.room-review-heading strong, .room-review-info strong { color: #385b43; font-size: 12px; text-transform: capitalize; }
+.room-review-heading span, .room-review-info span, .room-review-empty, .room-review-footer { color: #738076; font-size: 11px; line-height: 1.45; }
+.room-review-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 6px; padding: 8px; border: 1px solid #dce8df; border-radius: 7px; background: #fff; }
+.room-review-row.is-accepted { border-color: #8bb99a; background: #f0f8f1; }
+.room-review-row.is-rejected { opacity: .68; }
+.room-review-row .toolbar-button { min-height: 30px; padding: 0 9px; font-size: 11px; }
+.room-review-row .reject-button { color: #8a4c44; }
+.room-review-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.room-review-empty { margin: 0; }
 .correction-panel { margin: 12px 14px; padding: 12px; display: flex; flex-direction: column; gap: 10px; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
 .correction-heading, .correction-editor { display: flex; flex-direction: column; gap: 5px; }
 .correction-heading strong, .correction-editor strong { color: #385b43; font-size: 12px; }
@@ -150,6 +171,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .correction-row span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; text-transform: capitalize; }
 .correction-row small { color: #879188; font-size: 9px; text-transform: capitalize; }
 .correction-editor { padding-top: 8px; border-top: 1px solid #e2e8e2; }
+.correction-editor>span { color: #738076; font-size: 11px; line-height: 1.45; }
+.room-boundary-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid #e2e8e2; color: #536157; font-size: 11px; text-transform: capitalize; }
+.room-boundary-row .toolbar-button { min-height: 28px; padding: 0 8px; }
 .correction-editor label { display: flex; align-items: center; justify-content: space-between; gap: 8px; text-transform: capitalize; }
 .correction-editor select { min-height: 30px; padding: 0 7px; border: 1px solid #dce3dc; border-radius: 6px; background: white; color: #405247; font: inherit; text-transform: capitalize; }
 .correction-actions { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -171,4 +195,19 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
   .image-frame { inset: 16px; }
   .chat-panel { min-height: 520px; }
   .conversation { min-height: 220px; }
+  .room-review-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .room-review-info { grid-column: 1 / -1; }
+  .room-review-row .toolbar-button { width: 100%; padding: 0 5px; }
 }
+
+/* Room overlay: labeled rooms filled by purpose, rough (unlabelled) spaces dashed */
+.toolbar-button.is-on { border-color: #34764e; background: #e8f1ea; color: #285c3c; }
+.room-layer .room-shape polygon { stroke-width: 3; fill-opacity: 0.18; vector-effect: non-scaling-stroke; }
+.room-layer .room-shape.weak polygon { stroke-dasharray: 8 5; stroke-width: 2; fill-opacity: 0.08; }
+.room-layer .room-shape.unknown polygon { stroke-dasharray: 4 4; stroke-width: 1.5; opacity: 0.8; }
+.room-layer text { fill: #1f2a23; font-weight: 700; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: rgba(255, 255, 255, 0.9); stroke-width: 4px; stroke-linejoin: round; }
+.room-layer .room-shape.weak text, .room-layer .room-shape.unknown text { fill: #5d6b63; font-weight: 600; }
+.wall-layer line { stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.wall-layer line.exterior { stroke: #c0392b; stroke-width: 4; }
+.wall-layer line.interior { stroke: #2e6fb5; stroke-width: 2.5; }
+.room-layer, .wall-layer { pointer-events: none; } /* never take clicks from measuring, outlines or corrections */

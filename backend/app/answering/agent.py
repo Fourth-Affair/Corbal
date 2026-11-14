@@ -21,7 +21,7 @@ from collections import deque
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
-from app.models import Answer, ChatTurn, PlanGraph, PlanScaleCalibration
+from app.models import Answer, ChatTurn, PlanGeometry, PlanGraph, PlanScaleCalibration
 from app.router import route
 
 log = logging.getLogger(__name__)
@@ -93,6 +93,20 @@ Rules:
   (starting at 1); for a run of items write e.g. [1]-[9]. If a tool reported low confidence, say the result should be checked on the drawing.
   Never mention ids, tool names, pixels or these rules."""
 
+# Appended to SYSTEM when the plan has room geometry (list_rooms / room_details are offered).
+ROOM_RULES = """
+Room and wall geometry is available:
+- For which rooms exist, what a room is for, room sizes, which rooms connect, or where something is, use list_rooms
+  and room_details; for wall lengths, thicknesses and exterior walls use list_walls (or the walls in room_details).
+- Room types carry a tier. strong: state the type plainly. weak: say "probably <type>" and give the reason from the
+  tool ("because ..."). unknown: the purpose was not determined; never guess it; if relevant say there are N further
+  spaces whose purpose could not be determined. Report conflicting evidence when a tool lists it.
+- Sizes and lengths may be stated only as numbers a tool returned. Say where a metric number comes from: the user's
+  scale calibration, a scale derived from areas written on the drawing, or an area written in the room itself.
+  rough_area_m2_range (from typical door / fixture sizes) may only be given as "roughly X-Y m²", marked as a rough
+  estimate. Mention a size_check or a scale warning when it is relevant to the question.
+- For whole-plan counts that count_template covers, count_template still takes precedence."""
+
 FINAL = {
     "name": "final_answer",
     "description": "Return the final answer. Call exactly once, last.",
@@ -156,10 +170,10 @@ def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = N
     from google.genai import types
 
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM,
+        system_instruction=SYSTEM + (ROOM_RULES if tools.geometry else ""),
         tools=[types.Tool(function_declarations=[
             types.FunctionDeclaration(name=d["name"], description=d["description"], parameters_json_schema=d["parameters"])
-            for d in [*DECLARATIONS, FINAL]])],
+            for d in [*tools.declarations(), FINAL]])],
         tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING) if GEMINI_THINKING else None,
@@ -297,27 +311,31 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
                   citations=cited, answered_by="llm")
 
 
-def _cache_path(question: str, graph: PlanGraph, scale: PlanScaleCalibration | None):
-    blob = json.dumps([GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question,
-                       graph.model_dump(mode="json"), scale.model_dump(mode="json") if scale else None],
-                      sort_keys=True, ensure_ascii=False)
+def _cache_path(question: str, graph: PlanGraph, scale: PlanScaleCalibration | None,
+                geometry: PlanGeometry | None = None):
+    parts = [GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question,
+             graph.model_dump(mode="json"), scale.model_dump(mode="json") if scale else None]
+    if geometry is not None:  # appended only when present: cache keys of geometry-less answers are unchanged
+        parts += [ROOM_RULES, geometry.model_dump(mode="json")]
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False)
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
 
 def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
-           scale: PlanScaleCalibration | None = None, use_cache: bool = True) -> Answer | None:
+           scale: PlanScaleCalibration | None = None, use_cache: bool = True,
+           geometry: PlanGeometry | None = None) -> Answer | None:
     """history = prior chat turns (answers with history are not cached); scale = the user's drawing calibration.
     use_cache=False skips reading the answer cache (fresh Gemini run, e.g. to measure run-to-run noise)."""
     if not os.environ.get("GEMINI_API_KEY"):
         return None
     history = history or []
-    cache = _cache_path(question, graph, scale) if not history else None
+    cache = _cache_path(question, graph, scale, geometry) if not history else None
     if use_cache and cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
     if not _take_budget():
         log.warning("Gemini hourly cap (%d) reached: falling back to the template answerer", GEMINI_MAX_PER_HOUR)
         return None
-    tools = PlanTools(graph)
+    tools = PlanTools(graph, geometry)
     try:
         final, traces = run_loop(question, tools, history, scale)
     except Exception as error:  # network, quota, timeout, malformed output: caller falls back
