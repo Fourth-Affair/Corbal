@@ -10,6 +10,11 @@ type PlanRecord = {
 };
 
 type ChatMessage = { role: "user" | "assistant"; text: string };
+type PlanCitation = {
+  id: string;
+  bbox: [number, number, number, number];
+  polygon?: Array<[number, number]> | null;
+};
 
 export default function PlanPage({ params }: { params: Promise<{ planId: string }> }) {
   const [planId, setPlanId] = useState("");
@@ -21,6 +26,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [question, setQuestion] = useState("");
   const [sending, setSending] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
+  const [citations, setCitations] = useState<PlanCitation[]>([]);
 
   useEffect(() => {
     let objectUrl: string | null = null;
@@ -64,6 +71,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             const result = await analysisResponse.json();
             if (!analysisResponse.ok) throw new Error(result.detail || "Analysis failed");
             if (!cancelled) {
+              if (result.width && result.height) setImageSize({ width: result.width, height: result.height });
               setAnalysisStatus("Floor plan ready");
               setReady(true);
             }
@@ -89,6 +97,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     const submitted = question.trim();
     if (!submitted || !ready || sending || !planId) return;
     setQuestion("");
+    setCitations([]);
     setMessages(current => [...current, { role: "user", text: submitted }]);
     setSending(true);
     try {
@@ -98,8 +107,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
       const answer = result.answer === null ? result.explanation : `${result.answer}${result.unit ? ` ${result.unit}` : ""}. ${result.explanation}`;
+      setCitations(Array.isArray(result.citations) ? result.citations : []);
       setMessages(current => [...current, { role: "assistant", text: answer }]);
     } catch (askError) {
+      setCitations([]);
       const message = askError instanceof Error ? askError.message : "Could not answer that question";
       setMessages(current => [...current, { role: "assistant", text: message }]);
     } finally {
@@ -123,13 +134,23 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       <div className="work-area">
         <section className="drawing-panel" aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
-            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} /></div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && citations.length > 0 && <svg className="citation-overlay" viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" aria-label={`Highlighted ${citations.length} supporting items`}>
+              {citations.map((item, index) => {
+                const [x0, y0, x1, y1] = item.bbox;
+                const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
+                return <g className="citation-mark" key={`${item.id}-${index}`}>
+                  {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(1, x1 - x0)} height={Math.max(1, y1 - y0)} />}
+                  <circle cx={x0} cy={y0} r="18" />
+                  <text x={x0} y={y0}>{index + 1}</text>
+                </g>;
+              })}
+            </svg>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
           <div className="conversation" aria-live="polite">{messages.length === 0 ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p></div>)}</div>
-          <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
+          <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
         </aside>
       </div>
     </main>
