@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Next.js + FastAPI",
-  description: "A full-stack application starter",
+  title: "Plans",
+  description: "Upload a construction plan.",
 };
 
 export default function RootLayout({

@@ -26,6 +26,10 @@ def _cache_path(rel: str, source: str) -> Path:
         if FUSION_PATH.is_file():
             st = FUSION_PATH.stat()
             sub = f"model-{st.st_size:x}-{int(st.st_mtime):x}"
+        from app.cubicasa import symdet
+
+        if symdet.available():  # detector boxes are part of the evidence
+            sub += "-" + symdet.fingerprint().replace(".", "_")
     return CACHE_DIR / sub / (Path(rel).stem + ".json")
 
 

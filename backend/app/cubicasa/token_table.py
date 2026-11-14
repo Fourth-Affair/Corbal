@@ -10,11 +10,11 @@ from collections import Counter, defaultdict
 
 from shapely.geometry import Point, Polygon
 
-from app.config import MODEL_WEIGHTS
+from app.config import MODELS_DIR
 from app.cubicasa.features import feature_paths
 from app.cubicasa.rooms_dict import normalise
 
-TABLE_PATH = MODEL_WEIGHTS.parent / "ocr_token_table.json"
+TABLE_PATH = MODELS_DIR / "ocr_token_table.json"
 TYPES = ("bedroom", "bathroom", "wc", "sauna", "kitchen", "balcony")
 
 

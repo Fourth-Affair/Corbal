@@ -41,11 +41,26 @@ def feature_paths(rel: str) -> tuple[Path, Path]:
     return FEAT_DIR / f"{stem}.npz", FEAT_DIR / f"{stem}.json"
 
 
-def compute(rel: str, img: Image.Image | None = None) -> None:
-    from app.cubicasa import cubinet
+def ocr_tokens(rel: str, img: Image.Image | None = None) -> dict:
+    """{"width", "height", "ocr": [{"text", "bbox", "score"}]}: OCR only, cached in the same JSON as compute()."""
     from app.cubicasa.ocr import read_text
 
+    _, js = feature_paths(rel)
+    if js.exists():
+        return json.loads(js.read_text())
+    js.parent.mkdir(parents=True, exist_ok=True)
+    img = (img or Image.open(DATASET_DIR / rel)).convert("RGB")
+    toks = [{"text": t, "bbox": [round(float(v), 1) for v in b], "score": round(float(s), 3)} for t, b, s in read_text(img)]
+    out = {"width": img.width, "height": img.height, "ocr": toks}
+    js.write_text(json.dumps(out, ensure_ascii=False))
+    return out
+
+
+def compute(rel: str, img: Image.Image | None = None) -> None:
+    from app.cubicasa import cubinet
+
     npz, js = feature_paths(rel)
+    npz.parent.mkdir(parents=True, exist_ok=True)  # not part of the share bundle
     img = img or Image.open(DATASET_DIR / rel)
     img = img.convert("RGB")
     if not _npz_ok(npz):
@@ -63,9 +78,7 @@ def compute(rel: str, img: Image.Image | None = None) -> None:
             iprob=(icons[list(ICON_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
             rprob=(rooms[list(ROOM_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
         )
-    if not js.exists():
-        toks = [{"text": t, "bbox": [round(float(v), 1) for v in b], "score": round(float(s), 3)} for t, b, s in read_text(img)]
-        js.write_text(json.dumps({"width": img.width, "height": img.height, "ocr": toks}, ensure_ascii=False))
+    ocr_tokens(rel, img)
 
 
 def main() -> None:

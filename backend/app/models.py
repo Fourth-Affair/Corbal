@@ -4,10 +4,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-Category = Literal["floor", "room", "door", "window", "fixture"]
+Category = Literal["floor", "room", "door", "window", "fixture", "wall", "opening"]
 
 # Canonical classes. Rooms: bedroom, bathroom, wc, sauna, kitchen, balcony, other.
 # Fixtures: toilet, sink, double_sink, shower, bathtub, sauna_stove, other.
+# Walls (layers API): wall = solid wall region, opening = door/window gap in a wall.
 
 
 class PlanItem(BaseModel):
@@ -45,3 +46,25 @@ class Answer(BaseModel):
     confidence: Literal["high", "medium", "low", "not_found"]
     explanation: str
     citations: list[PlanItem] = Field(default_factory=list)
+
+
+class TextToken(BaseModel):
+    """One OCR reading. room_type is set when the text is a recognised room label (e.g. "MH" -> bedroom)."""
+
+    text: str
+    bbox: tuple[float, float, float, float]
+    score: float
+    room_type: str | None = None
+
+
+class Layer(BaseModel):
+    """One perception layer of a plan (walls, symbols or text), in pixels of the challenge PNG."""
+
+    image: str
+    width: int
+    height: int
+    layer: Literal["walls", "symbols", "text"]
+    model: str  # which model produced it, e.g. "wallseg", "cubicasa-net", "symbol-det.onnx", "rapidocr"
+    items: list[PlanItem] = Field(default_factory=list)
+    tokens: list[TextToken] = Field(default_factory=list)
+    stats: dict[str, float] = Field(default_factory=dict)

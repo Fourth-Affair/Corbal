@@ -77,3 +77,81 @@ def test_apartment_header():
     assert apartment_type("3H+K+S") == {"rooms": 3, "sauna": True, "kitchen": True}
     assert apartment_type("2h+kt") == {"rooms": 2, "sauna": False, "kitchen": True}
     assert apartment_type("KH") is None
+
+
+def test_det_features_thresholds_and_groups():
+    from app.cubicasa.symdet import det_features
+
+    dets = [{"cls": "window", "conf": 0.9, "bbox": [0, 0, 1, 1]},
+            {"cls": "window", "conf": 0.3, "bbox": [2, 0, 3, 1]},
+            {"cls": "sink", "conf": 0.6, "bbox": [0, 0, 1, 1]},
+            {"cls": "double_sink", "conf": 0.45, "bbox": [0, 0, 1, 1]}]
+    f = det_features(dets)
+    assert f["det_window_c25"] == 2 and f["det_window_c40"] == 1 and f["det_window_c70"] == 1
+    assert f["det_sinks_c40"] == 2 and f["det_sinks_c55"] == 1
+    assert f["det_door_c25"] == 0 and f["det_door_sum"] == 0
+    assert abs(f["det_window_sum"] - 1.2) < 1e-9
+
+
+def test_det_items_replace_segmentation_classes():
+    from app.cubicasa.detect import _det_items
+
+    items = _det_items([{"cls": "door", "conf": 0.8, "bbox": [1, 2, 3, 4]},
+                        {"cls": "shower", "conf": 0.2, "bbox": [1, 2, 3, 4]}])  # below ITEM_CONF
+    assert [(it.category, it.cls, it.raw) for it in items] == [("door", "", "detector")]
+
+
+def test_export_classes_match_detector():
+    from app.cubicasa.export_yolo import DET_CLASSES
+    from app.cubicasa.symdet import DET_ITEMS, DET_NAMES
+
+    assert DET_CLASSES == [DET_ITEMS[n] for n in DET_NAMES]
+
+
+@pytest.mark.parametrize("size", [(300, 200), (700, 530), (1200, 1100)])
+def test_wallseg_sliding_window_shapes(size):
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    from app.cubicasa import wallseg
+
+    torch.manual_seed(0)
+    model = torch.nn.Conv2d(3, len(wallseg.CLASSES), 3, padding=1).eval()  # stand-in for the U-Net
+    img = Image.fromarray(np.random.default_rng(0).integers(0, 255, (size[1], size[0], 3), dtype=np.uint8))
+    p = wallseg.predict(img, model=model, batch=4)
+    assert p.shape == (len(wallseg.CLASSES), size[1], size[0])
+    assert np.allclose(p.sum(0), 1, atol=1e-4) and p.min() >= 0
+
+
+def test_walls_layer_items(monkeypatch, tmp_path):
+    import numpy as np
+
+    from app.cubicasa import layers
+
+    cls = np.zeros((100, 120), dtype=np.uint8)
+    cls[10:14, 10:110] = 1  # one wall
+    cls[50:90, 60:64] = 1  # another, not touching
+    cls[10:14, 40:60] = 2  # an opening inside the first wall
+    cls[0:2, 0:2] = 1  # speck: ignored
+    monkeypatch.setattr(layers, "wall_classes", lambda rel, path: (cls, "test"))
+    layer = layers.walls("data/cubicasa5k/x.png", tmp_path / "x.png")
+    cats = sorted(it.category for it in layer.items)
+    assert cats == ["opening", "wall", "wall", "wall"]  # the opening splits the first wall in two; speck dropped
+    assert layer.layer == "walls" and layer.model == "test" and layer.stats["opening_px"] == 80
+
+
+@needs_data
+def test_api_layers():
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+    from app.cubicasa import symdet
+
+    client = TestClient(main.app)
+    r = client.get("/api/text", params={"path": SAMPLE})
+    assert r.status_code == 200 and r.json()["layer"] == "text" and r.json()["tokens"]
+    r = client.get("/api/symbols", params={"path": SAMPLE})
+    assert r.status_code == (200 if symdet.available() else 503)
+    assert client.get("/api/render", params={"path": SAMPLE}).status_code == 400  # layer=answer needs a question
+    assert client.get("/api/walls", params={"path": "data/cubicasa5k/../../questions.jsonl"}).status_code == 400
