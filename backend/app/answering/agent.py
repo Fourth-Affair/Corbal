@@ -44,7 +44,9 @@ Rules:
   value > 0, no if 0), even if raw items suggest otherwise; mention low confidence if reported.
 - For a question restricted to a room or area (e.g. "sinks in the kitchen"), find the room with
   list_items(category="room", type=...) and use items_in on it. If several such rooms exist and the question does not
-  say which, or the answer would need adding numbers together, answer not_found.
+  say which, answer not_found. For questions asking how many rooms there are and what types they are, call
+  list_items(category="room") once: its count is the deduplicated room count and its items give the room types and
+  labels. Answer both parts from that single result. Do not refuse merely because the rooms have different types.
 - Answer not_found when the tools cannot answer it: real-world sizes or areas (no scale is known), objects or text
   that are not detected, combinations the tools do not compute. An honest not_found is better than a wrong answer.
 - Finish by calling final_answer exactly once:
@@ -53,7 +55,7 @@ Rules:
   evidence_ids);
   explanation = 1-3 short sentences in the SAME language as the question (an English question gets an English
   answer, Finnish gets Finnish, Swedish gets Swedish), regardless of the language of labels on the drawing;
-  text answers (e.g. Yes / Kyllä / Ja) follow the same rule. State the value
+  text answers (e.g. Yes / Kyllä / Ja, or a room inventory) follow the same rule. State the value
   with digits, say what was counted and how, refer to cited items as [k] where k is the position in cited_ids
   (starting at 1); for a run of items write e.g. [1]-[9]. If a tool reported low confidence, say the result should be checked on the drawing.
   Never mention ids, tool names, pixels or these rules."""
@@ -189,6 +191,14 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
     else:
         answer, unit = str(final["text"]), None
         confidence = "medium" if graph.source == "svg" else "low"
+        # Text responses can combine an inventory with its count. Ground stated numbers in tool output.
+        number_text = re.sub(r"\[[^\]]*\]", "", answer)
+        stated_numbers = [float(n) for n in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", number_text)]
+        available_numbers = {float(n) for trace in traces for n in trace.numbers}
+        if any(number not in available_numbers for number in stated_numbers):
+            log.warning("text answer contains numbers not returned by tools: %s", stated_numbers)
+            return Answer(answer=None, confidence="not_found", answered_by="llm",
+                          explanation="The answer could not be verified against the drawing analysis.")
         # a yes/no answer usually rests on a count ("Is there a sauna?" -> saunas = 0): link it, and check it agrees
         counted = [t.template_answer for t in traces if t.template_answer is not None]
         basis = next((a for a in counted if a.template == route(question)), None) \
