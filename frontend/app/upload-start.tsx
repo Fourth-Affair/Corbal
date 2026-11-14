@@ -32,9 +32,9 @@ export default function UploadStart() {
       }
     }
     if (floors.length) {
-      const prior = JSON.parse(localStorage.getItem("junc-building-floors") || "[]") as typeof floors;
-      localStorage.setItem("junc-building-floors", JSON.stringify([...prior, ...floors]));
-      router.push(`/building?floor=${floors[0].id}`);
+      localStorage.setItem("junc-building-floors", JSON.stringify(floors));
+      localStorage.setItem("junc-building-chats", "{}");
+      router.push(`/plans/${floors[0].id}`);
     }
     setUploading(false);
   }
@@ -48,10 +48,10 @@ export default function UploadStart() {
   return (
     <main className="workspace">
       <input ref={inputRef} className="visually-hidden" type="file" multiple accept="application/pdf,image/png,image/jpeg,image/webp" onChange={event => { void startUpload(event.target.files ?? undefined); event.target.value = ""; }} />
-      <header className="toolbar"><div className="plan-title"><span className="plan-title-icon" aria-hidden="true">▤</span><span>Building plans</span></div><div className="toolbar-actions"><button className="toolbar-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading floors…" : "Upload floor plans"}</button></div></header>
+      <header className="toolbar"><div className="plan-title"><span className="plan-title-icon" aria-hidden="true">▤</span><span>Floor plan</span></div><div className="toolbar-actions"><button className="toolbar-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading…" : "Choose floor plan"}</button></div></header>
       <div className="work-area">
         <section className={`drawing-panel ${dragging ? "is-dragging" : ""}`} aria-label="Plan drawing" onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={drop}>
-          <div className="upload-empty-state"><div className="upload-icon" aria-hidden="true">↑</div><h1>Upload your building’s floor plans</h1><p>Add several floors together, then ask about one floor or the whole building.</p><button className="toolbar-button primary-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading floors…" : "Choose floor plans"}</button><span>PDF, PNG, JPG, or WebP · select multiple files</span></div>
+          <div className="upload-empty-state"><div className="upload-icon" aria-hidden="true">↑</div><h1>Open a floor plan</h1><p>View the drawing, explore detected rooms, and ask questions about this floor.</p><button className="toolbar-button primary-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading…" : "Choose floor plan"}</button><span>PDF, PNG, JPG, or WebP · you can add other floors later</span></div>
         </section>
         <aside className="chat-panel" aria-label="Plan questions"><div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div><div className="conversation"><div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>Upload a plan to get started.</p></div></div><form className="composer" onSubmit={event => event.preventDefault()}><textarea aria-label="Ask a question about the plan" placeholder="Upload a plan to ask a question" disabled /><div className="composer-footer"><span /><button className="send-button" type="submit" disabled aria-label="Send question">↑</button></div></form></aside>
       </div>
