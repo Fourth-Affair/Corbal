@@ -79,7 +79,7 @@ export default function BuildingPage() {
   }
 
   return <main className="workspace building-workspace">
-    <header className="toolbar"><Link className="plan-title building-home-link" href="/"><span className="plan-title-icon">▤</span><span>Building workspace</span></Link><span className="building-floor-count">{floors.length} {floors.length === 1 ? "floor" : "floors"}</span></header>
+    <header className="toolbar"><Link className="plan-title building-home-link" href={floors[0] ? `/plans/${floors[0].id}` : "/"}><span className="plan-title-icon">←</span><span>Back to floor</span></Link><span className="building-floor-count">Building questions · {floors.length} {floors.length === 1 ? "floor" : "floors"}</span></header>
     <div className="building-layout">
       <aside className="floor-sidebar">
         <div className="floor-sidebar-heading"><div><strong>Floors</strong><span>Select the plans to include</span></div><label className="toolbar-button floor-add">+ Add<input type="file" multiple accept="application/pdf,image/png,image/jpeg,image/webp" onChange={async event => {

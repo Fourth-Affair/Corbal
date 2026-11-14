@@ -8,6 +8,7 @@ type PlanRecord = {
   metadata?: { filename?: string };
   plan_images?: Array<{ upload_status?: string; role?: string }>;
 };
+type BuildingFloor = { id: string; name: string };
 
 type ChatMessage = { role: "user" | "assistant"; text: string; originalText?: string; evidence_ids?: string[]; evidence?: PlanCitation[]; confidence?: string; feedback?: string; evidenceDecision?: "trusted" | "rejected" };
 type PlanCitation = {
@@ -195,6 +196,9 @@ function linkRoomBoundaries(items: EvidenceItem[], outlines: FloorOutline[]) {
 export default function PlanPage({ params }: { params: Promise<{ planId: string }> }) {
   const [planId, setPlanId] = useState("");
   const [plan, setPlan] = useState<PlanRecord | null>(null);
+  const [buildingFloors, setBuildingFloors] = useState<BuildingFloor[]>([]);
+  const [addingFloors, setAddingFloors] = useState(false);
+  const addFloorsInput = useRef<HTMLInputElement>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [analysisStatus, setAnalysisStatus] = useState("Preparing your floor plan…");
@@ -258,6 +262,47 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const conversationRef = useRef<HTMLDivElement>(null);
   const roomBoundaryLinkRef = useRef<Record<string, string>>({});
   const evidenceItemsRef = useRef<EvidenceItem[]>([]);
+
+  async function addFloorPlans(files: FileList | null) {
+    const selected = Array.from(files ?? []);
+    if (!selected.length || addingFloors) return;
+    if (selected.some(file => !file.type.startsWith("image/") && file.type !== "application/pdf")) {
+      window.alert("Choose PDF or image floor plans.");
+      return;
+    }
+    setAddingFloors(true);
+    const added: BuildingFloor[] = [];
+    for (const file of selected) {
+      const id = crypto.randomUUID();
+      const body = new FormData();
+      body.set("file", file);
+      body.set("filename", file.name);
+      try {
+        const response = await fetch(`/api/plans/${id}/upload`, { method: "POST", body });
+        if (!response.ok) {
+          const result = await response.json().catch(() => ({}));
+          throw new Error(result.detail || "Upload failed");
+        }
+        added.push({ id, name: file.name });
+      } catch (uploadError) {
+        window.alert(`${file.name}: ${uploadError instanceof Error ? uploadError.message : "Upload failed"}`);
+      }
+    }
+    if (added.length) {
+      const next = [...buildingFloors, ...added];
+      setBuildingFloors(next);
+      localStorage.setItem("junc-building-floors", JSON.stringify(next));
+    }
+    setAddingFloors(false);
+  }
+
+  function startFreshWithCurrentFloor() {
+    if (!planId) return;
+    const currentFloor = { id: planId, name: plan?.metadata?.filename ?? "Floor plan" };
+    setBuildingFloors([currentFloor]);
+    localStorage.setItem("junc-building-floors", JSON.stringify([currentFloor]));
+    localStorage.setItem("junc-building-chats", "{}");
+  }
 
   useEffect(() => {
     if (!ready || !geometry || animationStarted.current) return;
@@ -337,6 +382,11 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         }
         if (cancelled) return;
         setPlan(record);
+        const existingFloors = JSON.parse(localStorage.getItem("junc-building-floors") || "[]") as BuildingFloor[];
+        const currentFloor = { id, name: record.metadata?.filename ?? "Floor plan" };
+        const nextFloors = existingFloors.some(floor => floor.id === id) ? existingFloors : [...existingFloors, currentFloor];
+        setBuildingFloors(nextFloors);
+        localStorage.setItem("junc-building-floors", JSON.stringify(nextFloors));
         try {
           const savedScale = await fetch(`/api/plans/${encodeURIComponent(id)}/scale`, { cache: "no-store" });
           if (savedScale.ok) {
@@ -992,12 +1042,18 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   return (
     <main className="workspace">
       <header className="toolbar">
+        <input ref={addFloorsInput} className="visually-hidden" type="file" multiple accept="application/pdf,image/png,image/jpeg,image/webp" onChange={event => { void addFloorPlans(event.target.files); event.target.value = ""; }} />
         <div className="plan-title" title={plan?.metadata?.filename ?? "Loading plan…"}>
           <span className="plan-title-icon" aria-hidden="true">▤</span>
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
-          <Link className="toolbar-button building-link" href="/building">Building view</Link>
+          <details className="toolbar-menu floor-switcher"><summary className="toolbar-button">Building · {buildingFloors.length} {buildingFloors.length === 1 ? "floor" : "floors"}</summary><div className="toolbar-menu-popover">
+            {buildingFloors.map((floor, index) => <Link key={floor.id} href={`/plans/${floor.id}`} aria-current={floor.id === planId ? "page" : undefined}>{index + 1}. {floor.name}</Link>)}
+            <button type="button" onClick={() => addFloorsInput.current?.click()}>{addingFloors ? "Adding floors…" : "+ Add floor plans"}</button>
+            {buildingFloors.length > 1 && <Link href="/building">Ask across floors</Link>}
+            {buildingFloors.length > 1 && <button type="button" onClick={startFreshWithCurrentFloor}>Start fresh with this floor</button>}
+          </div></details>
           {geometry && <details className="toolbar-menu"><summary className={`toolbar-button${showRooms || showWalls ? " is-on" : ""}`}>Overlays</summary><div className="toolbar-menu-popover" onClick={event => { if (event.target instanceof HTMLElement && event.target.closest("button")) event.currentTarget.closest("details")?.removeAttribute("open"); }}>
             <button type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)}>{showRooms ? "✓ " : ""}Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>
             {showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)}>{showUncertain ? "✓ " : ""}Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
@@ -1025,7 +1081,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       <div className="work-area">
         <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
-            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}${referenceMode ? " reference-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerDown={event => { if (referenceMode) { const point = planPoint(event); if (point) { setReferenceDragStart(point); setReferenceDragEnd(point); event.currentTarget.setPointerCapture(event.pointerId); } } }} onPointerMove={event => { if (referenceMode && referenceDragStart) { const point = planPoint(event); if (point) setReferenceDragEnd(point); } else if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={referenceMode ? "Click an item or drag to reference an area" : correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{!ready && !error && <div className={`analysis-progress${analysisStatus.startsWith("Analysis unavailable:") ? " failed" : ""}`} role="status" aria-live="polite"><div className="analysis-progress-card">{analysisStatus.startsWith("Analysis unavailable:") ? <div className="analysis-progress-icon failed-icon">!</div> : <span className="analysis-progress-spinner" />}<h2>{analysisStatus.startsWith("Analysis unavailable:") ? "Analysis couldn’t finish" : "Analyzing your floor plan"}</h2><p>{analysisStatus.startsWith("Analysis unavailable:") ? analysisStatus.replace("Analysis unavailable: ", "") : "Finding walls, rooms, doors, windows, and fixtures. This may take a little while for detailed plans."}</p>{analysisStatus.startsWith("Analysis unavailable:") ? <button className="toolbar-button" type="button" onClick={() => window.location.reload()}>Try again</button> : <><div className="analysis-progress-track"><span /></div><small>You can keep this page open while we work.</small></>}</div></div>}{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}${referenceMode ? " reference-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerDown={event => { if (referenceMode) { const point = planPoint(event); if (point) { setReferenceDragStart(point); setReferenceDragEnd(point); event.currentTarget.setPointerCapture(event.pointerId); } } }} onPointerMove={event => { if (referenceMode && referenceDragStart) { const point = planPoint(event); if (point) setReferenceDragEnd(point); } else if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={referenceMode ? "Click an item or drag to reference an area" : correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
               {drawingReferences.map((reference, index) => <g className="drawing-reference-mark" key={`reference-${index}`}><rect x={reference.bbox[0]} y={reference.bbox[1]} width={Math.max(1, reference.bbox[2] - reference.bbox[0])} height={Math.max(1, reference.bbox[3] - reference.bbox[1])} rx="3"/><text x={reference.bbox[0] + 4} y={reference.bbox[1] - 4}>{index + 1}</text></g>)}
               {animationStage !== null && geometry && <g className={`analysis-animation stage-${animationStage}`} aria-hidden="true">
                 {animationStage >= 0 && geometry.wall_segments.map((segment, index) => <line className="animated-wall" key={segment.id} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]} pathLength="1" style={{ animationDelay: `${Math.min(900, index * 18)}ms` }} />)}
