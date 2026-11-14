@@ -4,19 +4,27 @@
   uv run python scripts/verda_train.py run                     # cheapest available >= 24 GB GPU, yolo11s, 80 epochs
   uv run python scripts/verda_train.py run --type 1A100.22V --base rtdetr-l.pt --epochs 60 --batch 8
   uv run python scripts/verda_train.py run --host 1.2.3.4             # VM you created in the dashboard
+  uv run python scripts/verda_train.py run --host 1.2.3.4 --sweep "current A B C D" --questions-url <zip-url>
   uv run python scripts/verda_train.py run --host 1.2.3.4 --task wallseg   # wall segmenter (wallseg prepare first)
   uv run python scripts/verda_train.py attach <instance-id>    # re-follow a run (e.g. after the laptop slept)
+  uv run python scripts/verda_train.py attach --host 1.2.3.4   # same for a VM from the dashboard (never deleted)
   uv run python scripts/verda_train.py delete <instance-id>
 
 Credentials: VERDA_CLIENT_ID / VERDA_CLIENT_SECRET in the environment or the repo-root .env.
 The VM downloads CubiCasa5K itself (fast datacenter link); we upload only code, SVG labels and the holdout
 questions (the challenge preview, never trained on); for --task wallseg also the label masks (~20 MB).
-Results land in dataset/models/: symbol-det.{pt,onnx} or wallseg.{pt,log.csv}.
+Results land in dataset/models/: wallseg.{pt,log.csv}, or for the detector one folder per --sweep config in
+dataset/models/sweep/ (weights + sidecar, det_eval.json, viz/, fit-*/ fusion refits; presets in verda_remote.sh).
+The sweep also evaluates on the VM, which needs the challenge questions (--questions-url: the dataset zip, read
+with range requests) and dataset/cache/features_table.jsonl (uploaded). "current" = models/symbol-det.onnx.
+Works without rsync (Windows): falls back to tar / cat over ssh.
 The VM is deleted when the run ends, fails, times out (--max-hours) or is interrupted, unless --keep.
 """
 
 import argparse
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -114,7 +122,7 @@ def _ssh_key_id(client) -> str:
     for k in client.ssh_keys.get():
         if k.public_key.split()[:2] == pub.split()[:2]:
             return k.id
-    return client.ssh_keys.create(f"stoa-{os.uname().nodename}", pub).id
+    return client.ssh_keys.create(f"stoa-{platform.node()}", pub).id
 
 
 def _ssh_base(ip: str) -> list[str]:
@@ -129,6 +137,49 @@ def _ssh(ip: str, cmd: str, check=True, capture=False) -> subprocess.CompletedPr
 def _rsync(ip: str, src: list[str], dst: str, *extra: str) -> None:
     ssh = f"ssh -i {SSH_KEY} -o UserKnownHostsFile={KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new"
     subprocess.run(["rsync", "-az", "--info=stats1", "-e", ssh, *extra, *src, dst], check=True)
+
+
+# Transfers: rsync when installed, else tar / cat over ssh (Windows has ssh and tar, not rsync).
+# Directory helpers copy the *contents* of the source directory into the target directory.
+_HAVE_RSYNC = shutil.which("rsync") is not None
+
+
+def _put_dir(ip: str, local: Path, remote: str, excludes: tuple[str, ...] = ()) -> None:
+    if _HAVE_RSYNC:
+        return _rsync(ip, [str(local) + "/"], f"root@{ip}:{remote}/", *(f"--exclude={e}" for e in excludes))
+    tar = subprocess.Popen(["tar", "-C", str(local), "-czf", "-", *(f"--exclude={e}" for e in excludes), "."],
+                           stdout=subprocess.PIPE)
+    subprocess.run(_ssh_base(ip) + [f"mkdir -p {remote} && tar -C {remote} -xzf -"], stdin=tar.stdout, check=True)
+    tar.stdout.close()
+    if tar.wait():
+        raise subprocess.CalledProcessError(tar.returncode, "tar")
+
+
+def _put_file(ip: str, local: Path, remote: str) -> None:
+    if _HAVE_RSYNC:
+        return _rsync(ip, [str(local)], f"root@{ip}:{remote}")
+    with open(local, "rb") as f:
+        subprocess.run(_ssh_base(ip) + [f"mkdir -p $(dirname {remote}) && cat > {remote}"], stdin=f, check=True)
+
+
+def _get_dir(ip: str, remote: str, local: Path, excludes: tuple[str, ...] = ()) -> None:
+    local.mkdir(parents=True, exist_ok=True)
+    if _HAVE_RSYNC:
+        return _rsync(ip, [f"root@{ip}:{remote}/"], str(local) + "/", *(f"--exclude={e}" for e in excludes))
+    ex = " ".join(f"--exclude={e}" for e in excludes)
+    ssh = subprocess.Popen(_ssh_base(ip) + [f"tar -C {remote} -czf - {ex} ."], stdout=subprocess.PIPE)
+    subprocess.run(["tar", "-C", str(local), "-xzf", "-"], stdin=ssh.stdout, check=True)
+    ssh.stdout.close()
+    if ssh.wait():
+        raise subprocess.CalledProcessError(ssh.returncode, "ssh tar")
+
+
+def _get_file(ip: str, remote: str, local: Path) -> None:
+    local.parent.mkdir(parents=True, exist_ok=True)
+    if _HAVE_RSYNC:
+        return _rsync(ip, [f"root@{ip}:{remote}"], str(local))
+    with open(local, "wb") as f:
+        subprocess.run(_ssh_base(ip) + [f"cat {remote}"], stdout=f, check=True)
 
 
 def _wait_running(client, iid: str, timeout_s: float = 1200) -> str:
@@ -181,13 +232,14 @@ def _collect(ip: str, task: str = "symdet") -> None:
     models = DATASET / "models"
     models.mkdir(parents=True, exist_ok=True)
     if task == "wallseg":
-        _rsync(ip, [f"root@{ip}:{REMOTE}/data/out/wallseg/"], str(models) + "/")
-        _rsync(ip, [f"root@{ip}:{REMOTE}/train.log"], str(models / "wallseg.train.log"))
+        _get_dir(ip, f"{REMOTE}/data/out/wallseg", models)
+        _get_file(ip, f"{REMOTE}/train.log", models / "wallseg.train.log")
         print(f"weights in {models}: wallseg.pt, wallseg.log.csv")
         return
-    _rsync(ip, [f"root@{ip}:{REMOTE}/data/out/"], str(models) + "/", "--exclude=wallseg/")
-    _rsync(ip, [f"root@{ip}:{REMOTE}/train.log"], str(models / "symbol-det.train.log"))
-    print(f"weights in {models}: symbol-det.pt, symbol-det.onnx, symbol-det.results.csv")
+    sweep = models / "sweep"
+    _get_dir(ip, f"{REMOTE}/data/out", sweep, ("wallseg",))
+    _get_file(ip, f"{REMOTE}/train.log", sweep / "train.log")
+    print(f"results in {sweep}: one folder per config (symbol-det.pt/.onnx/.json, det_eval.*, viz/, fit-*/)")
 
 
 def cmd_run(args) -> None:
@@ -225,21 +277,38 @@ def cmd_run(args) -> None:
 
 def _train_on(ip: str, args, holdout: Path, svg: Path) -> bool:
     """Upload code + labels to a running VM, train there, follow the log, download the results."""
-    print(f"up at {ip}; uploading code + labels")
-    _ssh(ip, f"mkdir -p {REMOTE}/backend {REMOTE}/data/cache && "
-             "(command -v rsync >/dev/null || (apt-get update -qq && apt-get install -y -qq rsync))")
-    _rsync(ip, [str(BACKEND) + "/"], f"root@{ip}:{REMOTE}/backend/",
-           "--exclude=.venv", "--exclude=__pycache__", "--exclude=.pytest_cache")
-    _rsync(ip, [str(svg)], f"root@{ip}:{REMOTE}/data/cache/")
-    _rsync(ip, [str(holdout)], f"root@{ip}:{REMOTE}/data/holdout.jsonl")
+    def missing(remote: str) -> bool:
+        return _ssh(ip, f"test -s {remote}", check=False, capture=True).returncode != 0
+
+    if args.skip_upload:  # code, labels and tables already on the VM from an earlier run (slow uplinks)
+        print(f"up at {ip}; --skip-upload: reusing the code and labels on the VM")
+    else:
+        print(f"up at {ip}; uploading code + labels")
+        _ssh(ip, f"mkdir -p {REMOTE}/backend {REMOTE}/data/cache && "
+                 "(command -v rsync >/dev/null || (apt-get update -qq && apt-get install -y -qq rsync))")
+        _put_dir(ip, BACKEND, f"{REMOTE}/backend", (".venv", "__pycache__", ".pytest_cache"))
+        _put_dir(ip, svg, f"{REMOTE}/data/cache/svg")
+        _put_file(ip, holdout, f"{REMOTE}/data/holdout.jsonl")
     if args.task == "wallseg":
         masks = DATASET / "cache" / "wallmasks"
         if not (masks / "index.json").is_file():
             raise SystemExit(f"{masks}/index.json missing: run `python -m app.cubicasa.wallseg prepare` first")
-        _rsync(ip, [str(masks)], f"root@{ip}:{REMOTE}/data/cache/")
-    env = f"TASK={args.task} BASE={args.base} EPOCHS={args.epochs} IMGSZ={args.imgsz} BATCH={args.batch} DEGREES={args.degrees}"
+        _put_dir(ip, masks, f"{REMOTE}/data/cache/wallmasks")
+        env = f"TASK=wallseg EPOCHS={args.epochs} BATCH={args.batch}"
+    else:
+        table = DATASET / "cache" / "features_table.jsonl"
+        if table.is_file() and not args.skip_upload:  # perception features of the fit images: refit runs on the VM
+            _put_file(ip, table, f"{REMOTE}/data/cache/features_table.jsonl")
+        current = REPO / "models" / "symbol-det.onnx"
+        if "current" in args.sweep.split() and current.is_file() and (
+                not args.skip_upload or missing(f"{REMOTE}/data/current/symbol-det.onnx")):
+            _put_file(ip, current, f"{REMOTE}/data/current/symbol-det.onnx")
+        env = (f"TASK=symdet SWEEP='{args.sweep}' EPOCHS={args.epochs} BATCH={args.batch} FRACTION={args.fraction} "
+               f"QUESTIONS_ZIP='{args.questions_zip}' QUESTIONS_URL='{args.questions_url or ''}'")
     # clear markers from an earlier run first, so _follow cannot see a stale DONE
-    _ssh(ip, f"cd {REMOTE} && rm -f DONE FAILED && {env} nohup bash backend/scripts/verda_remote.sh > train.log 2>&1 "
+    # strip CRs: a checkout on Windows may have CRLF line endings, which bash rejects (`set: pipefail`)
+    _ssh(ip, f"cd {REMOTE} && rm -f DONE FAILED && sed -i 's/\\r$//' backend/scripts/*.sh && "
+             f"{env} nohup bash backend/scripts/verda_remote.sh > train.log 2>&1 "
              "< /dev/null &")
     print("training started; following the log (if this script stops, training continues on the VM)")
     ok = _follow(ip, time.time() + args.max_hours * 3600)
@@ -249,6 +318,14 @@ def _train_on(ip: str, args, holdout: Path, svg: Path) -> bool:
 
 
 def cmd_attach(args) -> None:
+    if args.host:  # VM from the dashboard: no API, never deleted
+        ip = args.host.split("@")[-1]
+        ok = _follow(ip, time.time() + args.max_hours * 3600)
+        if ok:
+            _collect(ip, args.task)
+        sys.exit(0 if ok else 1)
+    if not args.id:
+        raise SystemExit("give an instance id or --host")
     client = _client()
     ip = _wait_running(client, args.id)
     ok = _follow(ip, time.time() + args.max_hours * 3600)
@@ -275,19 +352,27 @@ def main() -> None:
     p.add_argument("--image", help="OS image (default: newest Ubuntu+CUDA image for the type)")
     p.add_argument("--spot", action="store_true", help="cheaper, but can be reclaimed mid-run")
     p.add_argument("--task", choices=["symdet", "wallseg"], default="symdet")
-    p.add_argument("--base", default="yolo11s.pt", help="symdet only")
+    p.add_argument("--sweep", default="A", help='symdet: configs to train and evaluate in order, e.g. "current A B C D" '
+                   "(presets in verda_remote.sh; current = models/symbol-det.onnx, evaluation only)")
+    p.add_argument("--questions-url", default=os.environ.get("QUESTIONS_URL"),
+                   help="symdet: challenge dataset zip with questions.jsonl, for the fusion refit on the VM")
+    p.add_argument("--questions-zip", default="~/junction-dataset.zip",
+                   help="symdet: the same zip if it is already on the VM (preferred over --questions-url)")
+    p.add_argument("--fraction", type=float, default=1.0, help="symdet: fraction of train images (smoke tests)")
     p.add_argument("--epochs", type=int, default=None, help="default: 80 (symdet), 40 (wallseg)")
-    p.add_argument("--imgsz", type=int, default=1280, help="symdet only")
-    p.add_argument("--degrees", type=float, default=0.0, help="symdet only: random rotation augmentation (+/- deg)")
-    p.add_argument("--batch", type=int, default=None, help="default: 16 (symdet), 24 (wallseg)")
+    p.add_argument("--batch", type=float, default=None,
+                   help="default: 0.7 = share of GPU memory (symdet), 24 (wallseg)")
     p.add_argument("--holdout", default=str(_default_holdout()),
                    help="questions.jsonl whose images must never be trained on")
     p.add_argument("--max-hours", type=float, default=8)
     p.add_argument("--keep", action="store_true", help="don't delete the VM at the end")
     p.add_argument("--host", help="use an existing VM (root@IP or IP) instead of creating one; it is not deleted")
+    p.add_argument("--skip-upload", action="store_true",
+                   help="--host: reuse the code, labels and tables already uploaded by an earlier run")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("attach")
-    p.add_argument("id")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--host", help="re-follow a run on a VM from the dashboard (root@IP or IP); never deleted")
     p.add_argument("--max-hours", type=float, default=8)
     p.add_argument("--keep", action="store_true")
     p.add_argument("--task", choices=["symdet", "wallseg"], default="symdet")
@@ -299,7 +384,7 @@ def main() -> None:
     if args.cmd == "run":
         wall = args.task == "wallseg"
         args.epochs = args.epochs or (40 if wall else 80)
-        args.batch = args.batch or (24 if wall else 16)
+        args.batch = int(args.batch or 24) if wall else (args.batch or 0.7)
     args.fn(args)
 
 

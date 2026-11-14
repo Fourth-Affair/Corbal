@@ -64,7 +64,7 @@ def test_api_ask_svg(monkeypatch):
     "token,expected",
     [("MH", "bedroom"), ("MH 12,5 m²", "bedroom"), ("KH", "bathroom"), ("PESUH.", "bathroom"), ("WC", "wc"),
      ("SAUNA", "sauna"), ("KT", "kitchen"), ("TUPAK.+HUONE", "kitchen"), ("Lasitettu parveke", "balcony"),
-     ("PARVEKE", "balcony"), ("OH", "other"), ("TK", "other"), ("+108.382", None), ("70,0 m²", None)],
+     ("PARVEKE", "balcony"), ("OH", "living"), ("TK", "other"), ("+108.382", None), ("70,0 m²", None)],
 )
 def test_room_dictionary(token, expected):
     from app.cubicasa.rooms_dict import room_type

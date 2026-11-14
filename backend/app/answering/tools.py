@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.cubicasa.answer import count
-from app.models import Answer, PlanGraph, PlanItem
+from app.models import Answer, PlanGeometry, PlanGraph, PlanItem, RoomShape, WallSegment
 from app.router import TEMPLATES
 
 # What each count template counts (the dataset's counting rules). Shown to the model in the tool description.
@@ -79,10 +79,97 @@ def _area(b: tuple) -> float:
     return (b[2] - b[0]) * (b[3] - b[1])
 
 
+def _room_item(rm: RoomShape) -> PlanItem:
+    """A geometry room as a citable item: the frontend highlights its polygon."""
+    return PlanItem(id=rm.id, category="room", cls=rm.type, bbox=rm.bbox, polygon=rm.polygon, text=rm.name,
+                    raw=f"geometry:{rm.tier}")
+
+
+def _segment_item(sg: WallSegment) -> PlanItem:
+    """A wall segment as a citable item: its centreline buffered by half its thickness."""
+    from shapely.geometry import LineString
+
+    poly = LineString([sg.p0, sg.p1]).buffer(max(1.0, sg.thickness_px / 2), cap_style=2)
+    coords = [(round(x, 1), round(y, 1)) for x, y in list(poly.exterior.coords)[:-1]]
+    x0, y0, x1, y1 = poly.bounds
+    return PlanItem(id=sg.id, category="wall", bbox=(x0, y0, x1, y1), polygon=coords, raw="wall segment")
+
+
+def _evidence_summary(rm: RoomShape) -> str:
+    """The evidence for the winning type, strongest first, e.g. 'label "WC"; toilet inside'."""
+    parts = [e for e in rm.evidence if e.type == rm.type and e.weight > 0]
+    return "; ".join(e.detail for e in sorted(parts, key=lambda e: -e.weight)[:3])
+
+
+def _simplify(points: list[tuple[float, float]], max_points: int = 24) -> list[list[float]]:
+    from shapely.geometry import Polygon
+
+    poly, tol = Polygon(points), 1.0
+    while len(poly.exterior.coords) - 1 > max_points and tol < 1e4:
+        poly, tol = Polygon(points).simplify(tol, preserve_topology=True), tol * 2
+    return [[round(x), round(y)] for x, y in list(poly.exterior.coords)[:-1]]
+
+
+def _room_row(rm: RoomShape, detail: bool = False) -> dict[str, Any]:
+    row: dict[str, Any] = {"id": rm.id, "tier": rm.tier}
+    if rm.tier != "unknown":
+        row["type"] = rm.type
+        if rm.name:
+            row["label"] = rm.name
+        if len(rm.purposes) > 1:
+            row["purposes"] = rm.purposes  # open plan: several labels in one enclosed space
+        row["because"] = _evidence_summary(rm)
+        others = [(t, v) for t, v in rm.scores.items() if t != rm.type][:2]
+        if others:
+            row["alternatives"] = {t: v for t, v in others}
+        if rm.conflicts:
+            row["conflicting_evidence_for"] = rm.conflicts
+    if rm.area_m2 is not None:
+        row["area_m2"] = rm.area_m2
+    if rm.labeled_area_m2 is not None:
+        row["area_m2_written_on_drawing"] = rm.labeled_area_m2
+    if rm.area_m2_range is not None:
+        row["rough_area_m2_range"] = list(rm.area_m2_range)  # from door / fixture sizes: bounds, not a measurement
+    if rm.size_check:
+        row["size_check"] = rm.size_check
+    row["neighbours"] = rm.neighbours
+    row["openings"] = len(rm.connections)
+    if detail:
+        row["text_inside"] = [lb.text for lb in rm.labels]
+        row["bbox_px"] = [round(v) for v in rm.bbox]
+        row["evidence"] = [{"for": e.type, "points": e.weight, "what": e.detail, **({"item": e.item_id} if e.item_id else {})}
+                           for e in sorted(rm.evidence, key=lambda e: -e.weight)]
+    return row
+
+
+def _segment_row(sg: WallSegment) -> dict[str, Any]:
+    row: dict[str, Any] = {"id": sg.id, "from_px": list(sg.p0), "to_px": list(sg.p1), "orientation": sg.orientation,
+                           "length_px": sg.length_px, "thickness_px": sg.thickness_px}
+    if sg.length_m is not None:
+        row["length_m"] = sg.length_m
+        row["thickness_m"] = sg.thickness_m
+    row["side_a"] = sg.rooms_left
+    row["side_b"] = sg.rooms_right
+    row["exterior"] = sg.exterior
+    if sg.openings:
+        row["openings"] = sg.openings
+    return row
+
+
 class PlanTools:
-    def __init__(self, graph: PlanGraph):
+    def __init__(self, graph: PlanGraph, geometry: PlanGeometry | None = None):
         self.graph = graph
+        self.geometry = geometry
         self.by_id = {it.id: it for it in graph.items}
+        self.rooms = {rm.id: rm for rm in geometry.rooms} if geometry else {}
+        self.segments = {sg.id: sg for sg in geometry.wall_segments} if geometry else {}
+        for rm in self.rooms.values():
+            self.by_id.setdefault(rm.id, _room_item(rm))
+        for sg in self.segments.values():
+            self.by_id.setdefault(sg.id, _segment_item(sg))
+
+    def declarations(self) -> list[dict]:
+        return DECLARATIONS + (ROOM_DECLARATIONS if self.geometry else [])
 
     # --- tools -------------------------------------------------------------------------------------------------
 
@@ -157,11 +244,97 @@ class PlanTools:
                "note": "Containment uses the container's bounding box (item centre inside), so it is approximate."}
         return out, ToolTrace(item_ids=[region.id] + [it.id for it in hits[:MAX_LIST]], numbers=[len(hits)])
 
+    def _scale_note(self) -> str:
+        sc = self.geometry.scale if self.geometry else None
+        sym = self.geometry.symbol_scale if self.geometry else None
+        if sc is None:
+            if sym is not None:
+                return ("No drawing scale. rough_area_m2_range is a wide bound estimated from the typical sizes of the "
+                        "detected doors and fixtures: give it only as a rough range ('roughly X-Y m²'), never as a "
+                        "measurement, and suggest setting the scale for exact sizes.")
+            return "No drawing scale: metric sizes are unknown except areas written on the drawing."
+        warn = f" Warning: this scale {sc.warning}." if sc.warning else ""
+        if sc.source == "calibration":
+            return "Metric sizes use the user's scale calibration." + warn
+        return (f"Metric sizes use a scale derived from the areas written in rooms {', '.join(sc.rooms)}: "
+                "mention that they are derived, not measured." + warn)
+
+    def list_rooms(self, include_uncertain: bool = False) -> tuple[dict, ToolTrace]:
+        rooms = [rm for rm in self.rooms.values() if include_uncertain or rm.tier == "strong"]
+        tiers = {t: sum(rm.tier == t for rm in self.rooms.values()) for t in ("strong", "weak", "unknown")}
+        out = {"strong_rooms": tiers["strong"], "weak_rooms": tiers["weak"], "unknown_spaces": tiers["unknown"],
+               "rooms": [_room_row(rm) for rm in rooms[:MAX_LIST]],
+               "note": ("Rooms are spaces enclosed by the detected walls; the type combines a readable label inside "
+                        "the room (strong), decisive fixtures such as a toilet or shower (strong) and the 2019 "
+                        "segmentation model (weak). tier strong: state the type plainly. weak: say 'probably <type>' "
+                        "and why. unknown: purpose not determined, never guess it. An open-plan space with several "
+                        "labels is one enclosed space with several purposes. " + self._scale_note())}
+        numbers: list[float] = [tiers["strong"], tiers["weak"], tiers["unknown"], len(rooms)]
+        numbers += [rm.area_m2 for rm in rooms if rm.area_m2 is not None]
+        numbers += [rm.labeled_area_m2 for rm in rooms if rm.labeled_area_m2 is not None]
+        numbers += [v for rm in rooms if rm.area_m2_range for v in rm.area_m2_range]
+        return out, ToolTrace(item_ids=[rm.id for rm in rooms[:MAX_LIST]], numbers=numbers)
+
+    def room_details(self, room_id: str) -> tuple[dict, ToolTrace]:
+        rm = self.rooms.get(room_id)
+        if rm is None:
+            return {"error": f"no room {room_id!r} (use ids from list_rooms)"}, ToolTrace()
+        from shapely.geometry import Point, Polygon
+
+        poly = Polygon(rm.polygon)
+        inside = [it for it in self.graph.items if it.category in ("door", "window", "fixture") and poly.contains(
+            Point((it.bbox[0] + it.bbox[2]) / 2, (it.bbox[1] + it.bbox[3]) / 2))]
+        openings = [op for op in (self.geometry.openings if self.geometry else []) if op.id in rm.connections]
+        walls = [self.segments[w] for w in rm.walls if w in self.segments]
+        row = _room_row(rm, detail=True)
+        row["outline_px"] = _simplify(rm.polygon)
+        if self.geometry and self.geometry.scale:
+            m = self.geometry.scale.m_per_px
+            row["outline_m"] = [[round(x * m, 2), round(y * m, 2)] for x, y in row["outline_px"]]
+        row["neighbours"] = [{"id": n, "tier": self.rooms[n].tier,
+                              **({"type": self.rooms[n].type} if self.rooms[n].tier != "unknown" else {})}
+                             for n in rm.neighbours if n in self.rooms]
+        row["openings"] = [{"id": op.id, "leads_to": [r for r in op.rooms if r != rm.id] or ["(same room)"],
+                            **({"symbol": op.symbol} if op.symbol else {})} for op in openings]
+        row["walls"] = [_segment_row(sg) for sg in walls[:MAX_LIST]]
+        row["items_inside"] = [_row(it) for it in inside[:MAX_LIST]]
+        row["note"] = ("Items inside = detected doors/windows/fixtures whose centre lies in the room outline. "
+                       "Walls = wall segments bounding the room ('outside' = exterior). " + self._scale_note())
+        numbers: list[float] = [len(inside), len(openings), len(walls)]
+        numbers += [v for v in (rm.area_m2, rm.labeled_area_m2) if v is not None]
+        numbers += list(rm.area_m2_range or ())
+        numbers += [v for sg in walls for v in (sg.length_m, sg.thickness_m, sg.length_px) if v is not None]
+        return row, ToolTrace(item_ids=[rm.id] + [it.id for it in inside[:MAX_LIST]] + [sg.id for sg in walls[:MAX_LIST]],
+                              numbers=numbers)
+
+    def list_walls(self, room_id: str | None = None, exterior_only: bool = False) -> tuple[dict, ToolTrace]:
+        segs = list(self.segments.values())
+        if room_id:
+            if room_id not in self.rooms:
+                return {"error": f"no room {room_id!r} (use ids from list_rooms)"}, ToolTrace()
+            segs = [sg for sg in segs if room_id in sg.rooms_left + sg.rooms_right]
+        if exterior_only:
+            segs = [sg for sg in segs if sg.exterior]
+        segs.sort(key=lambda sg: -sg.length_px)
+        shown = segs[:MAX_LIST]
+        out = {"count": len(segs), "walls": [_segment_row(sg) for sg in shown],
+               "note": ("Straight wall pieces (centrelines) from the wall detection; side_a / side_b = rooms on the two "
+                        "faces, 'outside' = exterior. Coordinates are image pixels, origin top-left. "
+                        + self._scale_note())}
+        if len(segs) > len(shown):
+            out["truncated"] = f"showing the {len(shown)} longest of {len(segs)}"
+        numbers: list[float] = [len(segs)]
+        numbers += [v for sg in shown for v in (sg.length_m, sg.thickness_m, sg.length_px, sg.thickness_px)
+                    if v is not None]
+        return out, ToolTrace(item_ids=[sg.id for sg in shown], numbers=numbers)
+
     # --- dispatch ----------------------------------------------------------------------------------------------
 
     def call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
         fn = {"plan_summary": self.plan_summary, "count_template": self.count_template,
-              "list_items": self.list_items, "items_in": self.items_in}.get(name)
+              "list_items": self.list_items, "items_in": self.items_in,
+              **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls}
+                 if self.geometry else {})}.get(name)
         if fn is None:
             return {"error": f"unknown tool {name!r}"}, ToolTrace()
         try:
@@ -204,5 +377,39 @@ DECLARATIONS = [
             "category": {"type": "string", "enum": CATEGORIES},
             "type": {"type": "string", "enum": ROOM_TYPES + FIXTURE_TYPES},
         }, "required": ["container_id", "category"]},
+    },
+]
+
+
+# Only offered when the plan has stored room geometry (uploaded plans); the benchmark path keeps the tools above.
+ROOM_DECLARATIONS = [
+    {
+        "name": "list_rooms",
+        "description": ("Rooms as spaces enclosed by the plan's walls. Each has a type from combined evidence (a label "
+                        "read inside it, fixtures such as a toilet or shower, the segmentation model) with a tier: "
+                        "strong, weak or unknown; why; its area in m² when a scale is known or an area is written in "
+                        "it; and its neighbouring rooms. Use it for which rooms exist, what they are for, their sizes "
+                        "and how they connect."),
+        "parameters": {"type": "object", "properties": {
+            "include_uncertain": {"type": "boolean",
+                                  "description": "also list weak and unknown spaces (default: strong only)"},
+        }},
+    },
+    {
+        "name": "room_details",
+        "description": ("One room from list_rooms: outline coordinates, all text read inside it, the full evidence for "
+                        "its type, its wall segments with lengths, openings and where they lead, neighbouring rooms, "
+                        "and the detected doors, windows and fixtures inside it."),
+        "parameters": {"type": "object", "properties": {"room_id": {"type": "string"}}, "required": ["room_id"]},
+    },
+    {
+        "name": "list_walls",
+        "description": ("Wall segments (straight centrelines): endpoints, length and thickness (px, and m when a scale "
+                        "is known), the rooms on each side, exterior or interior, and openings in them. Optionally only "
+                        "the walls of one room or only exterior walls."),
+        "parameters": {"type": "object", "properties": {
+            "room_id": {"type": "string"},
+            "exterior_only": {"type": "boolean"},
+        }},
     },
 ]

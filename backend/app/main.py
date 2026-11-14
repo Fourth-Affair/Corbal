@@ -1,5 +1,7 @@
 import io
 import json
+import logging
+import math
 import os
 from typing import Literal
 from urllib.error import HTTPError, URLError
@@ -12,11 +14,13 @@ from fastapi.responses import FileResponse, Response
 
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanGraph, PlanItem,
-                        PlanFeedbackRequest, PlanOutlinesRequest, PlanQuestionRequest)
+from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
+                        PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest, PlanScale,
+                        PlanScaleCalibration)
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
+log = logging.getLogger(__name__)
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
@@ -453,6 +457,7 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
         except Exception as error:  # noqa: BLE001  unreadable or encrypted PDF
             raise HTTPException(status_code=422, detail=f"Uploaded PDF could not be read: {error}") from error
         _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+        _store_geometry_safely(plan_id, graph)
         return graph
 
     # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
@@ -477,7 +482,138 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
     _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+    _store_geometry_safely(plan_id, graph)
     return graph
+
+
+# ---------------------------------------------------------------- plan geometry (rooms, walls, openings)
+
+def _geometry_request(plan_id: UUID, method: str = "GET", body: dict | None = None) -> dict | None:
+    """Read or upsert the plan_geometry row (backend-only credentials, like plan_knowledge)."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    query = urlencode({"on_conflict": "plan_id"}) if method == "POST" else urlencode(
+        {"plan_id": f"eq.{plan_id}", "select": "geometry"})
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
+    if method == "POST":
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_geometry?{query}",
+                      data=json.dumps(body).encode() if body is not None else None, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=30) as response:
+            if method == "POST":
+                return None
+            rows = json.loads(response.read())
+            return rows[0]["geometry"] if rows else None
+    except HTTPError as error:
+        reason = error.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Plan geometry request failed: {reason or error.reason}") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+
+
+def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
+    from app.cubicasa.rooms import geometry_from_graph, geometry_from_image
+
+    if graph.source == "pdf":
+        return geometry_from_graph(graph)
+    from app.config import CACHE_DIR
+
+    rel = f"uploads/{plan_id}.png"
+    path = CACHE_DIR / rel
+    if not path.is_file():  # cache cleared since the analysis: fetch the source image again
+        from PIL import Image
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB").save(path, format="PNG")
+    return geometry_from_image(rel, path, graph)
+
+
+def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
+    _geometry_request(plan_id, "POST", {
+        "plan_id": str(plan_id),
+        # metric values and size checks depend on the user's calibration at read time: stored in pixels only
+        "geometry": geometry.model_dump(mode="json", exclude={"rooms": {"__all__": {"area_m2", "area_m2_range",
+                                                                                  "size_check"}},
+                                                              "wall_segments": {"__all__": {"length_m", "thickness_m"}}}),
+        "model": geometry.model, "strong_rooms": sum(r.tier == "strong" for r in geometry.rooms),
+        "weak_rooms": sum(r.tier == "weak" for r in geometry.rooms)})
+
+
+def _store_geometry_safely(plan_id: UUID, graph: PlanGraph) -> None:
+    """Geometry is an extra layer: a failure here must not fail the analysis (it is retried on first read)."""
+    try:
+        _store_geometry(plan_id, _compute_geometry(plan_id, graph))
+    except Exception as error:  # noqa: BLE001
+        log.warning("plan %s: geometry not stored (%s)", plan_id, error)
+
+
+def _metres_per_unit(scale: PlanScaleCalibration) -> float | None:
+    """Metres per image pixel (PDF point) from the user's two-point calibration."""
+    (x1, y1), (x2, y2) = scale.points
+    span = math.hypot(x2 - x1, y2 - y1)
+    if span <= 0:
+        return None
+    unit_m = {"m": 1.0, "cm": 0.01, "ft": 0.3048, "in": 0.0254}[scale.unit]
+    return scale.distance * unit_m / span
+
+
+def with_metrics(geometry: PlanGeometry, calibration: PlanScaleCalibration | None) -> PlanGeometry:
+    """Fill room areas (m²) and wall lengths / thicknesses (m). The user's calibration wins over the scale derived from
+    written room areas; geometry.scale says which one was used."""
+    if calibration and (m := _metres_per_unit(calibration)):
+        geometry.scale = PlanScale(m_per_px=m, source="calibration")
+    if geometry.scale:
+        m = geometry.scale.m_per_px
+        for room in geometry.rooms:
+            room.area_m2 = round(room.area_px * m * m, 2)
+        for seg in geometry.wall_segments:
+            seg.length_m = round(seg.length_px * m, 2)
+            seg.thickness_m = round(seg.thickness_px * m, 3)
+    from app.cubicasa.size_priors import check_sizes
+
+    check_sizes(geometry)  # rough ranges from symbol sizes + plausibility (may lower a room's tier)
+    return geometry
+
+
+def _plan_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
+    """Stored geometry, computed and stored on first use for plans analysed before it existed."""
+    stored = _geometry_request(plan_id)
+    if stored is not None and stored.get("version", 1) >= PlanGeometry.model_fields["version"].default:
+        try:
+            return PlanGeometry.model_validate(stored)
+        except ValueError:
+            log.warning("plan %s: stored geometry is invalid, recomputing", plan_id)
+    geometry = _compute_geometry(plan_id, graph)
+    _store_geometry(plan_id, geometry)
+    return geometry
+
+
+def _saved_scale(plan_id: UUID) -> PlanScaleCalibration | None:
+    try:
+        row = _scale_request(plan_id)
+        return PlanScaleCalibration.model_validate(row) if row else None
+    except (HTTPException, ValueError):
+        return None
+
+
+@app.get("/api/plans/{plan_id}/geometry", response_model=PlanGeometry)
+def get_plan_geometry(plan_id: UUID, uncertain: bool = Query(True, description="include weak / unknown rooms")
+                      ) -> PlanGeometry:
+    """Rooms (polygons, type from combined evidence with a strong / weak / unknown tier), wall segments, walls and
+    openings of an analysed plan. Metric areas and lengths use the user's calibration, else written room areas."""
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    try:
+        geometry = _plan_geometry(plan_id, graph)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=f"Wall model unavailable: {error}") from error
+    if not uncertain:
+        geometry.rooms = [r for r in geometry.rooms if r.tier == "strong"]
+    return with_metrics(geometry, _saved_scale(plan_id))
 
 
 @app.post("/api/plans/{plan_id}/ask", response_model=Answer)
@@ -542,7 +678,12 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     if ANSWERER == "llm":
         from app.answering.agent import answer
 
-        if (result := answer(req.question, graph, req.history, req.scale)) is not None:
+        geometry = None
+        try:  # room tools for the agent; without geometry it answers with the item tools only
+            geometry = with_metrics(_plan_geometry(plan_id, graph), req.scale)
+        except Exception as error:  # noqa: BLE001
+            log.warning("plan %s: no geometry for the agent (%s)", plan_id, error)
+        if (result := answer(req.question, graph, req.history, req.scale, geometry=geometry)) is not None:
             return result
     return _template_answer(req.question, graph)
 

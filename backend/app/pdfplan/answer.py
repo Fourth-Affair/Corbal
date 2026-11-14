@@ -80,11 +80,11 @@ def raster_symbols(rel: str) -> tuple[Symbol, ...]:
         img = pdf[0].render(scale=k).to_pil().convert("RGB")
     finally:
         pdf.close()
-    res = symdet._model().predict(img, imgsz=symdet.IMGSZ, conf=symdet.ITEM_CONF, iou=0.5, max_det=1000, verbose=False)[0]
     out = []
-    for (x0, y0, x1, y1), c in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist()):
-        kind = _DET_KIND.get(res.names[int(c)])
+    for d in symdet.predict_image(img, conf=symdet.ITEM_CONF):
+        kind = _DET_KIND.get(d["cls"])
         if kind:
+            x0, y0, x1, y1 = d["bbox"]
             out.append(Symbol(kind, (x0 / k, y0 / k, x1 / k, y1 / k)))
     return tuple(out)
 

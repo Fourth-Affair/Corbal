@@ -17,7 +17,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from app.config import DATASET_DIR, MODELS_DIR
+from app.config import CACHE_DIR, DATASET_DIR, MODELS_DIR
 from app.cubicasa.features import FEAT_DIR
 
 DET_NAMES = ["door", "window", "toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove"]
@@ -31,7 +31,24 @@ DET_GROUPS = {"sinks": ("sink", "double_sink"), "showers_baths": ("shower", "bat
 CONF_THRESHOLDS = (0.25, 0.4, 0.55, 0.7)
 MIN_CONF = 0.1  # what is cached; features threshold higher
 ITEM_CONF = 0.4  # detections shown as evidence / citations
-IMGSZ = int(os.environ.get("SYMDET_IMGSZ", 1280))  # must match training
+TILE_OVERLAP = 256  # px of native resolution shared by neighbouring tiles (> the largest symbol side)
+
+
+def weights_meta() -> dict:
+    """How the weights were trained: imgsz and tile (native-resolution tile side, 0 = whole image).
+
+    Read from the `<weights>.json` sidecar written by app.cubicasa.train; SYMDET_IMGSZ / SYMDET_TILE override it.
+    Without a sidecar: the original detector (whole image at 1280)."""
+    meta = {"imgsz": 1280, "tile": 0}
+    p = weights_path()
+    side = p.with_suffix(".json") if p else None
+    if side and side.is_file():
+        meta |= {k: v for k, v in json.loads(side.read_text(encoding="utf-8")).items() if k in meta}
+    for k in meta:
+        env = os.environ.get(f"SYMDET_{k.upper()}")
+        if env:
+            meta[k] = int(env)
+    return meta
 
 
 def weights_path() -> Path | None:
@@ -72,33 +89,102 @@ def _model():
 
 
 def det_path(rel: str) -> Path:
-    return FEAT_DIR / f"{Path(rel).stem}.det.json"
+    # SYMDET_CACHE_DIR keeps the caches of several candidate detectors apart (one file per image otherwise)
+    return Path(os.environ.get("SYMDET_CACHE_DIR") or FEAT_DIR) / f"{Path(rel).stem}.det.json"
+
+
+def image_path(rel: str) -> Path:
+    """Challenge PNG if present, else the byte-identical original `<variant>/<id>/F1_original.png`."""
+    from app.config import CUBICASA_ORIG_DIR
+
+    p = DATASET_DIR / rel
+    if p.is_file():
+        return p
+    variant, _, num = Path(rel).stem.rpartition("-")
+    q = CUBICASA_ORIG_DIR / variant / num / "F1_original.png"
+    return q if q.is_file() else p
 
 
 def cached(rel: str) -> list[dict] | None:
-    """Cached detections for the current weights, or None."""
+    """Cached detections for the current weights and inference settings, or None."""
     p = det_path(rel)
     if not p.is_file():
         return None
     d = json.loads(p.read_text(encoding="utf-8"))
-    return d["dets"] if d.get("weights") == fingerprint() else None
+    meta = weights_meta()
+    ok = d.get("weights") == fingerprint() and d.get("imgsz", 1280) == meta["imgsz"] and d.get("tile", 0) == meta["tile"]
+    return d["dets"] if ok else None
+
+
+def tile_starts(length: int, tile: int, overlap: int = TILE_OVERLAP) -> list[int]:
+    """Tile origins covering [0, length): stride tile - overlap, the last tile flush with the end."""
+    if length <= tile:
+        return [0]
+    starts = list(range(0, length - tile, tile - overlap))
+    return starts + [length - tile]
+
+
+def nms(dets: list[dict], iou: float = 0.5, ios: float = 0.7) -> list[dict]:
+    """Class-wise greedy NMS over merged tile outputs. Besides IoU, suppresses a box mostly inside a stronger one
+    (intersection over the smaller box >= ios): a symbol cut by a tile border is a fragment of the full box."""
+    keep: list[dict] = []
+    for d in sorted(dets, key=lambda d: -d["conf"]):
+        a = d["bbox"]
+        aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        dup = False
+        for k in keep:
+            if k["cls"] != d["cls"]:
+                continue
+            b = k["bbox"]
+            iw, ih = min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+            if iw <= 0 or ih <= 0:
+                continue
+            inter = iw * ih
+            bb = (b[2] - b[0]) * (b[3] - b[1])
+            if inter / (aa + bb - inter) >= iou or inter / max(1e-6, min(aa, bb)) >= ios:
+                dup = True
+                break
+        if not dup:
+            keep.append(d)
+    return keep
+
+
+def _predict(img: Image.Image, imgsz: int, ox: float = 0.0, oy: float = 0.0) -> list[dict]:
+    res = _model().predict(img, imgsz=imgsz, conf=MIN_CONF, iou=0.5, max_det=1000, verbose=False)[0]
+    names = res.names
+    return [{"cls": names[int(k)], "conf": round(float(c), 4),
+             "bbox": [round(x0 + ox, 1), round(y0 + oy, 1), round(x1 + ox, 1), round(y1 + oy, 1)]}
+            for (x0, y0, x1, y1), c, k in zip(res.boxes.xyxy.tolist(), res.boxes.conf.tolist(), res.boxes.cls.tolist())]
+
+
+def predict_image(img: Image.Image, conf: float = MIN_CONF) -> list[dict]:
+    """Uncached detections on a PIL image, whole or tiled as the weights were trained."""
+    img = img.convert("RGB")
+    meta = weights_meta()
+    tile = meta["tile"]
+    if not tile:
+        return [d for d in _predict(img, meta["imgsz"]) if d["conf"] >= conf]
+    dets = []
+    for y in tile_starts(img.height, tile):
+        for x in tile_starts(img.width, tile):
+            crop = img.crop((x, y, min(x + tile, img.width), min(y + tile, img.height)))
+            dets += _predict(crop, meta["imgsz"], x, y)
+    return [d for d in nms(dets) if d["conf"] >= conf]
 
 
 def detect(rel: str, img: Image.Image | None = None) -> list[dict]:
-    """Detections as [{"cls", "conf", "bbox": [x0, y0, x1, y1]}] in pixels of the challenge PNG (cached)."""
+    """Detections as [{"cls", "conf", "bbox": [x0, y0, x1, y1]}] in pixels of the challenge PNG (cached).
+
+    Tiled weights (sidecar tile > 0) run on native-resolution tiles; boxes are merged with `nms`."""
     hit = cached(rel)
     if hit is not None:
         return hit
-    img = (img or Image.open(DATASET_DIR / rel)).convert("RGB")
-    res = _model().predict(img, imgsz=IMGSZ, conf=MIN_CONF, iou=0.5, max_det=1000, verbose=False)[0]
-    dets = []
-    names = res.names
-    for (x0, y0, x1, y1), c, k in zip(res.boxes.xyxy.tolist(), res.boxes.conf.tolist(), res.boxes.cls.tolist()):
-        dets.append({"cls": names[int(k)], "conf": round(float(c), 4),
-                     "bbox": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)]})
+    img = (img or Image.open(image_path(rel))).convert("RGB")
+    dets = predict_image(img)
+    meta = weights_meta()
     p = det_path(rel)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"weights": fingerprint(), "imgsz": IMGSZ, "dets": dets}))
+    p.write_text(json.dumps({"weights": fingerprint(), **meta, "dets": dets}))
     return dets
 
 
@@ -119,8 +205,8 @@ def main() -> None:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--splits", nargs="+", default=["val", "test", "train"])
-    ap.add_argument("--only-featured", action="store_true", default=True,
-                    help="only images that already have perception features (the fit table)")
+    ap.add_argument("--all", dest="only_featured", action="store_false",
+                    help="every image, not only those in the fit table (default: only images with perception features)")
     args = ap.parse_args()
     if not available():
         raise SystemExit("no detector weights; train one first (scripts/verda_train.py)")
@@ -129,7 +215,12 @@ def main() -> None:
     featured = None
     if args.only_featured and TABLE.exists():
         featured = {json.loads(line)["path"] for line in TABLE.read_text(encoding="utf-8").splitlines()}
-    paths = sorted({q["path"] for q in load_questions()})
+    from app.config import DATASET_DIR as DS
+
+    if (DS / "questions.jsonl").is_file():
+        paths = sorted({q["path"] for q in load_questions()})
+    else:  # e.g. on the training VM: every image with ground-truth labels
+        paths = sorted(f"data/cubicasa5k/{f.stem}.png" for f in (CACHE_DIR / "svg").glob("*.json"))
     todo = [p for p in paths if split_of(p) in args.splits and (featured is None or p in featured)]
     t0 = time.time()
     for i, rel in enumerate(todo, 1):
