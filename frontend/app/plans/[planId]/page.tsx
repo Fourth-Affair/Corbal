@@ -42,6 +42,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [scaleLoaded, setScaleLoaded] = useState(false);
   const [scaleMode, setScaleMode] = useState(false);
   const [measureMode, setMeasureMode] = useState(false);
+  const [measurementRequested, setMeasurementRequested] = useState(false);
   const [scalePoints, setScalePoints] = useState<Array<[number, number]>>([]);
   const [measurePoints, setMeasurePoints] = useState<Array<[number, number]>>([]);
   const [draggingMeasurePoint, setDraggingMeasurePoint] = useState<number | null>(null);
@@ -251,7 +252,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       const explanation = typeof result.explanation === "string" ? result.explanation : "";
       const needsScale = !scale && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
       const needsOutline = Boolean(scale) && /boundary|outline/i.test(explanation) && !hasRequiredOutline(submitted);
-      const answer = needsScale
+      const needsMeasurement = Boolean(scale) && /\b(measure|measurement|distance|length|width|wide|long)\b/i.test(submitted);
+      const answer = needsMeasurement
+        ? "I can measure that on the plan. Choose the two points you want to measure, and I’ll calculate the distance."
+        : needsScale
         ? "Let’s set the drawing scale first. Click the two ends of a distance you know on the plan, such as a wall with a printed measurement. Then enter that real distance and unit to calibrate the drawing."
         : needsOutline
           ? getRequestedRoomType(submitted)
@@ -270,6 +274,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       } else if (needsOutline) {
         setPendingAreaQuestion(submitted);
         startOutlineReview(submitted);
+      } else if (needsMeasurement) {
+        setMeasurementRequested(true);
       }
     } catch (askError) {
       setCitations([]);
@@ -288,6 +294,15 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setScaleDistance("");
     setScaleUnit("m");
     setScaleError(null);
+  }
+
+  function startMeasurement() {
+    setMeasurementRequested(false);
+    setMeasureMode(true);
+    setMeasurePoints([]);
+    setScaleMode(false);
+    setOutlineMode(false);
+    setCorrectionMode(false);
   }
 
   function cancelScaleCalibration() {
@@ -510,7 +525,6 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
           {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
-          {ready && scaleLoaded && scale && !scaleMode && <button className="toolbar-button" type="button" onClick={() => { setMeasureMode(true); setMeasurePoints([]); setScaleMode(false); }}>Measure distance</button>}
           {ready && !correctionMode && <button className="toolbar-button" type="button" onClick={startCorrectionReview}>Review detections</button>}
           {correctionMode && <button className="toolbar-button" type="button" onClick={() => { setCorrectionMode(false); setCorrectionAddMode(false); setSelectedEvidenceId(null); }}>Done reviewing</button>}
           {ready && scaleLoaded && !outlineMode && <button className="toolbar-button" type="button" onClick={() => startOutlineReview()}>{savedOutlines.length ? `Edit ${savedOutlines[0].label?.toLowerCase() ?? "outline"}` : floorOutlines.length ? "Review detected outline" : "Draw outline"}</button>}
@@ -559,6 +573,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
           <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p>{message.role === "assistant" && index > 0 && <div className="answer-feedback">{message.feedback ? <small>Thanks for the feedback.</small> : <><button type="button" onClick={() => void submitFeedback(index, "helpful")}>Helpful</button><button type="button" onClick={() => void submitFeedback(index, "incorrect")}>Needs correction</button><button type="button" onClick={() => void submitFeedback(index, "unclear")}>Unclear</button></>}</div>}</div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
           {feedbackError && <p className="feedback-error" role="alert">{feedbackError}</p>}
+          {measurementRequested && <section className="requested-action" aria-label="Requested measurement">
+            <div><strong>Measure a distance</strong><span>Choose the two points you want measured on the plan.</span></div>
+            <button className="toolbar-button primary-button" type="button" onClick={startMeasurement}>Choose points</button>
+          </section>}
           <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
         </aside>
       </div>

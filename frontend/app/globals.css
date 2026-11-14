@@ -70,6 +70,10 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .pdf-preview span { max-width: 320px; overflow-wrap: anywhere; color: #7c887f; font-size: 12px; }
 
 .chat-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: #fff; }
+.requested-action { margin: 0 18px 12px; padding: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #dce8dd; border-radius: 8px; background: #f6faf6; }
+.requested-action div { display: flex; flex-direction: column; gap: 4px; }
+.requested-action strong { color: #385b43; font-size: 12px; }
+.requested-action span { color: #738078; font-size: 11px; line-height: 1.4; }
 .chat-header { min-height: 74px; padding: 15px 20px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid #e9ede9; }
 .chat-header h1 { margin: 0; color: #34443a; font: 700 15px Manrope, sans-serif; }
 .chat-header p { margin: 5px 0 0; color: #869087; font-size: 11px; }
