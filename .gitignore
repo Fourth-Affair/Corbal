@@ -17,3 +17,4 @@ __pycache__/
 dataset/
 # Model weights
 *.pt
+stoa-share.zip
