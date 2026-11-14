@@ -102,7 +102,7 @@ CubiCasa5K data and the pretrained CubiCasa network are CC BY-NC(-SA): non-comme
 (used to train and run the detector) is AGPL-3.0. Fine for the hackathon; revisit before any commercial use.
 ## Store uploaded images in Supabase Storage
 
-Image uploads are sent directly from the browser to a Supabase Storage bucket. PDFs continue to be previewed locally and are not uploaded. The frontend needs the Supabase project URL and the public anon/publishable key; never put a `service_role` or secret key in frontend environment variables.
+Plan uploads (images and PDFs) are sent from the frontend to a Supabase Storage bucket. The frontend needs the Supabase project URL and the public anon/publishable key; never put a `service_role` or secret key in frontend environment variables.
 
 1. In the Supabase dashboard, open **Storage** and create a bucket named `plans` (or choose another name). Keep it private unless you specifically want uploaded images to be publicly readable.
 2. Open **Project Settings → API** and copy the project URL and anon/publishable key.
@@ -110,19 +110,19 @@ Image uploads are sent directly from the browser to a Supabase Storage bucket. P
 4. Allow browser uploads by adding this policy in **SQL Editor**. It allows anonymous users to add objects to this bucket; access to read or delete objects remains restricted.
 
    ```sql
-   create policy "Allow browser image uploads to plans"
+   create policy "Allow browser plan uploads to plans"
    on storage.objects
    for insert
    to anon
    with check (
      bucket_id = 'plans'
-     and (storage.extension(name) = 'png'
-       or storage.extension(name) = 'jpg'
-       or storage.extension(name) = 'jpeg'
-       or storage.extension(name) = 'webp'
-       or storage.extension(name) = 'gif')
+     and lower(storage.extension(name)) in ('png', 'jpg', 'jpeg', 'webp', 'gif', 'pdf')
    );
    ```
+
+   The migration `202611140010_allow_pdf_uploads.sql` replaces the older image-only policy with this one. Without
+   `pdf` in the list, PDF uploads fail with "new row violates row-level security policy". If the bucket has
+   **Allowed MIME types** set, add `application/pdf` there too.
 
    If you use a different bucket name, change `bucket_id` in the policy and set `NEXT_PUBLIC_SUPABASE_BUCKET` to that name in both env files.
 5. Restart the frontend (`docker compose up --build` for Docker, or restart `npm run dev` if running locally). Select or drop an image; the UI reports whether the upload succeeded. Objects appear under **Storage → plans**.
