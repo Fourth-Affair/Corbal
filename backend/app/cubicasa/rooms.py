@@ -30,6 +30,8 @@ from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLab
 _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
 _ICON_KINDS = {3: "closet", 4: "appliance", 8: "fireplace"}  # icon classes the detector / graph do not carry
 _FIXTURE_KINDS = {"toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench"}
+SPLIT_BY_LABELS = True  # cut spaces holding two labels that should not share a space (app.cubicasa.room_split)
+CUT_MIN_ROOM_FRAC = 0.004  # each side of such a cut keeps at least this share of the image
 SCALE_AGREE = 0.15  # written areas must agree within this (relative m/px) to set the plan scale
 SCALE_CROSS_CHECK = 0.10  # dimension-line and written-area scales further apart than this get a warning
 _AREA_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:m2|m²|m\^2|sqm|㎡)", re.IGNORECASE)
@@ -125,8 +127,17 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     t = float(2 * np.median(edt[skel])) if skel.any() else 4.0
     t = min(max(t, 2.0), 0.05 * max(H, W))
     closed = ndimage.binary_closing(barrier, iterations=max(1, round(t / 4))) | barrier
-
+    text = layers.text(rel, path)
     lab, n = ndimage.label(~closed)
+    room_cuts = []
+    if SPLIT_BY_LABELS:  # a bedroom open to the living room: cut between the two labels at the narrowest line
+        from app.cubicasa.room_split import split_by_labels
+        from app.cubicasa.room_types import LABEL_STRONG_SCORE
+
+        label_seeds = [((tk.bbox[0] + tk.bbox[2]) / 2, (tk.bbox[1] + tk.bbox[3]) / 2, purpose) for tk in text.tokens
+                       if tk.score >= LABEL_STRONG_SCORE and (purpose := room_purpose(tk.text))]
+        lab, room_cuts = split_by_labels(lab, label_seeds, t, CUT_MIN_ROOM_FRAC * H * W)
+        n = int(lab.max())
     outside = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
     sizes = ndimage.sum(np.ones_like(lab, dtype=np.int32), lab, np.arange(1, n + 1))
     slices = ndimage.find_objects(lab)
@@ -137,7 +148,6 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     room_id = {k: f"space-{j + 1}" for j, k in enumerate(keep)}
 
     # OCR tokens -> rooms (token centre, else the most common room within one wall thickness)
-    text = layers.text(rel, path)
     labels_of: dict[int, list[RoomLabel]] = {k: [] for k in keep}
     r = max(2, round(t))
     for tok in text.tokens:
@@ -200,7 +210,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
 
     sym = symbol_scale(graph)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
-                        walls=walls, openings=openings, wall_segments=segments,
+                        walls=walls, openings=openings, wall_segments=segments, room_cuts=room_cuts,
                         scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym)), symbol_scale=sym)
 
 

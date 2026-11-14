@@ -16,7 +16,7 @@ questions (the challenge preview, never trained on); for --task wallseg also the
 Results land in dataset/models/: wallseg.{pt,log.csv}, or for the detector one folder per --sweep config in
 dataset/models/sweep/ (weights + sidecar, det_eval.json, viz/, fit-*/ fusion refits; presets in verda_remote.sh).
 The sweep also evaluates on the VM, which needs the challenge questions (--questions-url: the dataset zip, read
-with range requests) and dataset/cache/features_table.jsonl (uploaded). "current" = models/symbol-det.onnx.
+with range requests) and dataset/cache/features_table.jsonl (uploaded). "current" = models/symbol-det.{pt,onnx}.
 Works without rsync (Windows): falls back to tar / cat over ssh.
 The VM is deleted when the run ends, fails, times out (--max-hours) or is interrupted, unless --keep.
 """
@@ -299,10 +299,14 @@ def _train_on(ip: str, args, holdout: Path, svg: Path) -> bool:
         table = DATASET / "cache" / "features_table.jsonl"
         if table.is_file() and not args.skip_upload:  # perception features of the fit images: refit runs on the VM
             _put_file(ip, table, f"{REMOTE}/data/cache/features_table.jsonl")
-        current = REPO / "models" / "symbol-det.onnx"
-        if "current" in args.sweep.split() and current.is_file() and (
-                not args.skip_upload or missing(f"{REMOTE}/data/current/symbol-det.onnx")):
-            _put_file(ip, current, f"{REMOTE}/data/current/symbol-det.onnx")
+        # the shipped detector (.pt or .onnx, plus its imgsz / tile sidecar) for the "current" baseline
+        current = next((p for p in (REPO / "models" / "symbol-det.pt", REPO / "models" / "symbol-det.onnx")
+                        if p.is_file()), None)
+        if "current" in args.sweep.split() and current and (
+                not args.skip_upload or missing(f"{REMOTE}/data/current/{current.name}")):
+            _put_file(ip, current, f"{REMOTE}/data/current/{current.name}")
+            if current.with_suffix(".json").is_file():
+                _put_file(ip, current.with_suffix(".json"), f"{REMOTE}/data/current/symbol-det.json")
         env = (f"TASK=symdet SWEEP='{args.sweep}' EPOCHS={args.epochs} BATCH={args.batch} FRACTION={args.fraction} "
                f"QUESTIONS_ZIP='{args.questions_zip}' QUESTIONS_URL='{args.questions_url or ''}'")
     # clear markers from an earlier run first, so _follow cannot see a stale DONE
@@ -353,7 +357,7 @@ def main() -> None:
     p.add_argument("--spot", action="store_true", help="cheaper, but can be reclaimed mid-run")
     p.add_argument("--task", choices=["symdet", "wallseg"], default="symdet")
     p.add_argument("--sweep", default="A", help='symdet: configs to train and evaluate in order, e.g. "current A B C D" '
-                   "(presets in verda_remote.sh; current = models/symbol-det.onnx, evaluation only)")
+                   "(presets in verda_remote.sh; current = models/symbol-det.{pt,onnx}, evaluation only)")
     p.add_argument("--questions-url", default=os.environ.get("QUESTIONS_URL"),
                    help="symdet: challenge dataset zip with questions.jsonl, for the fusion refit on the VM")
     p.add_argument("--questions-zip", default="~/junction-dataset.zip",

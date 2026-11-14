@@ -232,7 +232,9 @@ class PlanScale(BaseModel):
 class PlanGeometry(BaseModel):
     """Rooms and walls of one plan, stored in Supabase (plan_geometry) for overlays and the answering agent."""
 
-    version: int = 4  # bump when the content changes: older stored rows are recomputed
+    version: int = 5  # bump when the content changes: older stored rows are recomputed
+    # straight cuts splitting a space between two room labels (p0, p1 in pixels), app.cubicasa.room_split
+    room_cuts: list[tuple[tuple[float, float], tuple[float, float]]] = Field(default_factory=list)
     image: str
     width: int
     height: int
