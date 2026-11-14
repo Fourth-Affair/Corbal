@@ -9,6 +9,7 @@ counting:    per-template fusion models (app.cubicasa.fit) over the evidence fea
 
 import json
 import logging
+import re
 from functools import lru_cache
 
 import joblib
@@ -260,11 +261,15 @@ def _graph_from_image(rel: str, path) -> PlanGraph:
         f.update(symdet.det_features(dets))
     elif _bundle().get("symdet"):
         raise FileNotFoundError("fusion models need the symbol detector (models/symbol-det.onnx)")
-    counts = {}
+    counts, probability, borderline = {}, {}, {}
     with stage("counts"):
         for t, spec in _fusion().items():
             X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
             counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
+            if (p := count_probability(spec, X, counts[t])) is not None:
+                probability[t] = p
+            if (b := count_borderline(spec, dets)) is not None:
+                borderline[t] = b
     with stage("floor_outlines"):
         with np.load(feature_paths(rel)[0]) as z:
             floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
@@ -281,4 +286,35 @@ def _graph_from_image(rel: str, path) -> PlanGraph:
     with stage("evidence"):
         items = _evidence(rel, dets) + floor_items
     return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
-                     counts=counts, floor_outlines=floor_outlines)
+                     counts=counts, count_probability=probability, count_borderline=borderline,
+                     floor_outlines=floor_outlines)
+
+
+BORDERLINE_BAND = 0.15  # a detection this close to a rule's confidence cut-off could fall on either side of it
+_DET_RULE = re.compile(r"^det_(\w+)_c(\d+)$")
+
+
+def count_probability(spec: dict, X: np.ndarray, n: int) -> float | None:
+    """Classifier counting models (hgb_c): the predicted probability of the count `n`. None for other kinds."""
+    if spec["kind"] != "hgb_c":
+        return None
+    m = spec["model"]
+    classes = [int(c) for c in m.classes_]
+    if n not in classes:
+        return None
+    return round(float(m.predict_proba(X)[0][classes.index(n)]), 4)
+
+
+def count_borderline(spec: dict, dets: list[dict] | None) -> int | None:
+    """Rules that count detections above a confidence cut-off (det_<group>_c<NN>): the number of detections within
+    BORDERLINE_BAND of it. None for other models. Measured on the preview plans: doors are right 83% of the time with
+    none, 39% with one; windows 66% with none, 13% with three or more."""
+    if dets is None or spec["kind"] not in ("rule", "resid"):
+        return None
+    rule = spec["model"] if spec["kind"] == "rule" else spec["model"].rule
+    m = _DET_RULE.match(rule.feature)
+    if not m:
+        return None
+    group, cut = m.group(1), int(m.group(2)) / 100
+    members = symdet.DET_GROUPS.get(group, (group,))
+    return sum(1 for d in dets if d["cls"] in members and abs(d["conf"] - cut) < BORDERLINE_BAND)
