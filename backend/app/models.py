@@ -25,6 +25,12 @@ class PlanItem(BaseModel):
     raw: str | None = None  # source-format class, e.g. SVG "Space Bath Shower" (debugging / rule fitting)
 
 
+class PlanOutline(BaseModel):
+    id: str
+    polygon: list[tuple[float, float]] = Field(min_length=3, max_length=500)
+    score: float | None = None
+
+
 class PlanGraph(BaseModel):
     image: str  # dataset-relative path, e.g. data/cubicasa5k/colorful-10052.png (or uploads/<plan id>.pdf)
     width: int
@@ -33,6 +39,7 @@ class PlanGraph(BaseModel):
     items: list[PlanItem] = Field(default_factory=list)
     # model source only: per-template counts from the fusion models (items are the supporting evidence)
     counts: dict[str, int] = Field(default_factory=dict)
+    floor_outlines: list[PlanOutline] = Field(default_factory=list)
 
 
 class AskRequest(BaseModel):
@@ -40,8 +47,25 @@ class AskRequest(BaseModel):
     question: str
 
 
+class PlanScaleCalibration(BaseModel):
+    points: tuple[tuple[float, float], tuple[float, float]]
+    distance: float = Field(gt=0)
+    unit: Literal["m", "cm", "ft", "in"]
+
+
+class PlanOutlinesRequest(BaseModel):
+    outlines: list[PlanOutline] = Field(min_length=1, max_length=20)
+
+
 class PlanQuestionRequest(BaseModel):
     question: str
+    history: list["ChatTurn"] = Field(default_factory=list, max_length=40)
+    scale: PlanScaleCalibration | None = None
+
+
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(max_length=4000)
 
 
 class Answer(BaseModel):

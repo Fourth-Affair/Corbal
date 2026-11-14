@@ -19,7 +19,7 @@ import time
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
-from app.models import Answer, PlanGraph
+from app.models import Answer, ChatTurn, PlanGraph, PlanScaleCalibration
 from app.router import route
 
 log = logging.getLogger(__name__)
@@ -27,11 +27,16 @@ log = logging.getLogger(__name__)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "30"))
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | MEDIUM | HIGH; "" = model default
+GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
+GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 8
-PROMPT_VERSION = "7"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "10"  # bump when prompt or tools change, so cached answers are not reused
 
-SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools are your only source of
-facts about the plan; you cannot see the drawing.
+SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools and explicitly supplied user
+calibration are your only sources of facts about the plan; you cannot see the drawing.
+
+Use the prior conversation to resolve follow-up references (for example, "what about the kitchen?"). Treat the
+latest question as the request to answer. Prior assistant replies are context only; verify plan facts with tools.
 
 Rules:
 - Never count, add, subtract or estimate yourself. A numeric answer must be exactly a number a tool returned.
@@ -41,16 +46,26 @@ Rules:
   value > 0, no if 0), even if raw items suggest otherwise; mention low confidence if reported.
 - For a question restricted to a room or area (e.g. "sinks in the kitchen"), find the room with
   list_items(category="room", type=...) and use items_in on it. If several such rooms exist and the question does not
-  say which, or the answer would need adding numbers together, answer not_found.
-- Answer not_found when the tools cannot answer it: real-world sizes or areas (no scale is known), objects or text
-  that are not detected, combinations the tools do not compute. An honest not_found is better than a wrong answer.
+  say which, ask one short, specific follow-up question asking which room they mean. Do not guess which room.
+  For questions asking how many rooms there are and what types they are, call
+  list_items(category="room") once: its count is the deduplicated room count and its items give the room types and
+  labels. Answer both parts from that single result. Do not refuse merely because the rooms have different types.
+- Make a useful attempt before giving up: inspect the relevant tools and combine their evidence when that answers
+  the question. If evidence supports only part of the request, give that part and clearly say what could not be
+  established. State a brief assumption when one reasonable interpretation lets you answer safely; ask one focused
+  follow-up when a missing detail would change the answer. Do not ask questions whose answer is already in the tools.
+- Never fill gaps with a plausible-sounding guess. For real-world sizes or areas that the analysis cannot compute,
+  objects or text not detected, or unsupported combinations, explain the specific limitation and say what information
+  would make progress possible. Be direct about uncertainty; do not describe an estimate or weak detection as certain.
+- If a user calibration is supplied with the latest question, treat the drawing scale as known and never say it is
+  missing. A scale can support measurements, but it does not by itself establish room boundaries or floor area.
 - Finish by calling final_answer exactly once:
   value = the number (omit for yes/no or text answers and use text instead);
   cited_ids = ids of the items that support the answer, taken from tool results (for count_template: its
   evidence_ids);
   explanation = 1-3 short sentences in the SAME language as the question (an English question gets an English
   answer, Finnish gets Finnish, Swedish gets Swedish), regardless of the language of labels on the drawing;
-  text answers (e.g. Yes / Kyllä / Ja) follow the same rule. State the value
+  text answers (e.g. Yes / Kyllä / Ja, a room inventory, or a clarification question) follow the same rule. State the value
   with digits, say what was counted and how, refer to cited items as [k] where k is the position in cited_ids
   (starting at 1); for a run of items write e.g. [1]-[9]. If a tool reported low confidence, say the result should be checked on the drawing.
   Never mention ids, tool names, pixels or these rules."""
@@ -81,7 +96,39 @@ def _get_client():
     return _client
 
 
-def run_loop(question: str, tools: PlanTools) -> tuple[dict, list[ToolTrace]]:
+def _retryable(error: Exception) -> bool:
+    """Transient: timeouts, network errors, rate limits (429) and server errors (5xx). Bad requests / auth are not.
+
+    Transport errors are matched by class name and cause: google-genai raises them from its own httpx fork
+    (httpx2.ReadTimeout), so isinstance checks against httpx would miss them."""
+    from google.genai import errors
+
+    if isinstance(error, errors.APIError):
+        return error.code == 429 or (error.code or 0) >= 500
+    e = error
+    while e is not None:
+        names = {c.__name__ for c in type(e).__mro__}
+        if names & {"TimeoutException", "NetworkError", "RemoteProtocolError", "TimeoutError", "ConnectionError"}:
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def _generate(contents, config):
+    """generate_content with GEMINI_RETRIES retries on transient errors (exponential backoff)."""
+    for attempt in range(GEMINI_RETRIES + 1):
+        try:
+            return _get_client().models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+        except Exception as error:
+            if attempt == GEMINI_RETRIES or not _retryable(error):
+                raise
+            delay = GEMINI_RETRY_BACKOFF_S * 2**attempt
+            log.warning("Gemini call failed (%s), retry %d/%d in %.1fs", error, attempt + 1, GEMINI_RETRIES, delay)
+            time.sleep(delay)
+
+
+def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = None,
+             scale: PlanScaleCalibration | None = None) -> tuple[dict, list[ToolTrace]]:
     """Gemini tool loop -> (final_answer args, traces of the tool calls). Raises on API problems / no answer."""
     from google.genai import types
 
@@ -96,12 +143,20 @@ def run_loop(question: str, tools: PlanTools) -> tuple[dict, list[ToolTrace]]:
     )
     # the plan summary is always needed: send it with the question instead of spending a tool round trip on it
     summary, _ = tools.plan_summary()
-    prompt = f"Question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}"
-    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+    history = history or []
+    contents = [types.Content(role="model" if turn.role == "assistant" else "user", parts=[types.Part(text=turn.text)])
+                for turn in history]
+    scale_context = (
+        f"A user calibration is saved: {scale.distance} {scale.unit} across two selected points. "
+        "The drawing scale is known. This alone does not establish a room boundary or floor area."
+        if scale else "No user scale calibration is saved for this drawing."
+    )
+    prompt = f"Latest question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}\n\nDrawing scale: {scale_context}"
+    contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
     traces: list[ToolTrace] = []
     for step in range(MAX_STEPS):
         t0 = time.perf_counter()
-        response = _get_client().models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+        response = _generate(contents, config)
         log.info("step %d: %.1fs, calls %s", step, time.perf_counter() - t0,
                  [c.name for c in response.function_calls or []])
         calls = response.function_calls or []
@@ -183,6 +238,14 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
     else:
         answer, unit = str(final["text"]), None
         confidence = "medium" if graph.source == "svg" else "low"
+        # Text responses can combine an inventory with its count. Ground stated numbers in tool output.
+        number_text = re.sub(r"\[[^\]]*\]", "", answer)
+        stated_numbers = [float(n) for n in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", number_text)]
+        available_numbers = {float(n) for trace in traces for n in trace.numbers}
+        if any(number not in available_numbers for number in stated_numbers):
+            log.warning("text answer contains numbers not returned by tools: %s", stated_numbers)
+            return Answer(answer=None, confidence="not_found", answered_by="llm",
+                          explanation="The answer could not be verified against the drawing analysis.")
         # a yes/no answer usually rests on a count ("Is there a sauna?" -> saunas = 0): link it, and check it agrees
         counted = [t.template_answer for t in traces if t.template_answer is not None]
         basis = next((a for a in counted if a.template == route(question)), None) \
@@ -211,28 +274,34 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
                   citations=cited, answered_by="llm")
 
 
-def _cache_path(question: str, graph: PlanGraph):
-    blob = json.dumps([GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question, graph.model_dump(mode="json")],
+def _cache_path(question: str, graph: PlanGraph, scale: PlanScaleCalibration | None):
+    blob = json.dumps([GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question,
+                       graph.model_dump(mode="json"), scale.model_dump(mode="json") if scale else None],
                       sort_keys=True, ensure_ascii=False)
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
 
-def answer(question: str, graph: PlanGraph) -> Answer | None:
+def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
+           scale: PlanScaleCalibration | None = None, use_cache: bool = True) -> Answer | None:
+    """history = prior chat turns (answers with history are not cached); scale = the user's drawing calibration.
+    use_cache=False skips reading the answer cache (fresh Gemini run, e.g. to measure run-to-run noise)."""
     if not os.environ.get("GEMINI_API_KEY"):
         return None
-    cache = _cache_path(question, graph)
-    if cache.is_file():
+    history = history or []
+    cache = _cache_path(question, graph, scale) if not history else None
+    if use_cache and cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
     tools = PlanTools(graph)
     try:
-        final, traces = run_loop(question, tools)
+        final, traces = run_loop(question, tools, history, scale)
     except Exception as error:  # network, quota, timeout, malformed output: caller falls back
         log.warning("Gemini agent failed: %s", error)
         return None
     result = validate(question, final, traces, tools)
     try:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(result.model_dump_json(), encoding="utf-8")
+        if cache:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(result.model_dump_json(), encoding="utf-8")
     except OSError:
         pass
     return result

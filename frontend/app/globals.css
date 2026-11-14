@@ -31,6 +31,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .toolbar-actions { display: flex; align-items: center; gap: 15px; }
 .connection-status { display: flex; align-items: center; gap: 7px; color: #78847b; font-size: 11px; }
 .connection-status i { width: 7px; height: 7px; border-radius: 50%; background: #c39b58; }
+.scale-status { color: #8a958c; font-size: 10px; }
 .toolbar-button { min-height: 34px; padding: 0 12px; border: 1px solid #dce3dc; border-radius: 6px; background: #fff; color: #405247; cursor: pointer; font-size: 12px; font-weight: 600; }
 .toolbar-button:hover { background: #f6f8f6; }
 .toolbar-button.primary-button { border-color: #34764e; background: #34764e; color: white; }
@@ -39,9 +40,11 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 
 .drawing-panel { position: relative; min-width: 0; min-height: 0; padding: 0; display: grid; place-items: center; overflow: hidden; background: #eef0ed; }
 .drawing-panel.is-dragging { background: #e8f1ea; box-shadow: inset 0 0 0 2px #629576; }
+.drawing-panel.is-calibrating { box-shadow: inset 0 0 0 3px #629576; }
 .image-frame { position: absolute; inset: 24px; min-width: 0; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .plan-image { display: block; width: 100%; height: 100%; object-fit: contain; }
 .citation-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.citation-overlay.scale-selecting { pointer-events: auto; cursor: crosshair; }
 .citation-mark rect, .citation-mark polygon { fill: rgba(222, 92, 50, .16); stroke: #d94727; stroke-width: 5; vector-effect: non-scaling-stroke; }
 .citation-mark circle { fill: #d94727; stroke: white; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .citation-mark text { fill: #fff; font: 700 20px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
@@ -76,6 +79,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .chat-message.assistant { margin-right: auto; background: #f4f5f3; color: #46534a; }
 .chat-message span { display: block; margin-bottom: 4px; color: #829087; font-size: 10px; font-weight: 700; }
 .chat-message p { margin: 0; }
+.thinking-message { min-width: 190px; border: 1px solid #dce8df; background: #f3f8f4 !important; box-shadow: 0 2px 8px rgba(37, 72, 48, .06); }
+.thinking-message p { display: flex; align-items: center; gap: 9px; color: #385b43; font-weight: 600; }
+.thinking-spinner { width: 15px; height: 15px; flex: none; border: 2px solid #c6dccb; border-top-color: #34764e; border-radius: 50%; animation: spin .8s linear infinite; }
 .composer { margin: 0 14px 14px; padding: 9px; border: 1px solid #e2e8e2; border-radius: 8px; background: #fbfcfb; }
 .composer textarea { width: 100%; min-height: 88px; padding: 5px; resize: vertical; border: 0; outline: 0; background: transparent; color: #536157; font-size: 12px; line-height: 1.5; }
 .composer textarea::placeholder { color: #a0aaa2; }
@@ -85,6 +91,21 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .send-button { width: 28px; height: 28px; border: 0; border-radius: 6px; background: #e3eae4; color: #fff; font-size: 17px; }
 .send-button:disabled { cursor: not-allowed; }
 .send-button:not(:disabled) { background: #34764e; cursor: pointer; }
+.scale-hint { position: absolute; top: 14px; left: 50%; z-index: 2; transform: translateX(-50%); padding: 9px 13px; border: 1px solid #d8e5da; border-radius: 7px; background: #fff; color: #385b43; box-shadow: 0 3px 12px #26392c1a; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.scale-card { position: absolute; right: 12px; bottom: 12px; z-index: 2; display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid #dce6dd; border-radius: 7px; background: #ffffffed; color: #516056; box-shadow: 0 2px 8px #26392c12; font-size: 11px; }
+.scale-card strong { color: #385b43; font-size: 12px; }
+.scale-mark { pointer-events: none; }
+.scale-mark line { stroke: #e69532; stroke-width: 5; vector-effect: non-scaling-stroke; }
+.scale-mark circle { fill: #e69532; stroke: #fff; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.scale-mark text { fill: #fff; font: 700 20px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
+.scale-form { margin: 12px 14px 0; padding: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
+.scale-form>div { flex: 1 1 100%; display: flex; flex-direction: column; gap: 3px; }
+.scale-form strong { color: #385b43; font-size: 12px; }
+.scale-form span, .scale-form p { color: #7e8a80; font-size: 11px; }
+.scale-form input, .scale-form select { min-height: 34px; min-width: 0; padding: 0 8px; border: 1px solid #dce3dc; border-radius: 6px; background: white; color: #405247; font: inherit; font-size: 12px; }
+.scale-form input { flex: 1; width: 80px; }
+.scale-form button { flex: none; }
+.scale-form p { flex-basis: 100%; margin: 0; color: #a1483c; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 
 @media (max-width: 900px) {
