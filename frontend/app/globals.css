@@ -115,10 +115,6 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .measurement-label { pointer-events: none; }
 .measurement-label rect { fill: #fff; stroke: #d5e1d7; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .measurement-label text { fill: #355b40; font: 700 15px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
-.scale-reference-mark { pointer-events: none; }
-.scale-reference-mark line { stroke: #3c7652; stroke-width: 4; stroke-dasharray: 9 7; vector-effect: non-scaling-stroke; }
-.scale-reference-mark circle { fill: #fff; stroke: #3c7652; stroke-width: 3; vector-effect: non-scaling-stroke; }
-.scale-reference-mark text { fill: #2f6945; font: 700 12px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
 .scale-form { margin: 12px 14px 0; padding: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border: 1px solid #dce8df; border-radius: 8px; background: #f7faf7; }
 .scale-form>div { flex: 1 1 100%; display: flex; flex-direction: column; gap: 3px; }
 .scale-form strong { color: #385b43; font-size: 12px; }

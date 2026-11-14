@@ -353,20 +353,6 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     return [Math.max(0, Math.min(imageSize.width, mapped.x)), Math.max(0, Math.min(imageSize.height, mapped.y))];
   }
 
-  function snapToScaleReference(svg: SVGSVGElement, clientX: number, clientY: number, point: [number, number]): [number, number] {
-    if (!scale) return point;
-    const transform = svg.getScreenCTM();
-    if (!transform) return point;
-    const snapTarget = scale.points.find(([x, y]) => {
-      const reference = svg.createSVGPoint();
-      reference.x = x;
-      reference.y = y;
-      const screenReference = reference.matrixTransform(transform);
-      return Math.hypot(clientX - screenReference.x, clientY - screenReference.y) <= 22;
-    });
-    return snapTarget ?? point;
-  }
-
   function handlePlanClick(event: React.MouseEvent<SVGSVGElement>) {
     if (correctionMode && correctionAddMode) {
       const point = planPoint(event);
@@ -459,7 +445,6 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     if (!transform) return;
     const imagePoint = point.matrixTransform(transform.inverse());
     let pixelPoint: [number, number] = [Math.max(0, Math.min(imageSize.width, imagePoint.x)), Math.max(0, Math.min(imageSize.height, imagePoint.y))];
-    if (measureMode) pixelPoint = snapToScaleReference(svg, event.clientX, event.clientY, pixelPoint);
     if (scaleMode) {
       const next = [...scalePoints.slice(0, 1), pixelPoint];
       setScalePoints(next);
@@ -537,7 +522,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       <div className="work-area">
         <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
-            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerMove={event => { if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) { const snapped = snapToScaleReference(event.currentTarget, event.clientX, event.clientY, point); setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? snapped : value)); } } }} onPointerUp={() => { setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerMove={event => { if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={() => { setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
               {correctionMode && evidenceItems.map(item => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
@@ -554,11 +539,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 </g>;
               })}
               {scaleMode && scalePoints.length > 0 && <g className="scale-mark"><line x1={scalePoints[0][0]} y1={scalePoints[0][1]} x2={(scalePoints[1] ?? scalePoints[0])[0]} y2={(scalePoints[1] ?? scalePoints[0])[1]} />{scalePoints.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
-              {measureMode && scale && <g className="scale-reference-mark"><line x1={scale.points[0][0]} y1={scale.points[0][1]} x2={scale.points[1][0]} y2={scale.points[1][1]} />{scale.points.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="9"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measurePoints.length > 0 && <g className="scale-mark measurement-mark"><line x1={measurePoints[0][0]} y1={measurePoints[0][1]} x2={(measurePoints[1] ?? measurePoints[0])[0]} y2={(measurePoints[1] ?? measurePoints[0])[1]} />{measurePoints.map(([x, y], index) => <g className="measurement-handle" key={index} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingMeasurePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingMeasurePoint(null); }} onClick={event => event.stopPropagation()}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measuredDistance !== null && measurePoints.length === 2 && <g className="measurement-label" pointerEvents="none"><rect x={(measurePoints[0][0] + measurePoints[1][0]) / 2 - Math.max(52, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 7)} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 - 15} width={Math.max(104, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 14)} height="30" rx="7"/><text x={(measurePoints[0][0] + measurePoints[1][0]) / 2} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 + 5}>{measuredDistance.toFixed(2)} {scale?.unit}</text></g>}
               {(outlineMode ? outlinePoints : savedOutlines[0]?.polygon ?? []).length >= 3 && <g className="floor-outline-mark"><polygon points={(outlineMode ? outlinePoints : savedOutlines[0].polygon).map(([x, y]) => `${x},${y}`).join(" ")} />{outlineMode && outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
-            </svg>}{(scaleMode || measureMode || outlineMode) && <div className="scale-hint">{outlineMode ? (addOutlinePointMode ? "Click the plan to add a boundary point" : "Drag boundary points to edit the suggested outline") : scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point · near 1 or 2 snaps to the saved scale points" : "Click an end point · near 1 or 2 snaps to the saved scale points")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
+            </svg>}{(scaleMode || measureMode || outlineMode) && <div className="scale-hint">{outlineMode ? (addOutlinePointMode ? "Click the plan to add a boundary point" : "Drag boundary points to edit the suggested outline") : scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
