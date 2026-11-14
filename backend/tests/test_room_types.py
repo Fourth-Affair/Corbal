@@ -40,6 +40,13 @@ def test_label_beats_net_and_conflicting_fixture_drops_tier():
     assert (c.type, c.tier, c.conflicts) == ("kitchen", "weak", ["wc"])
 
 
+def test_toilet_in_labelled_bathroom_is_no_conflict():
+    c = classify([lb("KPH", "bathroom")], [Fixture("toilet"), Fixture("sink")], {"bath": 1.0}, 0.02)
+    assert (c.type, c.tier, c.conflicts) == ("bathroom", "strong", [])
+    c = classify([lb("MH", "bedroom")], [Fixture("shower")], {}, 0.05)  # a shower gives a bedroom nothing
+    assert (c.tier, c.conflicts) == ("weak", ["bathroom"])
+
+
 def test_open_plan_keeps_both_purposes():
     c = classify([lb("OH", "living"), lb("K", "kitchen")], [Fixture("appliance")], {}, 0.1)
     assert c.tier == "strong" and set(c.purposes) == {"living", "kitchen"}

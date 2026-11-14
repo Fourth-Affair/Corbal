@@ -31,7 +31,10 @@ _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 
 _ICON_KINDS = {3: "closet", 4: "appliance", 8: "fireplace"}  # icon classes the detector / graph do not carry
 _FIXTURE_KINDS = {"toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove", "sauna_bench"}
 SCALE_AGREE = 0.15  # written areas must agree within this (relative m/px) to set the plan scale
+SCALE_CROSS_CHECK = 0.10  # dimension-line and written-area scales further apart than this get a warning
 _AREA_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:m2|m²|m\^2|sqm|㎡)", re.IGNORECASE)
+_BARE_AREA_RE = re.compile(r"^\s*(\d{1,3}[.,]\d{1,2})\s*$")
+BARE_AREA_MIN_SCORE = 0.8  # OCR confidence for a unit-less area (a misread digit would skew the scale)
 MIN_ROOM_FRAC = 1e-3  # of the image area
 MAX_ROOM_FRAC = 0.5
 MAX_POINTS = 400
@@ -92,8 +95,19 @@ def _touching(lab: np.ndarray, mask: np.ndarray, sl, r: int) -> list[int]:
 
 
 def _labeled_area(labels: list[RoomLabel]) -> float | None:
+    """Area written in the room: a number with a unit ("12,5 m2"), else bare decimals ("11.5" under "MH", the usual
+    Finnish convention) when the room also carries a purpose label. Bare decimals in one space are summed: an open
+    plan ("OH 26.5" + "KEITTIÖ 17.0") or two rooms the wall map merged. Integers are not areas ("20" is usually a
+    misread "2.0"); a wrong number is caught by the agreement test in scale_from_written_areas."""
     m = _AREA_RE.search(" ".join(lb.text for lb in labels))
-    return float(m.group(1).replace(",", ".")) if m else None
+    if m:
+        return float(m.group(1).replace(",", "."))
+    if not any(lb.room_type for lb in labels):
+        return None
+    vals = [float(b.group(1).replace(",", ".")) for lb in labels
+            if (lb.score is None or lb.score >= BARE_AREA_MIN_SCORE) and (b := _BARE_AREA_RE.match(lb.text))]
+    vals = [v for v in vals if 0.5 <= v <= 300]
+    return round(sum(vals), 2) if vals else None
 
 
 def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) -> PlanGeometry:
@@ -184,9 +198,38 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
                 by_id[rid].walls.append(sg.id)
     from app.cubicasa.size_priors import symbol_scale
 
+    sym = symbol_scale(graph)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
-                        walls=walls, openings=openings, wall_segments=segments, scale=scale_from_written_areas(rooms),
-                        symbol_scale=symbol_scale(graph))
+                        walls=walls, openings=openings, wall_segments=segments,
+                        scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym)), symbol_scale=sym)
+
+
+def _dimension_scale(path: Path, tokens, sym: PlanScale | None) -> PlanScale | None:
+    """Scale from dimension lines, dropped when it is far outside the door / fixture size band (figures in cm or
+    inches, or a misread chain that happens to agree with itself)."""
+    from PIL import Image
+
+    from app.cubicasa.dimensions import dimension_scale
+    from app.cubicasa.size_priors import SCALE_DISAGREE
+
+    try:
+        dims = dimension_scale(Image.open(path), tokens)
+    except Exception:  # noqa: BLE001  optional evidence
+        return None
+    if dims and sym and sym.low and sym.high and not sym.low / SCALE_DISAGREE <= dims.m_per_px <= sym.high * SCALE_DISAGREE:
+        return None
+    return dims
+
+
+def plan_scale(rooms: list[RoomShape], dims: PlanScale | None) -> PlanScale | None:
+    """The plan's own scale: dimension lines (a direct length measurement) when they agree, else written room areas
+    (measured through the room outlines, so segmentation errors leak in). When both exist and differ by more than
+    SCALE_CROSS_CHECK, the chosen one carries a warning."""
+    areas = scale_from_written_areas(rooms)
+    if dims and areas and abs(dims.m_per_px - areas.m_per_px) > SCALE_CROSS_CHECK * areas.m_per_px:
+        dims.warning = (f"dimension lines give {dims.m_per_px * 1000:.2f} mm per pixel, the written room areas "
+                        f"{areas.m_per_px * 1000:.2f}: check the scale")
+    return dims or areas
 
 
 def scale_from_written_areas(rooms: list[RoomShape]) -> PlanScale | None:

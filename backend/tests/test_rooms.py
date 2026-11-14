@@ -12,6 +12,9 @@ from app.models import Layer, PlanGraph, PlanScaleCalibration, TextToken
     ("MH", "bedroom"), ("MH2", "bedroom"), ("OH", "living"), ("ET", "entry"), ("VH", "closet"), ("KPH", "bathroom"),
     ("K", "kitchen"), ("Kitchen", "kitchen"), ("Living room", "living"), ("OH+K", "kitchen"),
     ("H2388", None), ("h187o", None), ("10.747", None), ("5K", None), ("NA", None),
+    # OCR damage: label fused with a dimension, separator lost, umlaut lost, slash read as a letter
+    ("VAR4956", "storage"), ("MHTYOH", "bedroom"), ("MH/TYÖH", "bedroom"), ("KEITTIO", "kitchen"),
+    ("MHL", "bedroom"), ("AULAI", "entry"), ("KH", "bathroom"), ("KHH", "utility"), ("S", "sauna"),
 ])
 def test_room_purpose(token, purpose):
     assert room_purpose(token) == purpose
@@ -72,3 +75,17 @@ def test_room_tools(monkeypatch):
     assert all(i in tools.by_id and tools.by_id[i].category == "wall" for i in wtrace.item_ids)  # citable
     # plans without geometry keep the original tool set (benchmark path unchanged)
     assert "list_rooms" not in [d["name"] for d in PlanTools(graph).declarations()]
+
+
+def _lab(text, purpose=None, score=0.95):
+    from app.models import RoomLabel
+    return RoomLabel(text=text, bbox=(0, 0, 1, 1), score=score, room_type=purpose)
+
+
+def test_written_area_without_unit():
+    assert rooms._labeled_area([_lab("MH", "bedroom"), _lab("11.5")]) == 11.5
+    assert rooms._labeled_area([_lab("OH", "living"), _lab("26,5"), _lab("KEITTIÖ", "kitchen"), _lab("17.0")]) == 43.5
+    assert rooms._labeled_area([_lab("12,5 m2")]) == 12.5
+    assert rooms._labeled_area([_lab("11.5")]) is None  # no purpose label: a dimension, not an area
+    assert rooms._labeled_area([_lab("MH", "bedroom"), _lab("20")]) is None  # integers are usually misread "2.0"
+    assert rooms._labeled_area([_lab("MH", "bedroom"), _lab("11.5", score=0.6)]) is None  # unsure reading

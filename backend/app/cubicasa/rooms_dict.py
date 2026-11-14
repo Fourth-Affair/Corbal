@@ -5,6 +5,7 @@ OCR confusions folded). Keys are normalised the same way.
 """
 
 import re
+import unicodedata
 
 ROOM_LABELS: dict[str, list[str]] = {
     "bedroom": ["MH", "MH1", "MH2", "MH3", "MH4", "MAKUUH", "MAKUUHUONE", "SOV", "SOVRUM", "SOVR", "MAKUU"],
@@ -102,15 +103,45 @@ def apartment_type(token: str) -> dict | None:
 _PURPOSE = {normalise(k): typ for typ, keys in PURPOSE_LABELS.items() for k in keys}
 
 
+def _fold(n: str) -> str:
+    """Drop diacritics: OCR often reads TYÖH as TYOH, KEITTIÖ as KEITTIO."""
+    return "".join(c for c in unicodedata.normalize("NFKD", n) if not unicodedata.combining(c))
+
+
+# Purposes by diacritic-folded key (counting types first, finer purposes do not override them)
+_FOLDED: dict[str, str] = {}
+for _k, _t in [*_PURPOSE.items(), *((k, t) for k, t in _LOOKUP.items() if t != "other")]:
+    _FOLDED[_fold(_k)] = _t
+_MERGED_DIMENSION = re.compile(r"^\s*([^\W\d_]{2,})[\s.:]*\d{3,}\s*$")  # "VAR4956": label + dimension read as one
+
+
+def _tolerant_purpose(n: str) -> str | None:
+    """Purpose of a normalised token that has no exact match, allowing for common OCR damage. Plan geometry only:
+    the counting features (room_type, token table) keep exact matching, their models were fitted on it."""
+    f = _fold(n)
+    if f in _FOLDED:
+        return _FOLDED[f]
+    # separator lost: "MHTYOH" = MH/TYÖH -> the first part (both parts must be labels of >= 2 letters)
+    for i in range(2, len(f) - 1):
+        if f[:i] in _FOLDED and f[i:] in _FOLDED:
+            return _FOLDED[f[:i]]
+    # a slash or bar read as a letter: "AULAI" = AULA/, "MHL" = MH|
+    if len(f) >= 3 and f[-1] in "IL1" and f[:-1] in _FOLDED:
+        return _FOLDED[f[:-1]]
+    return None
+
+
 def room_purpose(token: str) -> str | None:
     """What a room is for, from one label: the counting type when it names one, else a finer purpose (living,
     entry, closet, storage, ...). None when the token is not a room label (dimensions, furniture codes, noise).
 
     Tokens with 3+ digits are annotations, not labels: "H2388" is a ceiling height and "MH 12,5" an area (its
-    number goes to the room's labeled area instead), but "MH2" stays bedroom 2."""
+    number goes to the room's labeled area instead), but "MH2" stays bedroom 2. A label of 2+ letters fused with
+    a dimension ("VAR4956") keeps its letters."""
     digits = sum(c.isdigit() for c in token)
     if digits >= 3 and not re.search(r"m2|m²", token, re.IGNORECASE):
-        return None
+        m = _MERGED_DIMENSION.match(token)
+        return room_purpose(m.group(1)) if m else None
     t = room_type(token)
     if t and t != "other":
         return t
@@ -124,4 +155,4 @@ def room_purpose(token: str) -> str | None:
         for p in parts:
             if p in _PURPOSE or (_LOOKUP.get(p) not in (None, "other")):
                 return _LOOKUP.get(p) if _LOOKUP.get(p) not in (None, "other") else _PURPOSE[p]
-    return None
+    return _tolerant_purpose(n)

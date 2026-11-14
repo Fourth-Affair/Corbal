@@ -51,15 +51,22 @@ type PlanGeometry = {
   model: string;
   rooms: RoomShape[];
   wall_segments: WallSegment[];
-  scale?: { m_per_px: number; source: "calibration" | "written_areas" } | null;
+  // the plan's own scale: printed dimension figures (with the segments they label) or areas written in the rooms
+  scale?: {
+    m_per_px: number;
+    source: "calibration" | "written_areas" | "dimensions";
+    warning?: string | null;
+    dimensions?: Array<{ text: string; value_mm: number; p0: [number, number]; p1: [number, number] }>;
+  } | null;
 };
 
 function roomWhy(room: RoomShape): string {
   const reasons = room.evidence.filter(e => e.type === room.type && e.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3).map(e => e.detail);
   const conflict = room.conflicts.length ? ` · conflicting evidence: ${room.conflicts.join(", ")}` : "";
   const size = room.size_check ? ` · size: ${room.size_check}` : "";
-  const rough = room.area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
-  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + rough;
+  const written = room.labeled_area_m2 != null ? " · area as written on the drawing" : room.area_m2 != null ? " · area measured from the outline" : "";
+  const rough = room.area_m2 == null && room.labeled_area_m2 == null && room.area_m2_range ? " · area is a rough range from door/fixture sizes; set the scale for exact sizes" : "";
+  return (reasons.length ? `${reasons.join("; ")}` : "no evidence") + conflict + size + written + rough;
 }
 
 // One colour per purpose; weak rooms are dashed, unknown spaces grey and dashed
@@ -70,11 +77,21 @@ const ROOM_COLOURS: Record<string, string> = {
 };
 
 function roomCaption(room: RoomShape): string {
-  const area = room.area_m2 ?? room.labeled_area_m2;
+  // the area printed on the drawing wins over one measured from the outline
+  const area = room.labeled_area_m2 ?? room.area_m2;
   const what = room.purposes.length > 1 ? room.purposes.join(" + ") : room.type;
   if (area != null) return `${what} · ${area.toFixed(1)} m²`;
   if (room.area_m2_range) return `${what} · ~${Math.round(room.area_m2_range[0])}–${Math.round(room.area_m2_range[1])} m²`;
   return what;
+}
+
+function pointInPolygon(x: number, y: number, polygon: Array<[number, number]>): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i], [xj, yj] = polygon[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
 }
 
 type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };
@@ -593,6 +610,15 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   };
   const acceptedArea = savedOutlines.reduce((sum, outline) => sum + (areaM2(outline.polygon) ?? 0), 0);
   const selectedEvidence = evidenceItems.find(item => item.id === selectedEvidenceId) ?? null;
+  // OCR text boxes are tiny and read as noise: they stay evidence for the backend but are not shown or reviewed
+  const reviewItems = evidenceItems.filter(item => item.raw !== "ocr");
+  // a cited OCR label is shown as the room it names (the space containing the text), else as its text box
+  const shownCitation = (item: PlanCitation): PlanCitation => {
+    if (item.raw !== "ocr" || !geometry) return item;
+    const cx = (item.bbox[0] + item.bbox[2]) / 2, cy = (item.bbox[1] + item.bbox[3]) / 2;
+    const room = geometry.rooms.find(room => pointInPolygon(cx, cy, room.polygon));
+    return room ? { ...item, bbox: room.bbox, polygon: room.polygon } : item;
+  };
 
   const imageStatus = plan?.plan_images?.find(image => image.role === "source")?.upload_status;
   return (
@@ -608,6 +634,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           {geometry && geometry.wall_segments.length > 0 && <button className={`toolbar-button${showWalls ? " is-on" : ""}`} type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)} title="Wall centrelines: exterior walls thick">Walls ({geometry.wall_segments.length})</button>}
           {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
           {ready && scaleLoaded && scale && !scaleMode && <span className="scale-status">Scale saved</span>}
+          {ready && scaleLoaded && !scale && geometry?.scale && geometry.scale.source !== "calibration" && <span className="scale-status" title={`${(geometry.scale.m_per_px * 1000).toFixed(2)} mm per pixel${geometry.scale.warning ? ` · ${geometry.scale.warning}` : ""}`}>{geometry.scale.source === "dimensions" ? `Scale read from ${geometry.scale.dimensions?.length ?? 0} dimension lines` : "Scale from written room areas"}{geometry.scale.warning ? " (check)" : ""}</span>}
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
           {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
           {ready && !correctionMode && <button className="toolbar-button" type="button" onClick={startCorrectionReview}>Review detections</button>}
@@ -622,7 +649,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
             imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerMove={event => { if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={() => { setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
-              {correctionMode && evidenceItems.map(item => {
+              {correctionMode && reviewItems.map(item => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 return <g className={`correction-mark${selectedEvidenceId === item.id ? " selected" : ""}${item.user_verified ? " user-corrected" : ""}`} key={item.id} onClick={event => { event.stopPropagation(); beginCorrection(item); }} role="button" aria-label={`${item.category} ${item.cls}`}>
@@ -644,12 +671,19 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   </g>;
                 })}
               </g>}
+              {geometry && showRooms && geometry.scale?.source === "dimensions" && <g className="dimension-layer">
+                {(geometry.scale.dimensions ?? []).map((dim, index) => <g key={index}>
+                  <line x1={dim.p0[0]} y1={dim.p0[1]} x2={dim.p1[0]} y2={dim.p1[1]} />
+                  <circle cx={dim.p0[0]} cy={dim.p0[1]} r="4" /><circle cx={dim.p1[0]} cy={dim.p1[1]} r="4" />
+                </g>)}
+              </g>}
               {geometry && showWalls && <g className="wall-layer">
                 {geometry.wall_segments.map(segment => <line key={segment.id} className={segment.exterior ? "exterior" : "interior"} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]}>
                   <title>{`${segment.exterior ? "Exterior" : "Interior"} wall · ${segment.length_m != null ? `${segment.length_m.toFixed(2)} m long, ${((segment.thickness_m ?? 0) * 100).toFixed(0)} cm thick` : `${Math.round(segment.length_px)} px long, ${Math.round(segment.thickness_px)} px thick`}`}</title>
                 </line>)}
               </g>}
-              {citations.map((item, index) => {
+              {citations.map((cited, index) => {
+                const item = shownCitation(cited);
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 return <g className={`citation-mark${item.user_verified ? " user-corrected" : ""}`} key={`${item.id}-${index}`}>
@@ -670,7 +704,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           {!outlineMode && savedOutlines.length > 0 && <div className="area-summary"><strong>Accepted {savedOutlines[0].label?.toLowerCase() ?? "outline"}</strong><span>{acceptedArea > 0 ? `Estimated area ${acceptedArea.toFixed(1)} m²` : "Set a drawing scale to calculate its area"}</span><button className="toolbar-button" type="button" onClick={removeSavedOutline} disabled={outlineRemoving}>{outlineRemoving ? "Removing…" : "Remove outline"}</button>{outlineError && <p role="alert">{outlineError}</p>}</div>}
           {correctionMode && <section className="correction-panel" aria-label="Review detected plan items">
             <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"}` : "Model detections are shown on the plan."}</span></div>
-            <div className="correction-list">{evidenceItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{item.cls.replaceAll("_", " ") || item.category}</span><small>{item.category}{item.user_verified ? " · verified" : item.score != null ? ` · ${Math.round(item.score * 100)}%` : ""}</small></button>)}</div>
+            <div className="correction-list">{reviewItems.filter(item => ["room", "door", "window", "fixture"].includes(item.category)).map(item => <button type="button" className={`correction-row${selectedEvidenceId === item.id ? " active" : ""}`} key={item.id} onClick={() => beginCorrection(item)}><span>{item.cls.replaceAll("_", " ") || item.category}</span><small>{item.category}{item.user_verified ? " · verified" : item.score != null ? ` · ${Math.round(item.score * 100)}%` : ""}</small></button>)}</div>
             {selectedEvidence && <div className="correction-editor"><strong>Correct selected item</strong><label>Kind<select value={editCategory} onChange={event => { const category = event.target.value; setEditCategory(category); setEditClass(itemTypes[category][0]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Type<select value={editClass} onChange={event => setEditClass(event.target.value)}>{(itemTypes[editCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><div className="correction-actions"><button className="toolbar-button primary-button" type="button" disabled={correctionSaving || (selectedEvidence.category === editCategory && selectedEvidence.cls === editClass)} onClick={() => void saveCorrection("update", selectedEvidence.id, { ...selectedEvidence, category: editCategory, cls: editClass })}>{correctionSaving ? "Saving…" : "Save correction"}</button><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => void saveCorrection("delete", selectedEvidence.id)}>Remove detection</button></div></div>}
             <div className="correction-editor"><strong>Add a missed item</strong><label>Kind<select value={addCategory} onChange={event => { const category = event.target.value; setAddCategory(category); setAddClass(itemTypes[category]?.[0] ?? "other"); setCorrectionAddPoints([]); }}>{Object.keys(itemTypes).map(category => <option key={category} value={category}>{category}</option>)}</select></label><label>Type<select value={addClass} onChange={event => setAddClass(event.target.value)}>{(itemTypes[addCategory] ?? ["other"]).map(type => <option key={type} value={type}>{type.replaceAll("_", " ")}</option>)}</select></label><button className="toolbar-button" type="button" disabled={correctionSaving} onClick={() => { setCorrectionAddPoints([]); setCorrectionAddMode(true); }}>{correctionAddMode ? addCategory === "room" ? correctionAddPoints.length === 0 ? "Click first room corner" : "Click opposite room corner" : "Click its location on the plan" : addCategory === "room" ? "Mark missing room" : "Place missing item"}</button></div>
             {correctionError && <p className="correction-error" role="alert">{correctionError}</p>}

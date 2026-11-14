@@ -202,24 +202,37 @@ class WallSegment(BaseModel):
     thickness_m: float | None = None
 
 
+class ScaleDimension(BaseModel):
+    """One dimension figure used for the scale: the printed length and the segment it labels (image pixels)."""
+
+    text: str
+    value_mm: float
+    bbox: tuple[float, float, float, float]  # the figure's text
+    p0: tuple[float, float]  # segment end ticks
+    p1: tuple[float, float]
+    length_px: float
+
+
 class PlanScale(BaseModel):
     """Metres per image pixel (PDF point) and where that number comes from."""
 
     m_per_px: float
-    # calibration = the user's two points; written_areas = areas written in rooms; symbols = rough band from the
-    # known sizes of doors / toilets / sinks (app.cubicasa.size_priors), never a measurement
-    source: Literal["calibration", "written_areas", "symbols"]
+    # calibration = the user's two points; written_areas = areas written in rooms; dimensions = printed lengths of
+    # dimension lines (app.cubicasa.dimensions); symbols = rough band from the known sizes of doors / toilets /
+    # sinks (app.cubicasa.size_priors), never a measurement
+    source: Literal["calibration", "written_areas", "dimensions", "symbols"]
     rooms: list[str] = Field(default_factory=list)  # written_areas: the rooms whose areas agreed
     low: float | None = None  # symbols: band of plausible m/px
     high: float | None = None
     items: list[str] = Field(default_factory=list)  # symbols: the plan items used
+    dimensions: list[ScaleDimension] = Field(default_factory=list)  # dimensions: the figures that agreed
     warning: str | None = None  # e.g. the scale disagrees with the symbol sizes (filled when served)
 
 
 class PlanGeometry(BaseModel):
     """Rooms and walls of one plan, stored in Supabase (plan_geometry) for overlays and the answering agent."""
 
-    version: int = 3  # bump when the content changes: older stored rows are recomputed
+    version: int = 4  # bump when the content changes: older stored rows are recomputed
     image: str
     width: int
     height: int

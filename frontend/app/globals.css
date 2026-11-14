@@ -183,4 +183,6 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .wall-layer line { stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .wall-layer line.exterior { stroke: #c0392b; stroke-width: 4; }
 .wall-layer line.interior { stroke: #2e6fb5; stroke-width: 2.5; }
-.room-layer, .wall-layer { pointer-events: none; } /* never take clicks from measuring, outlines or corrections */
+.dimension-layer line { stroke: #d35400; stroke-width: 3; vector-effect: non-scaling-stroke; }
+.dimension-layer circle { fill: #d35400; }
+.room-layer, .wall-layer, .dimension-layer { pointer-events: none; } /* never take clicks from measuring, outlines or corrections */

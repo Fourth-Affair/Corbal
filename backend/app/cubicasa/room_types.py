@@ -122,10 +122,12 @@ def classify(labels: list[RoomLabel], fixtures: list[Fixture], seg_fractions: di
     for e in ev:
         if e.source == "fixture" and e.weight > 0:
             fixture_best[e.type] = fixture_best.get(e.type, 0.0) + e.weight
+    fixture_top = None
     if kinds & DECISIVE_FIXTURES and fixture_best:
         top = max(fixture_best, key=fixture_best.get)
         if fixture_best[top] >= 4.0:
             strong_types.add(top)
+            fixture_top = top
 
     ranked = sorted(((t, round(s, 2)) for t, s in scores.items() if s > 0), key=lambda x: -x[1])
     purposes = [t for t in dict.fromkeys(e.type for e in ev if e.source == "ocr" and e.weight >= W["label"])]
@@ -133,8 +135,11 @@ def classify(labels: list[RoomLabel], fixtures: list[Fixture], seg_fractions: di
         return Classification("unknown", "unknown", [], {}, ev, [])
     best, best_score = ranked[0]
     runner = ranked[1][1] if len(ranked) > 1 else 0.0
-    # open plan: several clear labels in one space are not a conflict between each other
-    conflicts = sorted(t for t in strong_types if t != best and t not in purposes)
+    # open plan: several clear labels in one space are not a conflict between each other. Decisive fixtures that
+    # all fit the winner are not a conflict either: a toilet in a room labelled KPH points to "wc" more than to
+    # "bathroom", but bathrooms have toilets. A toilet in a room labelled K does conflict (it gives kitchen nothing).
+    fits = all(W["fixtures"].get(k, {}).get(best, 0) > 0 for k in kinds & DECISIVE_FIXTURES)
+    conflicts = sorted(t for t in strong_types if t != best and t not in purposes and not (t == fixture_top and fits))
     if best in strong_types and best_score - runner >= STRONG_MARGIN and not conflicts:
         tier = "strong"
     elif best in purposes and len(purposes) > 1 and not conflicts:
