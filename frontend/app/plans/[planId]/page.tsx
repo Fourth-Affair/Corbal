@@ -717,7 +717,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         : null);
       const areaQuestionForUI = requestedRoom ? `${submitted} ${requestedRoom.label}` : submitted;
       const needsScale = measurementIntent && !scale && !detectedScaleAvailable && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
-      const needsOutline = measurementIntent && Boolean(scale) && /boundary|outline/i.test(explanation) && !hasRequiredOutline(areaQuestionForUI);
+      // The API can use a detected scale that the user already confirmed. That
+      // scale lives in detectedScaleAccepted, not in the manual `scale` state.
+      // Don't hide the outline review just because the scale came from detection.
+      const needsOutline = measurementIntent && /boundary|outline/i.test(explanation) && !hasRequiredOutline(areaQuestionForUI);
       const needsMeasurement = Boolean(scale) && /\b(measure|measurement|distance|length|width|wide|long)\b/i.test(submitted);
       const answer = measurementIntent && !scale && detectedScaleAvailable && result.answer === null
         ? `I found a possible scale of ${geometry!.scale!.m_per_px.toFixed(5)} metres per pixel. Confirm it in the scale prompt before I use it for measurements.`
@@ -1164,12 +1167,13 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       Math.hypot(scale.points[1][0] - scale.points[0][0], scale.points[1][1] - scale.points[0][1])
     : null;
   const areaM2 = (polygon: Array<[number, number]>) => {
-    if (!metersPerPixel || polygon.length < 3) return null;
+    const effectiveMetersPerPixel = metersPerPixel ?? (detectedScaleAccepted ? geometry?.scale?.m_per_px ?? null : null);
+    if (!effectiveMetersPerPixel || polygon.length < 3) return null;
     const pixelArea = Math.abs(polygon.reduce((sum, [x, y], index) => {
       const [nextX, nextY] = polygon[(index + 1) % polygon.length];
       return sum + x * nextY - nextX * y;
     }, 0)) / 2;
-    return pixelArea * metersPerPixel * metersPerPixel;
+    return pixelArea * effectiveMetersPerPixel * effectiveMetersPerPixel;
   };
   const acceptedArea = savedOutlines.filter(outline => outline.decision !== "rejected")
     .reduce((sum, outline) => sum + (areaM2(outline.polygon) ?? 0), 0);
@@ -1356,10 +1360,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             <div className="room-review-heading"><strong>Review detected {getRequestedRoomType(pendingAreaQuestion)?.label.toLowerCase() ?? "room"} areas</strong><span>Each outline is separate. Check the painted area; adjust points only where needed.</span></div>
             {reviewedOutlines.length > 0 && <p className="room-review-placement">Use the controls placed inside each room on the plan.</p>}
             {getReviewOutlines(pendingAreaQuestion).length === 0 && <p className="room-review-empty">No room outline was detected. You can draw one on the plan.</p>}
-            <div className="room-review-footer">{scale ? `${reviewedAccepted.length} accepted · ${reviewedAcceptedArea.toFixed(1)} m² total` : "Set a drawing scale to show room areas"}{getReviewOutlines(pendingAreaQuestion).length === 0 && <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion)}>Draw room outline</button>}</div>
+            <div className="room-review-footer">{scale || detectedScaleAccepted ? `${reviewedAccepted.length} accepted · ${reviewedAcceptedArea.toFixed(1)} m² total` : "Set a drawing scale to show room areas"}{getReviewOutlines(pendingAreaQuestion).length === 0 && <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion)}>Draw room outline</button>}</div>
             {outlineError && <p role="alert">{outlineError}</p>}
           </section>}
-          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag a square corner handle to reshape the boundary. Select Add point to show edge handles and add a corner.</span></div><div className="outline-actions"><button className={`toolbar-button${addOutlinePointMode ? " is-on" : ""}`} type="button" onClick={() => setAddOutlinePointMode(on => !on)}>{addOutlinePointMode ? "Choose an edge" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{scale && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
+          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag a square corner handle to reshape the boundary. Select Add point to show edge handles and add a corner.</span></div><div className="outline-actions"><button className={`toolbar-button${addOutlinePointMode ? " is-on" : ""}`} type="button" onClick={() => setAddOutlinePointMode(on => !on)}>{addOutlinePointMode ? "Choose an edge" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{(scale || detectedScaleAccepted) && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && !detectedScaleAccepted && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
           {!pendingAreaQuestion && !outlineMode && savedOutlines.length > 0 && <div className="area-summary"><strong>Accepted outline areas</strong><span>{acceptedArea > 0 ? `Estimated total ${acceptedArea.toFixed(1)} m²` : "Set a drawing scale to calculate area"}</span><button className="toolbar-button" type="button" onClick={removeSavedOutline} disabled={outlineRemoving}>{outlineRemoving ? "Removing…" : "Remove outlines"}</button>{outlineError && <p role="alert">{outlineError}</p>}</div>}
           {correctionMode && <section className="correction-panel" aria-label="Review detected plan items">
             <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"} · used in this plan’s answers` : "Select a box, drag it to move, or drag its corner handle to resize it."}</span></div>
