@@ -10,7 +10,7 @@ import re
 from typing import Any, Callable
 
 from app.cubicasa.answer import count
-from app.models import Answer, PlanGeometry, PlanGraph, PlanItem, RoomShape, WallSegment
+from app.models import Answer, PlanGeometry, PlanGraph, PlanItem, PlanOutline, RoomShape, WallSegment
 from app.router import TEMPLATES
 
 # What each count template counts (the dataset's counting rules). Shown to the model in the tool description.
@@ -351,10 +351,13 @@ class PlanTools(BaseTools):
     uses_scale = True
     cross_check_router = True
 
-    def __init__(self, graph: PlanGraph, geometry: PlanGeometry | None = None):
+    def __init__(self, graph: PlanGraph, geometry: PlanGeometry | None = None,
+                 outlines: list[PlanOutline] | None = None):
         super().__init__()
         self.graph = graph
         self.geometry = geometry
+        self.outlines = outlines or []  # floor / room outlines the user reviewed or drew (decision set by the user)
+        self.area_scope: str | None = None  # "floor" or a room type, once outline_areas was asked about one
         self.by_id = {it.id: it for it in graph.items}
         self.rooms = {rm.id: rm for rm in geometry.rooms} if geometry else {}
         self.segments = {sg.id: sg for sg in geometry.wall_segments} if geometry else {}
@@ -367,14 +370,15 @@ class PlanTools(BaseTools):
         self.text_confidence = "medium" if graph.source == "svg" else "low"
 
     def declarations(self) -> list[dict]:
-        return DECLARATIONS + (ROOM_DECLARATIONS if self.geometry else [])
+        return DECLARATIONS + (ROOM_DECLARATIONS + [OUTLINE_AREAS] if self.geometry else [])
 
     def handlers(self) -> dict[str, Callable[..., tuple[dict, ToolTrace]]]:
         return {"plan_summary": self.plan_summary, "count_template": self.count_template,
                 "list_items": self.list_items, "items_in": self.items_in,
                 "count_items_in_area": self.count_items_in_area, "calculate": self.calculate,
                 **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls,
-                    "covering_quantity": self.covering_quantity} if self.geometry else {})}
+                    "covering_quantity": self.covering_quantity, "outline_areas": self.outline_areas}
+                   if self.geometry else {})}
 
     def summary(self) -> dict:
         return self.plan_summary()[0]
@@ -383,7 +387,58 @@ class PlanTools(BaseTools):
         parts: list[Any] = [self.graph.model_dump(mode="json")]
         if self.geometry is not None:
             parts.append(self.geometry.model_dump(mode="json"))
+        if self.outlines:  # accepting or redrawing an outline changes area answers
+            parts.append([o.model_dump(mode="json") for o in self.outlines])
         return parts
+
+    def outline_areas(self, scope: str = "all", room_type: str | None = None) -> tuple[dict, ToolTrace]:
+        """Areas (m²) of the floor / room outlines: the user's reviewed ones, and the model's suggestions not yet
+        reviewed. Polygon area x scale², computed here."""
+        from shapely.geometry import Polygon
+
+        if scope not in ("floor", "room", "all"):
+            raise ValueError("scope must be floor, room or all")
+        self.area_scope = "floor" if scope == "floor" else (room_type or self.area_scope)
+        scale = self.geometry.scale if self.geometry else None
+        reviewed = {o.id: o for o in self.outlines}
+        suggested = [*self.graph.floor_outlines,
+                     *(PlanOutline(id=rm.id, polygon=rm.polygon, scope="room", room_type=rm.type,
+                                   label=rm.name or rm.type) for rm in self.rooms.values()
+                       if rm.tier == "strong" and len(rm.polygon) >= 3)]
+        outlines = list(reviewed.values()) + [o for o in suggested if o.id not in reviewed]
+        outlines = [o for o in outlines if o.decision != "rejected"
+                    and (scope == "all" or o.scope == scope)
+                    and (room_type is None or o.room_type == room_type)]
+        written, items, numbers = self._written_areas()
+        if scale is None:
+            return {"outlines": len(outlines), "areas_written_on_drawing": written, "note": (
+                "No drawing scale is known, so outline areas in m² cannot be computed (areas printed on the drawing "
+                "are listed). Ask the user to set the scale with a known distance on the plan (Set scale).")},                 ToolTrace(item_ids=[it.id for it in items], numbers=numbers, items=items)
+        m = scale.m_per_px
+        rows = []
+        for o in outlines[:MAX_LIST]:
+            area = round(abs(Polygon(o.polygon).area) * m * m, 1)
+            status = "accepted by the user" if o.decision == "accepted" else "suggested by the model, not reviewed"
+            rows.append({"id": o.id, "scope": o.scope, "room_type": o.room_type, "label": o.label,
+                         "status": status, "area_m2": area})
+            xs, ys = zip(*o.polygon)
+            items.append(PlanItem(id=o.id, category="floor" if o.scope == "floor" else "room", cls=o.room_type or "",
+                                  text=o.label, polygon=list(o.polygon), bbox=(min(xs), min(ys), max(xs), max(ys))))
+            numbers.append(area)
+        accepted = [r["area_m2"] for r in rows if r["status"].startswith("accepted")]
+        out: dict[str, Any] = {"outlines": rows, "areas_written_on_drawing": written, "scale": self._scale_note()}
+        if len(accepted) > 1:
+            out["accepted_total_m2"] = round(sum(accepted), 1)
+            numbers.append(out["accepted_total_m2"])
+        out["note"] = ("Outline areas are measured to the drawn outline (a whole-floor outline includes the walls). "
+                       "An area printed on the drawing is the drawing's own figure, usually the net floor area: for "
+                       "an apartment total (often printed under the apartment name or type, e.g. '3h+k+s 66,0 m²') "
+                       "or a room, prefer it and cite it; give a measured outline area alongside when useful. "
+                       "Prefer outlines accepted by the user. A suggested outline is the model's guess: give its area "
+                       "as an estimate and suggest reviewing the outline on the drawing. No outline for what the "
+                       "user asks about: say so and suggest drawing one; never substitute a different outline (for "
+                       "example the whole floor for a room).")
+        return out, ToolTrace(item_ids=[it.id for it in items], numbers=numbers, items=items)
 
     def fallback(self, question: str) -> Answer:
         from app.router import route
@@ -497,6 +552,23 @@ class PlanTools(BaseTools):
         return (f"Metric sizes use a scale derived from the areas written in rooms {', '.join(sc.rooms)}: "
                 "mention that they are derived, not measured, and invite the user to calibrate the drawing for reliable "
                 "measurements." + warn)
+
+    def _written_areas(self) -> tuple[list[dict], list[PlanItem], list[float]]:
+        """Areas with a unit printed on the drawing ("66,0 m²"), from the text read inside each space."""
+        from app.cubicasa.rooms import _AREA_RE
+
+        rows, items, numbers = [], [], []
+        for rm in self.rooms.values():
+            for k, lb in enumerate(rm.labels):
+                for mm in _AREA_RE.finditer(lb.text):
+                    value = float(mm.group(1).replace(",", "."))
+                    item_id = f"text-{rm.id}-{k}"
+                    rows.append({"id": item_id, "text": lb.text, "area_m2": value, "inside_space": rm.id,
+                                 "space_type": rm.type, "other_text_in_space": [o.text for o in rm.labels if o is not lb][:8]})
+                    items.append(PlanItem(id=item_id, category="room", cls=rm.type if rm.type != "unknown" else "",
+                                          bbox=lb.bbox, text=lb.text, raw="printed area"))
+                    numbers.append(value)
+        return rows[:MAX_LIST], items[:MAX_LIST], numbers[:MAX_LIST]
 
     def list_rooms(self, include_uncertain: bool = False) -> tuple[dict, ToolTrace]:
         rooms = [rm for rm in self.rooms.values() if include_uncertain or rm.tier == "strong"]
@@ -636,6 +708,11 @@ IMAGE_RULES = """- For a whole-plan count that matches a count_template template
   For questions asking how many rooms there are and what types they are, call
   list_items(category="room") once: its count is the deduplicated room count and its items give the room types and
   labels. Answer both parts from that single result. Do not refuse merely because the rooms have different types.
+- For the area or size of the floor, apartment or a room, use outline_areas (and list_rooms for detected rooms).
+  If the room asked about is not among the outlines or rooms, say so; never answer with the whole floor's area
+  instead. If no drawing scale is known, ask the user to set the scale.
+- If the user refers to "this area" or "here" but no drawing location was supplied, ask them to select it on the
+  drawing with Refer to drawing.
 """
 
 DECLARATIONS = [
@@ -692,6 +769,20 @@ DECLARATIONS = [
 
 
 # Only offered when the plan has stored room geometry (uploaded plans); the benchmark path keeps the tools above.
+OUTLINE_AREAS = {
+    "name": "outline_areas",
+    "description": ("Areas in m² of floor and room outlines: the outlines the user accepted or drew in the viewer, and "
+                    "the model's suggested floor / room outlines not yet reviewed, each with its status. Uses the "
+                    "drawing scale (the user's calibration, else one read from the drawing). Use it for floor area, "
+                    "apartment size and room area questions."),
+    "parameters": {"type": "object", "properties": {
+        "scope": {"type": "string", "enum": ["floor", "room", "all"],
+                  "description": "floor = whole-floor outlines, room = room outlines (default all)"},
+        "room_type": {"type": "string", "description": ("only outlines of this room type, e.g. bedroom, kitchen, "
+                                                          "bathroom, wc, living, study, utility, storage")},
+    }},
+}
+
 ROOM_DECLARATIONS = [
     {
         "name": "covering_quantity",

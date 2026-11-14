@@ -164,7 +164,7 @@ is what the room tools, the room overlay and area questions use.
      reading (a number with a unit, or one bare decimal at OCR score ≥ 0.9, not a sum), one room purpose, a
      convex-ish outline (area / hull ≥ 0.85), a written area plausible for the room type, and an m/px inside the
      door / fixture band. Two passing rooms that disagree give no scale;
-   - the room-area questions and the outline review use this scale when the user has not calibrated one;
+   - the agent's `outline_areas` tool and the outline review use this scale when the user has not calibrated one;
    - otherwise only a rough range from door and fixture sizes (shown as `~8–12 m²`, never as a measured area).
 
 ---

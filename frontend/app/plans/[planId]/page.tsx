@@ -721,10 +721,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         ? [...recentHistory].reverse().filter(turn => turn.role === "user").map(turn => getRequestedRoomType(turn.text)).find(Boolean) ?? null
         : null);
       const areaQuestionForUI = requestedRoom ? `${submitted} ${requestedRoom.label}` : submitted;
-      const needsScale = measurementIntent && !scale && !detectedScaleAvailable && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
+      const needsScale = result.answer === null && measurementIntent && !scale && !detectedScaleAvailable && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
       // A detected scale can answer area questions before the user sets a manual scale.
       // Keep the outline review available when the server asks for a boundary.
-      const needsOutline = measurementIntent && /boundary|outline/i.test(explanation) && !hasRequiredOutline(areaQuestionForUI);
+      const needsOutline = result.answer === null && measurementIntent && /boundary|outline/i.test(explanation) && !hasRequiredOutline(areaQuestionForUI);
       const needsMeasurement = Boolean(scale) && /\b(measure|measurement|distance|length|width|wide|long)\b/i.test(submitted);
       const answer = measurementIntent && !scale && detectedScaleAvailable && result.answer === null
         ? `I found a possible scale of ${geometry!.scale!.m_per_px.toFixed(5)} metres per pixel. Confirm it in the scale prompt before I use it for measurements.`

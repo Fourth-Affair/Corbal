@@ -29,7 +29,7 @@ from uuid import uuid4
 from app.answering.tools import (CONFIDENCE_ORDER, MAX_CITATIONS, NUMBER_IN_TEXT, BaseTools, PlanTools, ToolTrace,
                                  backed, number_matches, written_decimals)
 from app.config import CACHE_DIR
-from app.models import Answer, ChatTurn, PlanGeometry, PlanGraph, PlanScaleCalibration
+from app.models import Answer, ChatTurn, PlanGeometry, PlanGraph, PlanOutline, PlanScaleCalibration
 from app.router import route
 
 log = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
 MAX_HISTORY_TURNS = 8
 MAX_HISTORY_CHARS = 6000
-PROMPT_VERSION = "21"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "22"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
@@ -518,6 +518,8 @@ def answer_with(question: str, tools: BaseTools, history: list[ChatTurn] | None 
         return None
     else:
         result = validate(question, final, traces, tools)
+        # which outlines the page should offer for review ("floor" or a room type), when areas were asked for
+        result.area_scope = getattr(tools, "area_scope", None)
     try:
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -534,9 +536,10 @@ def answer_with(question: str, tools: BaseTools, history: list[ChatTurn] | None 
 
 def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
            scale: PlanScaleCalibration | None = None, use_cache: bool = True,
-           geometry: PlanGeometry | None = None) -> Answer | None:
-    """Image plans: the agent over PlanTools (see answer_with)."""
-    return answer_with(question, PlanTools(graph, geometry), history, scale, use_cache)
+           geometry: PlanGeometry | None = None, outlines: list[PlanOutline] | None = None) -> Answer | None:
+    """Image plans: the agent over PlanTools (see answer_with). outlines = the floor / room outlines the user
+    reviewed in the viewer (outline_areas)."""
+    return answer_with(question, PlanTools(graph, geometry, outlines), history, scale, use_cache)
 
 
 def gave_up(result: Answer | None) -> bool:

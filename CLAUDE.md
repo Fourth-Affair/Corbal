@@ -102,7 +102,7 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
       within 4% and inside the door/fixture size band of `size_priors.py`), else written room areas (`rooms.py`,
       bare decimals under a label count; >= 2 rooms agreeing, else one room alone if it passes `single_room_scale`:
       clean reading, one purpose, convex-ish outline, area plausible for its type, inside the symbol band). Dimension
-      lines win; a > 10% disagreement with written areas is a warning. `ask_plan` room areas and the outline review
+      lines win; a > 10% disagreement with written areas is a warning. The agent's `outline_areas` and the outline review
       use this scale when the user has not calibrated.
   - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
     `app/pdfplan/`, `.ifc` -> `app/ifc/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
@@ -163,8 +163,9 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     class), rooms (centre-in-room), fusion counts exact per template, `--walls` wall F1. Seconds on cached graphs.
   - `app/main.py` web-app endpoints `/api/plans/{id}/...` (analyze, image, ask, geometry, scale, outline, corrections,
     feedback): source file from Supabase Storage, analysis saved in Supabase `plan_knowledge` (+ a local copy in
-    `CACHE_DIR/plan-graphs/`), geometry in `plan_geometry`. Room-area questions are answered in `ask_plan` from the
-    user's scale + accepted outlines before the agent is called. Analysis is a background job (`app/jobs.py`):
+    `CACHE_DIR/plan-graphs/`), geometry in `plan_geometry`. Every question goes to the agent (no keyword pre-routing);
+    floor / room areas come from its `outline_areas` tool (the user's accepted outlines + the model's suggested ones
+    x the scale, plus areas printed on the drawing), and `Answer.area_scope` tells the page which outlines to review. Analysis is a background job (`app/jobs.py`):
     `POST /analyze` -> 200 graph if saved, else 202; the page polls `GET /analysis` (state, stage, queue position).
   - `app/profiling.py` — `Profile` + `stage("name")` (nested, dotted names, contextvar: a no-op without an active
     profile, so library code marks its own stages) + `steps()` for long sequential functions; peak RSS per stage via
