@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { runAnalysis } from "../../analysis-client";
 
 type PlanRecord = {
   id: string;
@@ -413,9 +414,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           setImageUrl(objectUrl);
           setAnalysisStatus("Image ready · Analyzing floor plan…");
           try {
-            const analysisResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/analyze`, { method: "POST" });
-            const result = await analysisResponse.json();
-            if (!analysisResponse.ok) throw new Error(result.detail || "Analysis failed");
+            const result: any = await runAnalysis(id, () => cancelled, status => { if (!cancelled) setAnalysisStatus(status); });
             if (!cancelled) {
               if (result.width && result.height) setImageSize({ width: result.width, height: result.height });
               setEvidenceItems(Array.isArray(result.items) ? result.items : []);

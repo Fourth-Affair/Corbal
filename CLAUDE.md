@@ -48,8 +48,9 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     `final_answer` → `validate()`: value must equal a number a tool returned (else not_found), cited ids must come
     from tool output, confidence from the producing tool (count_template → counting model; raw items → low; router
     disagreement → low), explanation must state the value and use existing `[k]` refs. Answers cached in
-    `CACHE_DIR/agent`. `GEMINI_THINKING` (default `LOW`: 2-3x faster than the model default, same answers;
-    `MINIMAL` is rejected by gemini-3.8-flash). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
+    `CACHE_DIR/agent` (key includes `PROMPT_VERSION`: bump it when the prompt or tools change). `GEMINI_THINKING`
+    (default `MEDIUM` in code; `LOW` was measured 2-3x faster with the same answers on the dataset questions;
+    `MINIMAL` is rejected by gemini-3.8-flash). `GEMINI_MAX_PER_HOUR` caps uncached questions per process (0 = off). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
     (`GEMINI_TIMEOUT_S` per call, default 30). Yes/no answers are linked to, and checked against, a count_template
     result. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
   - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
@@ -76,6 +77,11 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
       (median 0.96), weakest on scanned architectural drawings; it paints openings as wall.
     - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
       `Layer` response shape; cached per image and weights).
+    - rooms (web app geometry): `rooms.py` (spaces from the wall map, `geometry_from_image` -> `PlanGeometry`),
+      `room_split.py` (cut a space holding two strong room labels), `room_types.py` (type from OCR label + fixtures +
+      net pixels, hand-set weights in `EVIDENCE_WEIGHTS`, strong / weak / unknown tier), `wallvec.py` (wall
+      centreline segments with length / thickness / rooms on each side), `windows.py` (split one detector box over a
+      mullioned window run). Evals: `rooms_eval.py`, `windows_eval.py`. `token_table.py` learns OCR token -> room type.
     - ground truth: `labels_from_svg.py`.
     - scale: `dimensions.py` (printed dimension figures + tick-to-tick span of their lines; >= 2 figures agreeing
       within 4% and inside the door/fixture size band of `size_priors.py`), else written room areas (`rooms.py`,
@@ -126,13 +132,34 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
   - `app/bench_perception.py` — `bench perception`: deterministic, no questions / router / LLM. Model PlanGraph vs
     SVG labels on the set's cubicasa test images: symbol boxes (one-to-one IoU matching -> precision/recall/F1 per
     class), rooms (centre-in-room), fusion counts exact per template, `--walls` wall F1. Seconds on cached graphs.
-- `frontend/` — Next.js 15 / React 19 / TypeScript. Calls backend via `BACKEND_URL`.
+  - `app/main.py` web-app endpoints `/api/plans/{id}/...` (analyze, image, ask, geometry, scale, outline, corrections,
+    feedback): source file from Supabase Storage, analysis saved in Supabase `plan_knowledge` (+ a local copy in
+    `CACHE_DIR/plan-graphs/`), geometry in `plan_geometry`. Room-area questions are answered in `ask_plan` from the
+    user's scale + accepted outlines before the agent is called. Analysis is a background job (`app/jobs.py`):
+    `POST /analyze` -> 200 graph if saved, else 202; the page polls `GET /analysis` (state, stage, queue position).
+  - `app/profiling.py` — `Profile` + `stage("name")` (nested, dotted names, contextvar: a no-op without an active
+    profile, so library code marks its own stages) + `steps()` for long sequential functions; peak RSS per stage via
+    psutil. Jobs log one `analysis_profile` JSON line each. `app/warmup.py` loads every model at startup (`WARMUP`).
+  - `scripts/profile_analysis.py` — the upload path (pipeline + geometry) on preview plans with an empty cache: stage
+    table, `--save-outputs` / `--diff` (prove a speed-up changes nothing), `--cpus N` (emulate a smaller server),
+    `--parallel-walls`, `--cprofile`.
+  - `scripts/inspect_plans.py` — inspection sheets (rooms, walls, detections, ground truth side by side; `--uploads N`
+    for uploaded plans). `scripts/fetch_questions.py` — `questions.jsonl` out of the dataset zip (HTTP range reads).
+- `frontend/` — Next.js 16 / React 19 / TypeScript. The browser calls only Next.js API routes
+  (`app/api/plans/[planId]/*`), which proxy to the backend via `BACKEND_URL` and parse every backend response as JSON.
+  Uploads go through `upload/route.ts` (anon key) to Supabase Storage. Plan viewer: `app/plans/[planId]/page.tsx`;
+  several floors at once: `app/building/page.tsx` (`/api/buildings/ask`). Both wait for analyses through
+  `app/analysis-client.ts` (`runAnalysis`: POST /analyze, poll GET /analysis); never treat a 2xx from /analyze as
+  the graph, it is 202 while the job runs.
+- `supabase/migrations/` — tables, upload RPCs and the Storage policy; apply in timestamp order.
 - `compose.yaml` — runs both with hot reload; mounts `./dataset` at `/dataset`.
+- `compose.prod.yaml` + `deploy/` — production on one server (Caddy -> frontend -> backend), see "Production" below.
 - `dataset/` (gitignored, never commit) — `junction-dataset/` (full challenge data + `questions.jsonl`),
   `junction-dataset-preview/` (preview release = our test set, never trained on), `cubicasa5k-original/`
   (Zenodo 2613548, labels + official split for training/eval only), `cache/`, `yolo-cubicasa-det/`, `runs/`,
   `models/` is now at the repo root (see below).
 - `models/` (`MODELS_DIR`, tracked in git, all files < 50 MB): `cubicasa-fusion.joblib`, `ocr_token_table.json`, `symbol-det.pt` + `.json` sidecar, `wallseg.pt` (fp16); checksums in `models/MANIFEST.json`. Not committed: `cubicasa-net.pkl` (208 MB CubiCasa net; the share bundle's `dataset/cubicasa-pretrained/` path also works). The detector fingerprint is a content hash, so retraining the detector requires refitting the fusion models.
+- `docs/pipeline.md` — how the whole system works, stage by stage (for the team; keep it current when a stage changes).
 - `docs/literature-review.md` — floor-plan recognition since CubiCasa5K and the roadmap.
 
 ## Commands
@@ -161,6 +188,9 @@ uv run python -m app.bench run --set fast --answerer template   # no Gemini: rou
 uv run python -m app.bench run --set fast --kind open           # breadth only: the open questions (~4 min)
 uv run python -m app.bench run --set fast --kind open --source svg --answerer agent   # same with perfect perception:
                                                             # what is left is question understanding and tools
+uv run python scripts/profile_analysis.py                  # where an upload's analysis spends time (6 preview plans)
+uv run python scripts/profile_analysis.py --save-outputs ../dataset/runs/profile/before   # then after a change:
+uv run python scripts/profile_analysis.py --diff ../dataset/runs/profile/before ../dataset/runs/profile/after
 uv run python -m app.bench perception --set fast [--walls]  # no questions at all: evidence boxes/rooms/counts vs SVG
                                                             # labels (diff works on these runs too)
 
@@ -211,11 +241,15 @@ balconies 85, sinks 84, bedrooms 78, doors 66, windows 44. Previous detector 81.
 door 0.957, window 0.917; 93 test windows are still "merged" (one box over a mullioned run; the ground truth itself
 labels such runs inconsistently, see `windows_eval.py`).
 
+The 81.8% was measured with three `var_*` features parsed from the dataset **file name** (the CubiCasa variant), which
+an upload never has. Removed 2026-11-15 (`fuse.image_features`; `fit.py` excludes `var_*`): on the 241 preview plans,
+zeroing them changes 2 of 2892 counts and leaves accuracy at 80.5%. Re-report the test score at the next refit (VM).
+No feature may come from a file name or path.
+
 History: majority baseline 52.8% → pipeline **77.2%** without the detector (same number via the runtime path, `app.eval --method model`). Per template: kitchens 95, bathrooms 94, floors 93, saunas 93,
 WC seats 89, WC rooms 85, balconies 84, bedrooms 77, showers+baths 75, sinks 74, doors 51, windows 38.
 Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: adjacent symbols merge in the
-segmentation. The symbol detector (`symdet.py`) is trained; refitting the counting models with its `det_*`
-features is the next step. 197 of the 241 preview plans are in the official *train* split, so preview scores of
+segmentation. The symbol detector and the refit with its `det_*` features gave the 81.8% above. 197 of the 241 preview plans are in the official *train* split, so preview scores of
 the counting models are optimistic: report on the official test split.
 
 ## Current PDF results (preview set; counts exact, areas within 2%)
@@ -233,11 +267,58 @@ of free-text reference answers); all 64.9%, coverage 91.2%, precision 67.6%. Pre
 99.0% (692), counts 48% / lengths 50% / volumes 50% (the misses are Danish / Estonian phrasings the word lists do not
 cover, answered not_found), text ≈54%; all 82.2%, coverage 90.8%, precision 88.5%.
 
+## Analysis speed (`scripts/profile_analysis.py`, 6 preview plans 0.03–12 MP, laptop, models loaded)
+
+Upload path = image pipeline + room / wall geometry. Before (2026-11-14): 12 MP plan **70.6 s**, 6.5 GB peak; plans
+up to 1 MP 3–9 s. Biggest stages at 12 MP: wall segmenter 27 s (native-resolution 512 px tiles), `fuse` features
+16 s, CubiCasa net 5 s + full-resolution maps 4 s, OCR 5 s (detection 4 s), evidence 3 s. On 4 pinned cores the 12 MP
+plan takes 92 s and small plans 10–16 s.
+
+- Done: `fuse.components` counts only labelled pixels (ndimage.sum/mean bincounted every pixel 4x per call):
+  features 16.2 -> 7.3 s, evidence 3.4 -> 1.4 s at 12 MP; 12 MP total 61 s. Outputs byte-identical (6 plans
+  graph + geometry, `image_features` on 253 cached plans).
+- Done: model warm-up at startup (`app/warmup.py`, `WARMUP`): 7–18 s per process no longer lands on the first upload.
+- Measured, off by default: `WALLSEG_MAX_PIXELS` (wall segmenter on a downscaled copy). On the 13 preview plans
+  over 4 MP: wall-seg time 251 s -> 180 s (6 MP cap) / 120 s (4 MP); agreement with the native map wall F1 mean
+  0.984 / 0.974, worst plan 0.936 / 0.902, openings worst 0.83. Agreement is not accuracy: turn it on only after
+  `app.cubicasa.walls --model wallseg` (ground-truth wall F1, needs the original CubiCasa5K) shows no drop.
+- Measured, off by default: `PARALLEL_WALLS` (wall segmenter in a thread during the pipeline). On 4 cores: 160.8 ->
+  157.5 s over the 6 plans, the 12 MP plan slower (91.5 -> 94.8 s) and +0.5 GB peak: both networks compete for
+  the same cores. Worth re-measuring only on a bigger server.
+- Not done (needs a counting-model refit): full-resolution softmax / argmax / quantisation in `features.compute`
+  (`maps`, 4–5 s at 12 MP) and full-resolution morphology in `image_features` / `_evidence`. Other candidates:
+  ONNX Runtime for the wall U-Net, OCR detection on a downscaled copy.
+
+## Production (`deploy/README.md` has the operator's version)
+
+Every push to `main` runs the backend tests and then deploys to the single server (`.github/workflows/deploy.yml` ->
+`deploy/deploy.sh ci`): code only, the server keeps its `.env`, `models/cubicasa-net.pkl` and `dataset/cache/`. So:
+
+- A change that needs a new env var, weights file or Supabase migration breaks production until someone adds it by
+  hand. Give new env vars a working default in code; pass them through `compose.prod.yaml` (with the same default:
+  an unset `${VAR:-}` becomes an empty string, not "unset"), list them in `.env.example`, and mention migrations in
+  the commit.
+- `models/` is mounted read-only and `dataset/` too (only `dataset/cache` is writable): runtime code must not write
+  next to the weights or the dataset.
+- One uvicorn process (`--workers 1`). Uploads are analysed by the in-process job queue (`app/jobs.py`, one worker
+  per slot; a restart forgets it and the page resubmits). Heavy work (`graph_from_image`, `_compute_geometry`) goes
+  through `_bounded_analysis` (`MAX_CONCURRENT_ANALYSES` slots; jobs wait, request handlers get a 503 "busy" after
+  `ANALYSIS_QUEUE_TIMEOUT`); keep new heavy paths inside it, and mark their stages with `app.profiling.stage`. Memory peaks at ~1.7 GB + 0.27 GB per megapixel, so uploads are downscaled to
+  `MAX_ANALYSIS_PIXELS` (`config.py`, default 16 MP) and PDF pages render at most that large (`pdf_render_scale`).
+  Downscaling is safe because the viewer draws the graph in its own `width`/`height` over the original image.
+- Unhandled backend errors return JSON `{"detail": ...}` (exception handler in `main.py`). The Next.js proxies show a
+  non-JSON body as "Could not reach the backend". Node's `fetch` in those proxies gives up after 300 s.
+- Gemini failures (bad key, retired `GEMINI_MODEL`, quota) are silent for users: answers fall back to the template
+  counter. Check backend logs for `Gemini agent failed`.
+- `deploy/*.sh` must keep LF line endings (`.gitattributes`). Writing them from Python on Windows produces CRLF.
+
 ## Conventions
 
 - Pydantic models for every API request/response; keep the `Answer`/`Citation` schema stable — the
   frontend renders highlights from it.
 - Coordinates: image pixels (PNG) or PDF user-space points, origin top-left, per page.
-- Secrets (e.g. `ANTHROPIC_API_KEY`) via `.env`, never committed.
-- Default LLM: latest Claude models (`claude-opus-5-5` for reasoning, `claude-haiku-5-5` for cheap
-  bulk steps like page classification).
+- Secrets (`GEMINI_API_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `VERDA_*`) via `.env`, never committed. Only `NEXT_PUBLIC_*`
+  values reach the browser, and they are baked in at `next build`.
+- LLM: the answering agent uses Gemini through `google-genai` (`GEMINI_MODEL`). For new LLM components, prefer the
+  latest Claude models (`claude-opus-5-5` for reasoning, `claude-haiku-5-5` for cheap bulk steps like page
+  classification).

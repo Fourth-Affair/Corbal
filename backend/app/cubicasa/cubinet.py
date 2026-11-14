@@ -24,7 +24,8 @@ if str(_VENDOR) not in sys.path:
 from floortrans.models.hg_furukawa_original import hg_furukawa_original  # noqa: E402
 from floortrans.post_prosessing import get_polygons, split_prediction  # noqa: E402
 
-# 208 MB, too big for git: fetched by scripts/fetch_models.py. The old share-bundle location still works.
+# 208 MB, too big for git: copied to models/cubicasa-net.pkl by hand or by deploy/deploy.sh push (from the share
+# bundle). The old share-bundle location still works.
 _LEGACY = DATASET_DIR.parent / "cubicasa-pretrained" / "model_best_val_loss_var.pkl"
 WEIGHTS = Path(os.environ.get("CUBINET_WEIGHTS") or (
     MODELS_DIR / "cubicasa-net.pkl" if (MODELS_DIR / "cubicasa-net.pkl").is_file() or not _LEGACY.is_file() else _LEGACY))

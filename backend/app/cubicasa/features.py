@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 
 from app.config import CACHE_DIR, DATASET_DIR
+from app.profiling import stage
 
 FEAT_DIR = CACHE_DIR / "features"
 MAX_SIDE = 1536
@@ -73,26 +74,29 @@ def compute(rel: str, img: Image.Image | None = None) -> None:
     img = img or Image.open(DATASET_DIR / rel)
     img = img.convert("RGB")
     if not _npz_ok(npz):
-        pred = cubinet.predict(img, max_side=MAX_SIDE)[0]
-        rooms = torch.softmax(pred[21:33], 0)
-        icons = torch.softmax(pred[33:44], 0)
-        tmp = npz.with_name(f"{npz.name}.{uuid4().hex}.tmp.npz")
-        try:
-            np.savez_compressed(
-                tmp,
-                heat=(pred[:21].clamp(0, 1) * 255).to(torch.uint8).numpy()[:, ::2, ::2],  # junction heatmaps, half res
-                rooms=rooms.argmax(0).to(torch.uint8).numpy(),
-                rooms_conf=(rooms.max(0).values * 255).to(torch.uint8).numpy(),
-                icons=icons.argmax(0).to(torch.uint8).numpy(),
-                icons_conf=(icons.max(0).values * 255).to(torch.uint8).numpy(),
-                # per-class probabilities: argmax loses symbols that sit on walls / touch each other
-                iprob=(icons[list(ICON_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
-                rprob=(rooms[list(ROOM_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
-            )
-            tmp.replace(npz)
-        finally:
-            tmp.unlink(missing_ok=True)
-    ocr_tokens(rel, img)
+        with stage("cubinet"):
+            pred = cubinet.predict(img, max_side=MAX_SIDE)[0]
+            rooms = torch.softmax(pred[21:33], 0)
+            icons = torch.softmax(pred[33:44], 0)
+        with stage("maps"):  # argmax / quantisation at full resolution + compressed npz
+            tmp = npz.with_name(f"{npz.name}.{uuid4().hex}.tmp.npz")
+            try:
+                np.savez_compressed(
+                    tmp,
+                    heat=(pred[:21].clamp(0, 1) * 255).to(torch.uint8).numpy()[:, ::2, ::2],  # junction heatmaps, half res
+                    rooms=rooms.argmax(0).to(torch.uint8).numpy(),
+                    rooms_conf=(rooms.max(0).values * 255).to(torch.uint8).numpy(),
+                    icons=icons.argmax(0).to(torch.uint8).numpy(),
+                    icons_conf=(icons.max(0).values * 255).to(torch.uint8).numpy(),
+                    # per-class probabilities: argmax loses symbols that sit on walls / touch each other
+                    iprob=(icons[list(ICON_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
+                    rprob=(rooms[list(ROOM_PROB_CLASSES)] * 255).to(torch.uint8).numpy(),
+                )
+                tmp.replace(npz)
+            finally:
+                tmp.unlink(missing_ok=True)
+    with stage("ocr"):
+        ocr_tokens(rel, img)
 
 
 def main() -> None:

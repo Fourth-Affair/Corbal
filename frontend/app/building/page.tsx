@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { runAnalysis } from "../analysis-client";
 
 type Floor = { id: string; name: string };
 type Evidence = { id: string; bbox: [number, number, number, number]; category?: string; cls?: string; user_verified?: boolean };
@@ -51,16 +52,21 @@ export default function BuildingPage() {
     setQuestion(""); setBusy(true); setStatus("Preparing selected floors…");
     appendMessage(targetChatKey, { role: "user", text });
     try {
+      // All floors are submitted at once: the backend queues them (POST /analyze returns 202 while a job runs) and
+      // runAnalysis polls each until its graph is ready.
       const analyzed: Record<string, { width: number; height: number }> = {};
-      for (const floor of chosenFloors) {
-        const analysis = await fetch(`/api/plans/${encodeURIComponent(floor.id)}/analyze`, { method: "POST" });
-        if (!analysis.ok) {
-          const body = await analysis.json().catch(() => ({}));
-          throw new Error(body.detail || `Could not analyze ${floor.name}`);
+      const progress: Record<string, string> = {};
+      await Promise.all(chosenFloors.map(async floor => {
+        try {
+          const graph: any = await runAnalysis(floor.id, () => false, step => {
+            progress[floor.name] = step;
+            setStatus(Object.entries(progress).map(([name, text]) => `${name}: ${text}`).join(" · "));
+          });
+          analyzed[floor.id] = { width: graph.width, height: graph.height };
+        } catch (error) {
+          throw new Error(`${floor.name}: ${error instanceof Error ? error.message : "could not be analyzed"}`);
         }
-        const graph = await analysis.json();
-        analyzed[floor.id] = { width: graph.width, height: graph.height };
-      }
+      }));
       setStatus("Checking the plans…");
       const response = mode === "building"
         ? await fetch("/api/buildings/ask", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: text, floors: chosenFloors }) })

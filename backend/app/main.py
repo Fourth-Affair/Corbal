@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -15,8 +15,12 @@ from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.requests import Request as HTTPRequest
+from fastapi.responses import FileResponse, JSONResponse, Response
 
+from app.config import MAX_ANALYSIS_PIXELS, pdf_render_scale
+from app.jobs import AnalysisJobs
+from app.profiling import Profile, stage
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
 from app.models import (Answer, AskRequest, BuildingQuestionRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
@@ -24,12 +28,40 @@ from app.models import (Answer, AskRequest, BuildingQuestionRequest, Layer, Plan
                         PlanScaleCalibration)
 from app.router import route
 
-app = FastAPI(title="Junc API", version="0.1.0")
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 log.propagate = False
+
+# Load the models in a background thread at startup, so the first analysis does not pay ~20 s of model loading and
+# imports (app/warmup.py). Analysis jobs wait for it; /health does not. WARMUP=0 skips it (dev hot reload).
+WARMUP = os.environ.get("WARMUP", "1") != "0"
+_models_ready = threading.Event()
+_models_ready.set()  # cleared only while a warm-up runs (tests and scripts never start one)
+
+
+def _warm_up_models() -> None:
+    from app.warmup import warm_up
+
+    try:
+        with Profile(sample_rss=False) as prof:
+            failed = warm_up()
+        log.info("model warm-up %.1f s%s %s", prof.total_s, f" (failed: {', '.join(failed)})" if failed else "",
+                 prof.to_json())
+    finally:
+        _models_ready.set()
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    if WARMUP:
+        _models_ready.clear()
+        threading.Thread(target=_warm_up_models, name="warm-up", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Junc API", version="0.1.0", lifespan=_lifespan)
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
@@ -37,33 +69,16 @@ PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
 ANSWERER = os.environ.get("ANSWERER", "llm")
 MAX_CONCURRENT_ANALYSES = max(1, int(os.environ.get("MAX_CONCURRENT_ANALYSES", "1")))
 ANALYSIS_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("ANALYSIS_QUEUE_TIMEOUT", "45")))
+# Start the wall segmenter (the geometry step's biggest cost) while the image pipeline runs: shorter analyses, higher
+# peak memory (both networks' buffers at once). See "Analysis speed" in CLAUDE.md.
+PARALLEL_WALLS = os.environ.get("PARALLEL_WALLS", "0") != "0"
 _analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
-_plan_locks: dict[UUID, list] = {}
-_plan_locks_guard = threading.Lock()
+# Uploads are analysed by background jobs (POST /analyze -> poll GET /analysis); one pool worker per slot.
+_jobs = AnalysisJobs(lambda plan_id: _analyze_plan(plan_id), workers=MAX_CONCURRENT_ANALYSES, ready=_models_ready)
 
 # Plans are routed by file type, never by folder: images -> image pipeline, PDFs -> vector PDF parser, .ifc -> app.ifc.
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
-
-
-@contextmanager
-def _plan_analysis_lock(plan_id: UUID):
-    """Serialize work for one plan while letting different plans proceed independently."""
-    with _plan_locks_guard:
-        entry = _plan_locks.get(plan_id)
-        if entry is None:
-            entry = [threading.Lock(), 0]
-            _plan_locks[plan_id] = entry
-        entry[1] += 1
-    entry[0].acquire()
-    try:
-        yield
-    finally:
-        with _plan_locks_guard:
-            entry[1] -= 1
-            entry[0].release()
-            if entry[1] == 0:
-                _plan_locks.pop(plan_id, None)
 
 
 def _upstream_bytes(request: Request, timeout: float, *, retry_safe: bool = False) -> tuple[bytes, int, object]:
@@ -88,8 +103,10 @@ def _upstream_bytes(request: Request, timeout: float, *, retry_safe: bool = Fals
     raise TimeoutError("Upstream request exceeded its overall deadline")
 
 
-def _bounded_analysis(operation):
-    if not _analysis_slots.acquire(timeout=ANALYSIS_QUEUE_TIMEOUT):
+def _bounded_analysis(operation, timeout: float | None = ANALYSIS_QUEUE_TIMEOUT):
+    """Run heavy work (analysis, geometry) in one of MAX_CONCURRENT_ANALYSES slots. Request handlers give up after
+    `timeout` seconds (503, retryable); background jobs pass None and wait for a slot."""
+    if not _analysis_slots.acquire(timeout=-1 if timeout is None else timeout):
         raise HTTPException(status_code=503, detail="Plan analysis is busy. Please try again shortly.")
     try:
         return operation()
@@ -112,6 +129,13 @@ def _check_path(path: str, pdf_ok: bool = False):
         return p
     kinds = "an image (.png, .jpg)" + (" or a .pdf" if pdf_ok else "")
     raise HTTPException(400, f"Expected {kinds}, got {p.name}.")
+
+
+@app.exception_handler(Exception)
+async def _unhandled(_request: HTTPRequest, error: Exception) -> JSONResponse:
+    """Unhandled errors as JSON: the Next.js proxies parse every backend response as JSON, and a plain-text 500 would
+    reach the user as "Could not reach the backend". Starlette still logs the traceback."""
+    return JSONResponse({"detail": f"Internal error ({type(error).__name__})"}, status_code=500)
 
 
 @app.get("/health")
@@ -541,7 +565,8 @@ def _render_pdf_page(path_or_bytes, scale: float = 2.0):
 
     pdf = pdfium.PdfDocument(path_or_bytes)
     try:
-        return pdf[0].render(scale=scale).to_pil().convert("RGB")
+        page = pdf[0]
+        return page.render(scale=pdf_render_scale(*page.get_size(), scale)).to_pil().convert("RGB")
     finally:
         pdf.close()
 
@@ -564,45 +589,55 @@ def get_plan_image(plan_id: UUID) -> Response:
     return Response(content, media_type=media_type, headers={"Cache-Control": "private, max-age=300"})
 
 
-@app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
-def analyze_plan(plan_id: UUID) -> PlanGraph:
-    with _plan_analysis_lock(plan_id):
-        return _analyze_plan(plan_id)
+@app.post("/api/plans/{plan_id}/analyze", response_model=None)
+def analyze_plan(plan_id: UUID) -> JSONResponse:
+    """200 with the PlanGraph when the plan is already analysed; otherwise starts (or joins) a background job and
+    returns 202 {"state", "stage", "position"}: poll GET /api/plans/{plan_id}/analysis."""
+    if (job := _jobs.get(plan_id)) is None or job.state == "failed":
+        if graph := _saved_graph(plan_id):
+            return JSONResponse(graph.model_dump(mode="json"))
+        job = _jobs.submit(plan_id)
+    status, body = _jobs.response(job)
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/api/plans/{plan_id}/analysis", response_model=None)
+def analysis_status(plan_id: UUID) -> JSONResponse:
+    """The plan's analysis job: 202 {"state": "queued" | "running", "stage", "position"}, 200 {"state": "done",
+    "graph", "profile"} or {"state": "failed", "status", "detail"}; 404 {"state": "unknown"} when no job is known
+    (e.g. after a restart) and the plan has no saved analysis: POST /analyze again."""
+    job = _jobs.get(plan_id)
+    if job is None:
+        if graph := _saved_graph(plan_id):
+            return JSONResponse({"state": "done", "graph": graph.model_dump(mode="json")})
+        return JSONResponse({"state": "unknown", "detail": "No analysis is running for this plan"}, status_code=404)
+    status, body = _jobs.response(job)
+    return JSONResponse(body, status_code=status)
 
 
 def _analyze_plan(plan_id: UUID) -> PlanGraph:
-    """Download the uploaded source file from Supabase and analyze it (image pipeline, or the PDF parser)."""
-    request_started = time.perf_counter()
-    stage_times: dict[str, float] = {}
-
-    def timed(stage: str, operation):
-        started = time.perf_counter()
-        try:
-            return operation()
-        finally:
-            stage_times[stage] = time.perf_counter() - started
-
-    def finish(graph: PlanGraph, cache_hit: bool = False) -> PlanGraph:
-        log.info("plan analysis timing plan_id=%s source=%s cache_hit=%s stages_s=%s total_s=%.3f",
-                 plan_id, graph.source, cache_hit,
-                 {name: round(seconds, 3) for name, seconds in stage_times.items()},
-                 time.perf_counter() - request_started)
+    """The analysis job: download the uploaded source file from Supabase and analyse it (image pipeline, or the PDF
+    parser), then persist the graph and the room / wall geometry. Stages are recorded into the job's profile."""
+    with stage("saved_lookup"):
+        graph = _saved_graph(plan_id)
+    if graph:
         return graph
-
-    if graph := timed("saved_graph_lookup", lambda: _saved_graph(plan_id)):
-        return finish(graph, cache_hit=True)
-    image_bytes = timed("source_download", lambda: _download_source(plan_id))
+    with stage("download"):
+        image_bytes = _download_source(plan_id)
     if _is_pdf_bytes(image_bytes):  # vector PDF: deterministic parser, coordinates in PDF points
         from app.pdfplan.answer import plan_graph
 
         try:
-            graph = timed("pdf_parse", lambda: _bounded_analysis(
-                lambda: plan_graph(str(_upload_pdf(plan_id, image_bytes)), image=f"uploads/{plan_id}.pdf")))
+            with stage("pdf_parse"):
+                graph = _bounded_analysis(lambda: plan_graph(str(_upload_pdf(plan_id, image_bytes)),
+                                                             image=f"uploads/{plan_id}.pdf"), timeout=None)
         except Exception as error:  # noqa: BLE001  unreadable or encrypted PDF
             raise HTTPException(status_code=422, detail=f"Uploaded PDF could not be read: {error}") from error
-        timed("knowledge_persist", lambda: _persist_graph(plan_id, graph))
-        timed("geometry_store", lambda: _store_geometry_safely(plan_id, graph))
-        return finish(graph)
+        with stage("persist"):
+            _persist_graph(plan_id, graph)
+        with stage("geometry"):
+            _store_geometry_safely(plan_id, graph, timeout=None)
+        return graph
 
     # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
     # cache key prevents unrelated uploads from sharing feature files.
@@ -614,28 +649,46 @@ def _analyze_plan(plan_id: UUID) -> PlanGraph:
     cache_key = f"uploads/{plan_id}.png"
     cache_path = CACHE_DIR / cache_key
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    def prepare_image():
+    with stage("decode"):
         try:
             image = Image.open(io.BytesIO(image_bytes))
             image.verify()
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            if (pixels := image.width * image.height) > MAX_ANALYSIS_PIXELS:
+                s = (MAX_ANALYSIS_PIXELS / pixels) ** 0.5
+                log.info("plan %s: %dx%d image downscaled by %.2f for analysis", plan_id, image.width, image.height, s)
+                image = image.resize((max(1, int(image.width * s)), max(1, int(image.height * s))),
+                                     Image.LANCZOS, reducing_gap=3.0)
             tmp = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp.png")
             try:
                 image.save(tmp, format="PNG")
                 tmp.replace(cache_path)
             finally:
                 tmp.unlink(missing_ok=True)
+        except Image.DecompressionBombError as error:  # > ~179 MP: refuse before decoding
+            raise HTTPException(status_code=413, detail="The uploaded image is too large to analyse. "
+                                "Please upload it at a lower resolution.") from error
         except (UnidentifiedImageError, OSError) as error:
             raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
+    walls_thread = None
+    if PARALLEL_WALLS:
+        from app.cubicasa.layers import prefetch_walls
 
-    timed("image_decode_and_cache", prepare_image)
+        walls_thread = prefetch_walls(cache_key, cache_path)
     try:
-        graph = timed("image_pipeline", lambda: _bounded_analysis(lambda: graph_from_image(cache_key, cache_path)))
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
-    timed("knowledge_persist", lambda: _persist_graph(plan_id, graph))
-    timed("geometry_store", lambda: _store_geometry_safely(plan_id, graph))
-    return finish(graph)
+        try:
+            with stage("pipeline"):
+                graph = _bounded_analysis(lambda: graph_from_image(cache_key, cache_path), timeout=None)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
+        with stage("persist"):
+            _persist_graph(plan_id, graph)
+        with stage("geometry"):  # its wall map comes from the prefetch when PARALLEL_WALLS is on
+            _store_geometry_safely(plan_id, graph, timeout=None)
+        return graph
+    finally:
+        if walls_thread is not None:  # part of this job: never let it run on into the next one
+            walls_thread.join()
 
 
 # ---------------------------------------------------------------- plan geometry (rooms, walls, openings)
@@ -681,7 +734,10 @@ def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp.png")
         try:
-            Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB").save(tmp, format="PNG")
+            image = Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB")
+            if image.size != (graph.width, graph.height):  # the analysis downscaled it (MAX_ANALYSIS_PIXELS)
+                image = image.resize((graph.width, graph.height), Image.LANCZOS, reducing_gap=3.0)
+            image.save(tmp, format="PNG")
             tmp.replace(path)
         finally:
             tmp.unlink(missing_ok=True)
@@ -699,10 +755,10 @@ def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
         "weak_rooms": sum(r.tier == "weak" for r in geometry.rooms)})
 
 
-def _store_geometry_safely(plan_id: UUID, graph: PlanGraph) -> None:
+def _store_geometry_safely(plan_id: UUID, graph: PlanGraph, timeout: float | None = ANALYSIS_QUEUE_TIMEOUT) -> None:
     """Geometry is an extra layer: a failure here must not fail the analysis (it is retried on first read)."""
     try:
-        _store_geometry(plan_id, _compute_geometry(plan_id, graph))
+        _store_geometry(plan_id, _bounded_analysis(lambda: _compute_geometry(plan_id, graph), timeout))
     except Exception as error:  # noqa: BLE001
         log.warning("plan %s: geometry not stored (%s)", plan_id, error)
 
@@ -743,7 +799,8 @@ def _plan_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
             return PlanGeometry.model_validate(stored)
         except ValueError:
             log.warning("plan %s: stored geometry is invalid, recomputing", plan_id)
-    geometry = _compute_geometry(plan_id, graph)
+    # wall segmentation at native resolution: as heavy as an analysis, so it takes one of the same slots
+    geometry = _bounded_analysis(lambda: _compute_geometry(plan_id, graph))
     _store_geometry(plan_id, geometry)
     return geometry
 

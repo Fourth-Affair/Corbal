@@ -86,7 +86,9 @@ def dataset(table, qs, paths, template):
     for p in paths:
         if p in table and (p, template) in qs:
             f = table[p]
-            keys = keys or sorted(f)
+            # var_*: the CubiCasa variant parsed from the dataset file name, in feature tables built before
+            # 2026-11-15. Not evidence from the drawing (an upload has no such name): never fit on it.
+            keys = keys or sorted(k for k in f if not k.startswith("var_"))
             X.append([f.get(k, 0.0) for k in keys])
             y.append(qs[(p, template)])
             P.append(p)
