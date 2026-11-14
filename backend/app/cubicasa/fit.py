@@ -42,7 +42,7 @@ def _feat(rel: str):
 def build_table(paths: list[str]) -> dict[str, dict]:
     table: dict[str, dict] = {}
     if TABLE.exists():
-        for line in TABLE.read_text().splitlines():
+        for line in TABLE.read_text(encoding="utf-8").splitlines():
             r = json.loads(line)
             if r.get("v") == FEATURE_VERSION:
                 table[r["path"]] = r["f"]

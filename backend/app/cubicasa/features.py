@@ -47,12 +47,17 @@ def ocr_tokens(rel: str, img: Image.Image | None = None) -> dict:
 
     _, js = feature_paths(rel)
     if js.exists():
-        return json.loads(js.read_text())
+        try:
+            return json.loads(js.read_text(encoding="utf-8"))
+        except ValueError:  # truncated by an interrupted run: recompute
+            pass
     js.parent.mkdir(parents=True, exist_ok=True)
     img = (img or Image.open(DATASET_DIR / rel)).convert("RGB")
     toks = [{"text": t, "bbox": [round(float(v), 1) for v in b], "score": round(float(s), 3)} for t, b, s in read_text(img)]
     out = {"width": img.width, "height": img.height, "ocr": toks}
-    js.write_text(json.dumps(out, ensure_ascii=False))
+    tmp = js.with_suffix(".json.tmp")  # atomic: a crash must not leave a half-written cache
+    tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(js)
     return out
 
 

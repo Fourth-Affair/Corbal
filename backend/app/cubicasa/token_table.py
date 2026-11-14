@@ -30,7 +30,7 @@ def learn(min_count: int = 3, min_purity: float = 0.7) -> dict[str, str]:
         if not js.exists():
             continue
         n_img += 1
-        ocr = json.loads(js.read_text())["ocr"]
+        ocr = json.loads(js.read_text(encoding="utf-8"))["ocr"]
         rooms = [(Polygon(it.polygon).buffer(0), it.cls) for it in get_graph(rel, "svg").items
                  if it.category == "room" and it.polygon and len(it.polygon) >= 3]
         for tok in ocr:
@@ -57,14 +57,14 @@ _TABLE: dict[str, str] | None = None
 def lookup(token: str) -> str | None:
     global _TABLE
     if _TABLE is None:
-        _TABLE = json.loads(TABLE_PATH.read_text()) if TABLE_PATH.exists() else {}
+        _TABLE = json.loads(TABLE_PATH.read_text(encoding="utf-8")) if TABLE_PATH.exists() else {}
     return _TABLE.get(normalise(token))
 
 
 if __name__ == "__main__":
     t = learn()
     TABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TABLE_PATH.write_text(json.dumps(t, ensure_ascii=False, indent=0, sort_keys=True))
+    TABLE_PATH.write_text(json.dumps(t, ensure_ascii=False, indent=0, sort_keys=True), encoding="utf-8")
     by = defaultdict(list)
     for k, v in t.items():
         by[v].append(k)

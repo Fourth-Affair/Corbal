@@ -222,7 +222,7 @@ def answer(question: str, graph: PlanGraph) -> Answer | None:
         return None
     cache = _cache_path(question, graph)
     if cache.is_file():
-        return Answer.model_validate_json(cache.read_text())
+        return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
     tools = PlanTools(graph)
     try:
         final, traces = run_loop(question, tools)
@@ -232,7 +232,7 @@ def answer(question: str, graph: PlanGraph) -> Answer | None:
     result = validate(question, final, traces, tools)
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(result.model_dump_json())
+        cache.write_text(result.model_dump_json(), encoding="utf-8")
     except OSError:
         pass
     return result

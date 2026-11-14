@@ -59,7 +59,7 @@ def _det_items(dets: list[dict]) -> list[PlanItem]:
 def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
     npz, js = feature_paths(rel)
     z = np.load(npz)
-    meta = json.loads(js.read_text())
+    meta = json.loads(js.read_text(encoding="utf-8"))
     icons, iconf, rooms, rconf = z["icons"], z["icons_conf"], z["rooms"], z["rooms_conf"]
     H, W = icons.shape
     items: list[PlanItem] = []

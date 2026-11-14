@@ -36,7 +36,7 @@ def _cache_path(rel: str, source: str) -> Path:
 def get_graph(rel: str, source: str = "model", use_cache: bool = True) -> PlanGraph:
     cache = _cache_path(rel, source)
     if use_cache and cache.is_file():
-        return PlanGraph.model_validate_json(cache.read_text())
+        return PlanGraph.model_validate_json(cache.read_text(encoding="utf-8"))
 
     if source == "svg":
         from app.cubicasa.labels_from_svg import graph_from_svg
@@ -50,5 +50,5 @@ def get_graph(rel: str, source: str = "model", use_cache: bool = True) -> PlanGr
         raise ValueError(source)
 
     cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(graph.model_dump_json())
+    cache.write_text(graph.model_dump_json(), encoding="utf-8")
     return graph
