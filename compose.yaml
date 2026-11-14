@@ -29,6 +29,7 @@ services:
       CACHE_DIR: /dataset/cache
       MODELS_DIR: /dataset/models
       PLAN_SOURCE: ${PLAN_SOURCE:-model}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:
       - ./backend:/app
       - ./dataset:/dataset
