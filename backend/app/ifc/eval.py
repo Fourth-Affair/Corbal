@@ -2,6 +2,7 @@
 
   uv run python -m app.ifc.eval                          # every .ifc question of DATASET_DIR (full dataset)
   uv run python -m app.ifc.eval --preview                # the preview release (= our test set; never tune on it)
+  uv run python -m app.ifc.eval --preview --agent --type count   # through the Gemini agent (IfcTools), as the API
   uv run python -m app.ifc.eval --type count --show 30   # one answer type, print misses
 
 Scoring:
@@ -102,6 +103,10 @@ def main() -> None:
     ap.add_argument("--type", default=None, help="only this answer type (count, area, volume, length, text)")
     ap.add_argument("--show", type=int, default=0, help="print this many misses")
     ap.add_argument("--out", type=Path, default=None, help="write per-question results (jsonl)")
+    ap.add_argument("--agent", action="store_true", help="answer through the Gemini agent with IfcTools (fallback: "
+                    "the deterministic answerer when Gemini is unavailable), as /api/ask does")
+    ap.add_argument("--limit", type=int, default=0, help="only the first N questions (after filters)")
+    ap.add_argument("--workers", type=int, default=8, help="parallel questions with --agent")
     args = ap.parse_args()
 
     root = args.dataset or (DATASET_DIR.parent / "junction-dataset-preview" if args.preview else DATASET_DIR)
@@ -110,23 +115,51 @@ def main() -> None:
     model_mod.DATASET_DIR = root  # resolve paths against the chosen release
     from app.ifc.answer import answer_question
 
+    if args.agent:
+        from app.answering.agent import answer_with
+        from app.bench import _load_dotenv
+        from app.ifc.agent_tools import IfcTools
+        from app.ifc.model import load_model
+
+        _load_dotenv()
+
+        def answer_question(path, question):  # noqa: F811  same routing as /api/ask
+            tools = IfcTools(load_model(path), path)
+            return answer_with(question, tools) or tools.fallback(question)
+
     qs = [json.loads(line) for line in open(root / "questions.jsonl", encoding="utf-8")]
     qs = [q for q in qs if q["path"].lower().endswith(".ifc") and q["path"].startswith(args.prefix)
           and (args.type is None or q["type"] == args.type)]
+    if args.limit:
+        qs = qs[: args.limit]
     stats = defaultdict(lambda: [0, 0, 0, 0])  # n, correct, answered, correct&answered
     misses, out = [], []
     t0 = time.time()
-    for q in qs:
+    def one(q):
+        from app.models import Answer
+
         try:
-            a = answer_question(q["path"], q["question"])
+            return answer_question(q["path"], q["question"])
         except FileNotFoundError:
-            from app.models import Answer
-
-            a = Answer(answer=None, confidence="not_found", explanation="file missing")
+            return Answer(answer=None, confidence="not_found", explanation="file missing")
         except Exception as e:  # noqa: BLE001  one broken question must not stop the eval
-            from app.models import Answer
+            return Answer(answer=None, confidence="not_found", explanation=f"error: {type(e).__name__}: {e}")
 
-            a = Answer(answer=None, confidence="not_found", explanation=f"error: {type(e).__name__}: {e}")
+    if args.agent:  # models parsed once, sequentially, then questions in parallel (network-bound)
+        from concurrent.futures import ThreadPoolExecutor
+
+        from app.ifc.model import load_model
+
+        for path in sorted({q["path"] for q in qs}):
+            try:
+                load_model(path)
+            except Exception:  # noqa: BLE001
+                pass
+        with ThreadPoolExecutor(args.workers) as pool:
+            answers = list(pool.map(one, qs))
+    else:
+        answers = [one(q) for q in qs]
+    for q, a in zip(qs, answers, strict=True):
         ok = correct(a, q)
         answered = a.confidence != "not_found" and a.answer is not None
         for key in (q["type"], f"{q['type']}:{a.template or '-'}", "ALL"):

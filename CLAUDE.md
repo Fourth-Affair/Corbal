@@ -48,10 +48,20 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     `final_answer` → `validate()`: value must equal a number a tool returned (else not_found), cited ids must come
     from tool output, confidence from the producing tool (count_template → counting model; raw items → low; router
     disagreement → low), explanation must state the value and use existing `[k]` refs. Answers cached in
-    `CACHE_DIR/agent`. `GEMINI_THINKING` (default `LOW`: 2-3x faster than the model default, same answers;
-    `MINIMAL` is rejected by gemini-3.8-flash). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
+    `CACHE_DIR/agent`. `GEMINI_THINKING` (default `MEDIUM`; `LOW` is 2-3x faster than the model default with the same
+    dataset answers; `MINIMAL` is rejected by gemini-3.8-flash). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
     (`GEMINI_TIMEOUT_S` per call, default 30). Yes/no answers are linked to, and checked against, a count_template
-    result. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
+    result. No `GEMINI_API_KEY` / API error / hourly cap → `answer_with` returns None → the deterministic answerer
+    (router + template counter for images). `ANSWERER=template` disables it. A model that does not finish is not an
+    API error: on the last of `MAX_STEPS` only `final_answer` may be called (`allowed_function_names`), a reply
+    without a function call gets one reminder, and if there is still no final answer the result is not_found
+    (`agent.gave_up()`, bench error `agent_gave_up`), never a template answer.
+    The loop runs over any toolset (`BaseTools` in `tools.py`: declarations, `call()` recording numbers and items,
+    `calculate`, prompt `rules` between the shared prompt's head and tail, `summary()`, `fingerprint()` for the cache
+    key, `raw_confidence` / `text_confidence`, `fallback()`): `PlanTools` (images, the only one with the router
+    cross-check), `app/pdfplan/tools.py` `PdfTools` and `app/ifc/agent_tools.py` `IfcTools`. Values may also be a
+    tool number rounded to fewer (≥1) decimals (45.2 for 45.237); text answers may state numbers written in tool
+    result strings.
   - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
     counts), `list_items`, `items_in` (containment by the room's outline when it has one: fixtures by centre, doors
     and windows when they run along it; bounding box otherwise; a room label uses the room region around it),
@@ -85,7 +95,10 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     next to the PDF, room/apartment outlines and door / window / fixture symbols from it (layers matched by keyword,
     FIXTURE outline + inner marks -> toilet/washbasin/bathtub/shower/kitchen/stairs), joined to the PDF through shared
     texts with an affine fit. Without a DXF, symbol counts use the image detector on the rendered page (low
-    confidence) and apartment areas say not found. `answer.py`: EN/DE/FR/IT questions -> 12 templates.
+    confidence) and apartment areas say not found. `answer.py`: EN/DE/FR/IT questions -> 12 templates
+    (`parse_question` + `answer_template`; the offline path and the agent's fallback). `tools.py`: agent tools
+    `pdf_lookup` (the 12 templates as one calibrated tool), `list_rooms` (by name / apartment), `list_apartments`,
+    `list_symbols`, `calculate`.
     `python -m app.pdfplan.eval [--prefix data/swiss_dwellings/] [--split eval] [--no-dxf]`.
   - `app/ifc/` — IFC (BIM) models, deterministic, no API key. `model.py`: ifcopenshell -> IfcModel evidence (header /
     IfcApplication / schema, project / sites / buildings / storeys, every element with class, effective kind (IFC2X3
@@ -96,11 +109,16 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     property). `tools.py`: general tools (count / select / group by class + storey + filters, find spaces, sum /
     extreme of a quantity, types, materials, storeys, metadata, systems), every result carries GlobalIds.
     `answer.py`: EN/DE/FI/SV question -> operation -> tools -> Answer; citations are PlanItems with id = IFC
-    GlobalId, raw = IFC class, bbox (0,0,0,0). Unmapped -> not_found. Not yet offered to the Gemini agent.
+    GlobalId, raw = IFC class, bbox (0,0,0,0). Unmapped -> not_found. `answer.py` is the offline path and the agent's
+    fallback; `agent_tools.py` (`IfcTools`) offers the tools to the agent with IFC class names as arguments (the
+    model translates the question's language), filters storey / predefined type / name_contains / external /
+    load_bearing: `count_elements`, `group_elements`, `list_storeys`, `find_spaces`, `space_areas`, `sum_quantity`,
+    `extreme`, `element_details`, `materials`, `types`, `metadata`, `systems`, `calculate`.
     `python -m app.ifc.eval [--preview]` (counts exact, numbers within 2%, text scored approximately).
   - `app/eval.py` — exact-match eval per template (counting models only, bypasses the agent).
-  - `app/bench.py` — benchmark of the `/api/ask` answer path, routed by file type like the API (images -> agent /
-    template counter, PDFs -> `app/pdfplan/`, IFC -> `app/ifc/`, anything else = unsupported): fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
+  - `app/bench.py` — benchmark of the `/api/ask` answer path, routed by file type like the API (images, PDFs, IFC ->
+    agent with that file type's toolset, `--answerer template` / fallback -> template counter, `app/pdfplan/`,
+    `app/ifc/`; anything else = unsupported): fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
     test split EN+FI, paraphrases/traps from `app/answering/paraphrases.py`, samples of every other dataset), runs in
     `dataset/runs/bench/` (meta: git sha, set hash, graph cache, Gemini model/prompt version), metrics: accuracy with
     image-bootstrap CI, coverage, precision, calibration per confidence, citation validity, EN/FI consistency,
@@ -205,8 +223,10 @@ Rebuild the Docker image after changing `backend/pyproject.toml` or `frontend/pa
 Majority baseline 52.8% → pipeline **77.2%** (same number via the runtime path, `app.eval --method model`). Per template: kitchens 95, bathrooms 94, floors 93, saunas 93,
 WC seats 89, WC rooms 85, balconies 84, bedrooms 77, showers+baths 75, sinks 74, doors 51, windows 38.
 Reproduced 77.1% with `fit --test --fit-on train+val`. Weakest = doors/windows: adjacent symbols merge in the
-segmentation. The symbol detector (`symdet.py`) is trained; refitting the counting models with its `det_*`
-features is the next step. 197 of the 241 preview plans are in the official *train* split, so preview scores of
+segmentation. The shipped fusion models (`models/cubicasa-fusion.joblib`, version 10) are already fitted with the
+symbol detector's `det_*` features (bundle key `symdet` = detector fingerprint); doors / windows are still the
+weakest templates with them (fast bench 2026-11-14: doors 59%, windows 34%). Next: find where the errors come from
+(`det_eval` error buckets: missed vs merged boxes vs counting) before retraining the detector (sweep presets B-D). 197 of the 241 preview plans are in the official *train* split, so preview scores of
 the counting models are optimistic: report on the official test split.
 
 ## Current PDF results (preview set; counts exact, areas within 2%)
@@ -223,6 +243,29 @@ Full dataset (1188 questions): counts 100% (76), room / storey areas 100% (292),
 of free-text reference answers); all 64.9%, coverage 91.2%, precision 67.6%. Preview (1076 questions, test set): areas
 99.0% (692), counts 48% / lengths 50% / volumes 50% (the misses are Danish / Estonian phrasings the word lists do not
 cover, answered not_found), text ≈54%; all 82.2%, coverage 90.8%, precision 88.5%.
+
+## Agent on PDF and IFC (2026-11-15)
+
+Through the agent (`app.ifc.eval --preview --agent`, `app.pdfplan.eval --agent --every 100`), same questions as the
+deterministic numbers above: IFC preview counts 48% -> **98.9%** (93), volumes 50% -> **100%** (28), lengths 50% ->
+**100%** (14), room areas 100% -> 99.3% (150-question sample; one honest not_found), text 53.8% -> 47.8% (249; approximate
+scoring that rewards long lists; precision 52.5% -> 55.3%, coverage 87% -> 65%: most lost questions are list
+answers in which the model computed a sum or percentage itself, which validation rejects). PDF sample (404 questions): 90.8% both ways, identical per
+template. Fast bench: images unchanged within noise (74.7% -> 74.9%), offline `--answerer template` identical.
+Off-template questions are where it matters: Danish / Estonian / Swedish IFC questions get cited answers instead of
+not_found, and the deterministic PDF parser answers any question that mentions "door" with the door count (high
+confidence), where the agent answers the question asked or says not_found.
+Known gaps: IFC breakdown questions ("spaces grouped by function with areas") need the full list in the answer
+(prompt rule: list answers use `text`); "top 5 rooms by ceiling height" runs out of steps because `space_areas` has no
+heights; PDFs rendered from IFC models have no Swiss-style room stacks, so their room-area questions are not_found.
+
+## Next steps (2026-11-15, ranked by question breadth)
+
+1. **Text-search tool** over PDF text runs (with boxes) and IFC properties (with GlobalIds) for lookup questions
+   (fire rating, architect, scale) and for PDFs whose rooms `parse.py` does not recognise (IFC plan renders,
+   opening_design drawing sets).
+2. **Room tables with every quantity** for IFC (height, volume next to area) so ranking questions take one call.
+3. **Doors / windows**: diagnose with `det_eval` first (see cubicasa results above).
 
 ## Conventions
 

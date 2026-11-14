@@ -6,7 +6,8 @@ produced, so the agent can check that the final answer and its citations are bac
 
 from dataclasses import dataclass, field
 import math
-from typing import Any
+import re
+from typing import Any, Callable
 
 from app.cubicasa.answer import count
 from app.models import Answer, PlanGeometry, PlanGraph, PlanItem, RoomShape, WallSegment
@@ -35,12 +36,69 @@ FIXTURE_TYPES = ["toilet", "sink", "double_sink", "shower", "bathtub", "sauna_st
 MAX_LIST = 50
 
 
+MAX_CITATIONS = 200
+CONFIDENCE_ORDER = ["not_found", "low", "medium", "high"]
+
+
 @dataclass
 class ToolTrace:
     item_ids: list[str] = field(default_factory=list)  # items the call returned (citable)
     numbers: list[int | float] = field(default_factory=list)  # numbers the call computed (answerable)
-    template_answer: Answer | None = None  # set by count_template
+    template_answer: Answer | None = None  # set by count_template (and other calibrated lookups)
     derived_from: list["ToolTrace"] | None = None  # set by calculate: the calls whose numbers it combined
+    confidence: str | None = None  # the producing tool's own confidence; None = the toolset's raw_confidence
+    items: list[PlanItem] = field(default_factory=list)  # citable items created by this call (registered in by_id)
+    mentioned: list[float] = field(default_factory=list)  # numbers inside result strings (set by BaseTools.call)
+
+
+# a number written in text: not part of a word or identifier ("IFC4", GUID digits), e.g. "37" in "C30/37"
+NUMBER_IN_TEXT = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?")
+_ID_KEYS = {"id", "ids", "gid", "global_id", "evidence_ids", "item_ids", "container_id"}
+
+
+def _decimals(v: float) -> int:
+    text = repr(float(v))
+    if "e" in text or text.endswith(".0"):
+        return 0
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def written_decimals(text: str) -> int:
+    """Decimal places as written: "87.0" has 1 (the float 87.0 alone would say 0)."""
+    text = text.replace(",", ".")
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+def number_matches(value: float, number: float, decimals: int | None = None) -> bool:
+    """The value equals the tool number, or is that number rounded to the value's (at least one) decimals:
+    45.2 matches 45.237, but an integer never matches a fraction (3 does not match 2.9). decimals = as written in
+    text, when the value was read from text ("87.0" matches 87.012)."""
+    if isinstance(value, bool) or isinstance(number, bool):
+        return False
+    if float(value) == float(number):
+        return True
+    d = _decimals(value) if decimals is None else decimals  # by distance, not round(): round(90.645, 2) is 90.64 in binary floats, people write 90.65
+    return 0 < d < _decimals(number) and abs(float(value) - float(number)) <= 0.5 * 10 ** -d + 1e-9
+
+
+def backed(value: float, numbers, decimals: int | None = None) -> bool:
+    return any(number_matches(value, n, decimals) for n in numbers)
+
+
+def _mentioned(result: Any, out: list[float]) -> list[float]:
+    """Numbers written inside the strings of a tool result ("C30/37", "EI 60"), skipping identifiers. Numeric
+    values are not included: a tool lists the ones that may be stated in its trace's numbers (bbox coordinates and
+    scores must not back a stated number)."""
+    if isinstance(result, dict):
+        for k, v in result.items():
+            if k not in _ID_KEYS:
+                _mentioned(v, out)
+    elif isinstance(result, list | tuple):
+        for v in result:
+            _mentioned(v, out)
+    elif isinstance(result, str):
+        out.extend(float(n) for n in NUMBER_IN_TEXT.findall(result))
+    return out
 
 
 def _kind(it: PlanItem) -> str:
@@ -197,21 +255,142 @@ def _segment_row(sg: WallSegment) -> dict[str, Any]:
     return row
 
 
-class PlanTools:
+class BaseTools:
+    """What the agent needs from a toolset (image plan, PDF, IFC model): declarations, a dispatcher that records
+    which numbers and items each call produced, calculate, and the toolset's prompt rules / summary / cache key /
+    confidence defaults / deterministic fallback."""
+
+    rules = ""  # toolset-specific prompt rules, placed between the shared prompt's head and tail
+    summary_label = "Plan summary"
+    uses_scale = False  # the user's drawing calibration is relevant to this toolset
+    cross_check_router = False  # compare with the cubicasa regex router (image plans only)
+    raw_confidence = "low"  # a value from a tool without its own confidence
+    text_confidence = "low"  # a text (non-numeric) answer
+    geometry: PlanGeometry | None = None
+
+    def __init__(self):
+        self.by_id: dict[str, PlanItem] = {}
+        self.produced: dict[float, ToolTrace] = {}  # every number a tool returned so far -> the call it came from
+
+    # --- to override -------------------------------------------------------------------------------------------
+
+    def declarations(self) -> list[dict]:
+        raise NotImplementedError
+
+    def handlers(self) -> dict[str, Callable[..., tuple[dict, ToolTrace]]]:
+        raise NotImplementedError
+
+    def summary(self) -> dict:
+        return {}
+
+    def fingerprint(self) -> Any:
+        """JSON-able identity of the evidence (part of the answer cache key)."""
+        raise NotImplementedError
+
+    def fallback(self, question: str) -> Answer:
+        """The deterministic answerer, used when Gemini is unavailable."""
+        raise NotImplementedError
+
+    # --- shared ------------------------------------------------------------------------------------------------
+
+    def item(self, item_id: str) -> PlanItem | None:
+        return self.by_id.get(item_id)
+
+    def source_of(self, number: float) -> ToolTrace | None:
+        """The call that produced this number (exactly, else as a rounded form of it)."""
+        if isinstance(number, bool) or not isinstance(number, int | float):
+            return None
+        hit = self.produced.get(float(number))
+        if hit is not None:
+            return hit
+        return next((t for n, t in self.produced.items() if number_matches(number, n)), None)
+
+    def calculate(self, operation: str, operands: list) -> tuple[dict, ToolTrace]:
+        """Sum or difference of numbers earlier calls returned. The model supplies no numbers of its own."""
+        if operation not in ("add", "subtract"):
+            return {"error": "operation must be 'add' or 'subtract'"}, ToolTrace()
+        if not isinstance(operands, list) or len(operands) < 2 or any(
+                isinstance(v, bool) or not isinstance(v, int | float) for v in operands):
+            return {"error": "operands must be a list of at least two numbers"}, ToolTrace()
+        unknown = [v for v in operands if self.source_of(v) is None]
+        if unknown:
+            return {"error": f"{unknown} were not returned by a tool: every operand must be a number from an earlier "
+                             "tool result (call the tool that provides it first)"}, ToolTrace()
+        result = sum(operands) if operation == "add" else operands[0] - sum(operands[1:])
+        result = int(result) if float(result).is_integer() else round(result, 6)
+        sources = list({id(t): t for t in (self.source_of(v) for v in operands)}.values())
+        ids = list(dict.fromkeys(i for t in sources for i in t.item_ids))
+        return ({"operation": operation, "operands": operands, "result": result,
+                 "note": "subtract = first operand minus the others" if operation == "subtract" else ""},
+                ToolTrace(item_ids=ids, numbers=[result], derived_from=sources))
+
+    def call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
+        fn = self.handlers().get(name)
+        if fn is None:
+            return {"error": f"unknown tool {name!r}"}, ToolTrace()
+        try:
+            result, trace = fn(**args)
+        except (TypeError, ValueError) as error:  # wrong / missing arguments from the model
+            return {"error": str(error)}, ToolTrace()
+        for it in trace.items:
+            self.by_id.setdefault(it.id, it)
+        trace.mentioned = _mentioned(result, [])
+        for number in trace.numbers:  # a calibrated count keeps the claim on its number over raw item counts
+            if isinstance(number, bool) or not isinstance(number, int | float):
+                continue
+            known = self.produced.get(float(number))
+            if known is None or (known.template_answer is None and trace.template_answer is not None):
+                self.produced[float(number)] = trace
+        return result, trace
+
+
+class PlanTools(BaseTools):
+    """Image plans (cubicasa pipeline or SVG labels)."""
+
+    summary_label = "Plan summary"
+    uses_scale = True
+    cross_check_router = True
+
     def __init__(self, graph: PlanGraph, geometry: PlanGeometry | None = None):
+        super().__init__()
         self.graph = graph
         self.geometry = geometry
         self.by_id = {it.id: it for it in graph.items}
         self.rooms = {rm.id: rm for rm in geometry.rooms} if geometry else {}
         self.segments = {sg.id: sg for sg in geometry.wall_segments} if geometry else {}
-        self.produced: dict[float, ToolTrace] = {}  # every number a tool returned so far -> the call it came from
         for rm in self.rooms.values():
             self.by_id.setdefault(rm.id, _room_item(rm))
         for sg in self.segments.values():
             self.by_id.setdefault(sg.id, _segment_item(sg))
+        self.rules = IMAGE_RULES
+        self.raw_confidence = "high" if graph.source == "svg" else "low"  # raw items, not a calibrated count
+        self.text_confidence = "medium" if graph.source == "svg" else "low"
 
     def declarations(self) -> list[dict]:
         return DECLARATIONS + (ROOM_DECLARATIONS if self.geometry else [])
+
+    def handlers(self) -> dict[str, Callable[..., tuple[dict, ToolTrace]]]:
+        return {"plan_summary": self.plan_summary, "count_template": self.count_template,
+                "list_items": self.list_items, "items_in": self.items_in, "calculate": self.calculate,
+                **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls,
+                    "covering_quantity": self.covering_quantity} if self.geometry else {})}
+
+    def summary(self) -> dict:
+        return self.plan_summary()[0]
+
+    def fingerprint(self) -> Any:
+        parts: list[Any] = [self.graph.model_dump(mode="json")]
+        if self.geometry is not None:
+            parts.append(self.geometry.model_dump(mode="json"))
+        return parts
+
+    def fallback(self, question: str) -> Answer:
+        from app.router import route
+
+        template = route(question)
+        if template is None:
+            return Answer(answer=None, confidence="not_found", explanation="This question type is not supported yet.")
+        return count(self.graph, template)
 
     # --- tools -------------------------------------------------------------------------------------------------
 
@@ -403,49 +582,37 @@ class PlanTools:
             result["rooms_without_area"] = missing
         return result, ToolTrace(item_ids=ids, numbers=[area, unit_area, base_count, waste_percent, quantity])
 
-    def calculate(self, operation: str, operands: list) -> tuple[dict, ToolTrace]:
-        """Sum or difference of numbers earlier calls returned. The model supplies no numbers of its own."""
-        if operation not in ("add", "subtract"):
-            return {"error": "operation must be 'add' or 'subtract'"}, ToolTrace()
-        if not isinstance(operands, list) or len(operands) < 2 or any(
-                isinstance(v, bool) or not isinstance(v, int | float) for v in operands):
-            return {"error": "operands must be a list of at least two numbers"}, ToolTrace()
-        unknown = [v for v in operands if float(v) not in self.produced]
-        if unknown:
-            return {"error": f"{unknown} were not returned by a tool: every operand must be a number from an earlier "
-                             "tool result (call the tool that provides it first)"}, ToolTrace()
-        result = sum(operands) if operation == "add" else operands[0] - sum(operands[1:])
-        result = int(result) if float(result).is_integer() else round(result, 6)
-        sources = list({id(t): t for t in (self.produced[float(v)] for v in operands)}.values())
-        ids = list(dict.fromkeys(i for t in sources for i in t.item_ids))
-        return ({"operation": operation, "operands": operands, "result": result,
-                 "note": "subtract = first operand minus the others" if operation == "subtract" else ""},
-                ToolTrace(item_ids=ids, numbers=[result], derived_from=sources))
 
-    # --- dispatch ----------------------------------------------------------------------------------------------
+CALCULATE = {
+    "name": "calculate",
+    "description": ("Add or subtract numbers that earlier tool calls returned, e.g. two count_template values: "
+                    "'how many X and Y in total' -> add, 'how many more X than Y' -> subtract (first operand "
+                    "minus the others). Every operand must be a number from an earlier tool result; the result "
+                    "may be given as the answer value."),
+    "parameters": {"type": "object", "properties": {
+        "operation": {"type": "string", "enum": ["add", "subtract"]},
+        "operands": {"type": "array", "items": {"type": "number"}, "minItems": 2},
+    }, "required": ["operation", "operands"]},
+}
 
-    def call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
-        result, trace = self._call(name, args)
-        for number in trace.numbers:  # a calibrated count keeps the claim on its number over raw item counts
-            known = self.produced.get(float(number))
-            if known is None or (known.template_answer is None and trace.template_answer is not None):
-                self.produced[float(number)] = trace
-        return result, trace
+# the same tool for toolsets without count_template (PDF, IFC)
+CALCULATE_ANY = {**CALCULATE, "description": (
+    "Add or subtract numbers that earlier tool calls returned: 'how many X and Y in total' or 'total area of A and B' "
+    "-> add, 'how many more X than Y' or 'how much larger' -> subtract (first operand minus the others). Every "
+    "operand must be a number from an earlier tool result; the result may be given as the answer value.")}
 
-    def _call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
-        fn = {"plan_summary": self.plan_summary, "count_template": self.count_template,
-              "list_items": self.list_items, "items_in": self.items_in, "calculate": self.calculate,
-              **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls}
-                 if self.geometry else {})}.get(name)
-        if name == "covering_quantity" and self.geometry:
-            fn = self.covering_quantity
-        if fn is None:
-            return {"error": f"unknown tool {name!r}"}, ToolTrace()
-        try:
-            return fn(**args)
-        except TypeError as error:  # wrong / missing arguments from the model
-            return {"error": str(error)}, ToolTrace()
-
+# Prompt rules for image plans (placed between the shared prompt's head and tail by the agent).
+IMAGE_RULES = """- For a whole-plan count that matches a count_template template, use count_template (it is calibrated); do not
+  count raw items from list_items for those.
+- "Is there a ...?" questions about something count_template covers: answer from count_template only (yes if its
+  value > 0, no if 0), even if raw items suggest otherwise; mention low confidence if reported.
+- For a question restricted to a room or area (e.g. "sinks in the kitchen"), find the room with
+  list_items(category="room", type=...) and use items_in on it. If several such rooms exist and the question does not
+  say which, ask one short, specific follow-up question asking which room they mean. Do not guess which room.
+  For questions asking how many rooms there are and what types they are, call
+  list_items(category="room") once: its count is the deduplicated room count and its items give the room types and
+  labels. Answer both parts from that single result. Do not refuse merely because the rooms have different types.
+"""
 
 DECLARATIONS = [
     {
@@ -483,17 +650,7 @@ DECLARATIONS = [
             "type": {"type": "string", "enum": ROOM_TYPES + FIXTURE_TYPES},
         }, "required": ["container_id", "category"]},
     },
-    {
-        "name": "calculate",
-        "description": ("Add or subtract numbers that earlier tool calls returned, e.g. two count_template values: "
-                        "'how many X and Y in total' -> add, 'how many more X than Y' -> subtract (first operand "
-                        "minus the others). Every operand must be a number from an earlier tool result; the result "
-                        "may be given as the answer value."),
-        "parameters": {"type": "object", "properties": {
-            "operation": {"type": "string", "enum": ["add", "subtract"]},
-            "operands": {"type": "array", "items": {"type": "number"}, "minItems": 2},
-        }, "required": ["operation", "operands"]},
-    },
+    CALCULATE,
 ]
 
 

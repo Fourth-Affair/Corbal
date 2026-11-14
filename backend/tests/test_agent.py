@@ -143,11 +143,101 @@ def test_answer_end_to_end_and_cache(fake):
     assert agent.answer("Kuinka monta ovea?", GRAPH) == a and len(models.seen) == 2  # second call from cache
 
 
-def test_answer_returns_none_on_failure(fake, monkeypatch):
-    fake([[("plan_summary", {})]] * agent.MAX_STEPS)  # never finishes
+def test_answer_returns_none_when_gemini_unavailable(fake, monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError("503 overloaded")
+
+    monkeypatch.setattr(agent, "run_loop", broken)  # API / network error: the caller may fall back
     assert agent.answer("How many doors?", GRAPH) is None
     monkeypatch.delenv("GEMINI_API_KEY")
     assert agent.answer("How many doors?", GRAPH) is None
+
+
+class RecordingModels(FakeModels):
+    """FakeModels for the real run_loop: records each call's allowed function names; a turn [] = no function call."""
+
+    def __init__(self, turns):
+        super().__init__(turns)
+        self.allowed = []
+
+    def generate_content(self, model, contents, config):
+        self.allowed.append(config.tool_config.function_calling_config.allowed_function_names)
+        return super().generate_content(model, contents, config)
+
+
+@pytest.fixture
+def real(monkeypatch, tmp_path):
+    """The real run_loop (with google.genai types) against scripted responses."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    monkeypatch.setattr(agent, "CACHE_DIR", tmp_path)
+
+    def install(turns):
+        models = RecordingModels(turns)
+        monkeypatch.setattr(agent, "_get_client", lambda: SimpleNamespace(models=models))
+        return models
+
+    return install
+
+
+def test_step_limit_forces_final_answer(real):
+    turns = [[("count_template", {"template": "doors"})]] + [[("plan_summary", {})]] * (agent.MAX_STEPS - 2)
+    models = real(turns + [[("final_answer", _final(value=2, explanation="2 doors."))]])
+    a = agent.answer("How many doors?", GRAPH)
+    assert (a.answer, a.template) == (2, "doors")
+    assert models.allowed[:-1] == [None] * (agent.MAX_STEPS - 1) and models.allowed[-1] == ["final_answer"]
+
+
+def test_agent_that_never_finishes_answers_not_found(real):
+    real([[("plan_summary", {})]] * agent.MAX_STEPS)
+    a = agent.answer("How many doors?", GRAPH)
+    assert a is not None and a.answer is None and a.confidence == "not_found" and agent.gave_up(a)
+
+
+def test_no_function_call_is_reprompted_for_a_final_answer(real):
+    models = real([[], [("final_answer", _final(not_found=True, explanation="Not on this plan."))]])
+    a = agent.answer("What colour is the roof?", GRAPH)
+    assert a.confidence == "not_found" and not agent.gave_up(a)
+    assert models.allowed == [None, ["final_answer"]]
+    real([[], []])  # still no call after the reminder: give up, do not fall back
+    assert agent.gave_up(agent.answer("What colour is the facade?", GRAPH))
+
+
+def test_gave_up_is_not_replaced_by_the_fallback(real, monkeypatch):
+    import app.main as m
+
+    real([[("plan_summary", {})]] * agent.MAX_STEPS)
+    monkeypatch.setattr(m, "ANSWERER", "llm")
+
+    class Tools(PlanTools):
+        def fallback(self, question):
+            raise AssertionError("fallback must not run when the model gave up")
+
+    assert agent.gave_up(m._agent_or_fallback("How many doors?", Tools(GRAPH)))
+
+
+@pytest.mark.parametrize("value,number,ok", [
+    (45.237, 45.237, True), (45.2, 45.237, True), (45.24, 45.237, True), (45.3, 45.237, False),
+    (45, 45.237, False), (3, 2.9, False), (2, 2, True), (2.0, 2, True), (True, 1, False),
+    (90.65, 90.645, True), (90.64, 90.645, True), (90.66, 90.645, False),  # half-up and half-even both accepted
+])
+def test_number_matches(value, number, ok):
+    from app.answering.tools import number_matches
+
+    assert number_matches(value, number) == ok
+
+
+def test_numbers_written_with_trailing_zero():
+    from app.answering.tools import backed, written_decimals
+
+    assert written_decimals("87.0") == 1 and written_decimals("74,51") == 2 and written_decimals("12") == 0
+    assert backed(87.0, [87.012], written_decimals("87.0")) and not backed(87.0, [87.012])
+
+
+def test_explanation_states_value_in_local_formats():
+    assert agent.explanation_problem("Största rummet är 74,51 m².", 74.509, 1) is None
+    assert agent.explanation_problem("Total 74.509 m².", 74.509, 1) is None
+    assert agent.explanation_problem("Total 75 m².", 74.509, 1) is not None
+    assert agent.explanation_problem("Huoneita on 12.", 2, 1) is not None
 
 
 @pytest.mark.parametrize("text,ok", [

@@ -15,8 +15,9 @@
 Sets (deterministic from --seed; stored under dataset/, never committed):
 - dataset questions: cubicasa5k images of the official *test* split only (both languages, so EN/FI consistency can
   be checked), plus a sample of every other dataset. Plans are routed by file type like the API does: images ->
-  image pipeline (agent or template counter), PDFs -> app.pdfplan and IFC models -> app.ifc (both deterministic,
-  whatever --answerer says). File types without a parser show up as 0% coverage, so a blind spot stays visible.
+  image pipeline, PDFs -> app.pdfplan and IFC models -> app.ifc, each through the agent with its own toolset
+  (--answerer llm / agent) or its deterministic answerer (--answerer template, and the llm fallback when Gemini is
+  unavailable). File types without a parser show up as 0% coverage, so a blind spot stays visible.
 - paraphrases (app.answering.paraphrases) on test images: unseen wordings and languages. Ground truth = the SVG
   label count for the expected template; trap / out-of-scope questions expect not_found.
 - open questions (app.answering.openq) on test images: questions no count template covers (items in one room, rooms
@@ -265,6 +266,64 @@ def _dataset_weights() -> dict[str, int]:
     return dict(c)
 
 
+def _document_tools(path: str):
+    """The agent toolset of a PDF or IFC file (parsing errors propagate)."""
+    if path.lower().endswith(".ifc"):
+        from app.ifc.agent_tools import IfcTools
+        from app.ifc.model import load_model
+
+        return IfcTools(load_model(path), path)
+    from app.pdfplan.tools import PdfTools
+
+    return PdfTools(path)
+
+
+def _agent_then(question: str, tools, answerer: str, use_cache: bool, rec: dict, fallback):
+    """The API's answer path: agent (llm / agent), then the deterministic answerer when Gemini is unavailable (llm,
+    template). An agent that gives up answers not_found (recorded as error agent_gave_up), with no fallback."""
+    from app.models import Answer
+
+    res = None
+    if answerer in ("llm", "agent"):
+        from app.answering import agent
+
+        res = agent.answer_with(question, tools, use_cache=use_cache)
+        if res is None:
+            rec["error"] = "agent_failed"
+        elif agent.gave_up(res):
+            rec["error"] = "agent_gave_up"
+    if res is None and answerer != "agent":
+        rec["fell_back"] = answerer == "llm"
+        try:
+            res = fallback(question)
+        except Exception as e:  # noqa: BLE001
+            res = Answer(answer=None, confidence="not_found", explanation=f"{type(e).__name__}: {e}")
+            rec["error"] = "crash"
+    if res is None:
+        res = Answer(answer=None, confidence="not_found", explanation="agent failed")
+    return res
+
+
+def _warm_documents(paths: list[str]) -> None:
+    """Parse PDFs and IFC models once, sequentially, before answering in threads: pdfium is not thread-safe."""
+    from app.pdfplan.answer import raster_symbols
+    from app.pdfplan.parse import parse_plan
+
+    t0 = time.perf_counter()
+    for p in paths:
+        try:
+            if p.lower().endswith(".ifc"):
+                from app.ifc.model import load_model
+
+                load_model(p)
+            elif parse_plan(p).symbols is None:
+                raster_symbols(p)
+        except Exception:  # noqa: BLE001  reported per question by _answer_one
+            pass
+    if paths:
+        print(f"  parsed {len(paths)} PDF / IFC files ({time.perf_counter() - t0:.0f}s)", flush=True)
+
+
 def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dict:
     """One question through the same routing as /api/ask: by file type, never by dataset folder."""
     from app.main import IMAGE_SUFFIXES, _is_pdf, _template_answer
@@ -275,28 +334,17 @@ def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dic
     path = item["path"]
     graph = graphs.get(path)
     ids = None  # ids a citation may use; None = not checked (PDF answers build their items per question)
-    if _is_pdf(path):
-        from app.pdfplan.answer import answer_question
-
+    if _is_pdf(path) or path.lower().endswith(".ifc"):  # PDF / BIM model: own toolset, own deterministic answerer
         try:
-            res = answer_question(path, item["question"])
+            tools = _document_tools(path)
         except FileNotFoundError as e:
             res = Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {e}")
             rec["error"] = "parser"
-        except Exception as e:  # noqa: BLE001  the API would return a 500: count it, keep the run going
+        except Exception as e:  # noqa: BLE001  the API would answer not_found / 500: count it, keep the run going
             res = Answer(answer=None, confidence="not_found", explanation=f"{type(e).__name__}: {e}")
             rec["error"] = "crash"
-    elif path.lower().endswith(".ifc"):  # BIM model: deterministic parser, citations are IFC GlobalIds
-        from app.ifc.answer import answer_question as ifc_answer
-
-        try:
-            res = ifc_answer(path, item["question"])
-        except FileNotFoundError as e:
-            res = Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {e}")
-            rec["error"] = "parser"
-        except Exception as e:  # noqa: BLE001
-            res = Answer(answer=None, confidence="not_found", explanation=f"{type(e).__name__}: {e}")
-            rec["error"] = "crash"
+        else:
+            res = _agent_then(item["question"], tools, answerer, use_cache, rec, tools.fallback)
     elif Path(path).suffix.lower() not in IMAGE_SUFFIXES:
         res = Answer(answer=None, confidence="not_found", explanation="unsupported file type")
         rec["error"] = "unsupported"
@@ -304,19 +352,11 @@ def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dic
         res = Answer(answer=None, template=route(item["question"]), confidence="not_found", explanation=graph)
         rec["error"] = "parser"
     else:
-        ids = {it.id for it in graph.items}
-        res = None
-        if answerer in ("llm", "agent"):
-            from app.answering import agent
+        from app.answering.tools import PlanTools
 
-            res = agent.answer(item["question"], graph, use_cache=use_cache)
-            if res is None:
-                rec["error"] = "agent_failed"
-        if res is None and answerer != "agent":
-            rec["fell_back"] = answerer == "llm"
-            res = _template_answer(item["question"], graph)
-        if res is None:
-            res = Answer(answer=None, confidence="not_found", explanation="agent failed")
+        ids = {it.id for it in graph.items}
+        res = _agent_then(item["question"], PlanTools(graph), answerer, use_cache, rec,
+                          lambda q: _template_answer(q, graph))
     rec["latency_s"] = round(time.perf_counter() - t0, 3)
 
     num = _num(res.answer)
@@ -372,13 +412,10 @@ def run(set_name: str, answerer: str, source: str, use_cache: bool, workers: int
                     prompt_version=agent.PROMPT_VERSION)
 
     t0 = time.perf_counter()
-    # PDFs first, one at a time: pdfium is not thread-safe, and that path makes no network calls anyway
-    pdf_recs = {it["id"]: _answer_one(it, graphs, answerer, use_cache) for it in items if _is_pdf(it["path"])}
-    if pdf_recs:
-        print(f"  answered {len(pdf_recs)} PDF questions ({time.perf_counter() - t0:.0f}s)", flush=True)
+    _warm_documents(sorted({it["path"] for it in items if _is_pdf(it["path"]) or it["path"].lower().endswith(".ifc")}))
     recs, done = [], 0
     with ThreadPoolExecutor(max(1, workers if answerer != "template" else 1)) as pool:
-        for rec in pool.map(lambda it: pdf_recs.get(it["id"]) or _answer_one(it, graphs, answerer, use_cache), items):
+        for rec in pool.map(lambda it: _answer_one(it, graphs, answerer, use_cache), items):
             recs.append(rec)
             done += 1
             if done % 100 == 0 or done == len(items):

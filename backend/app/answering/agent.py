@@ -7,7 +7,11 @@ Checks done in code, not by the model:
 - confidence comes from the tool that produced the value (count_template -> the counting model's confidence,
   raw items -> low), downgraded when the regex router recognises the question as a different template;
 - the explanation must state the value; evidence is shown beside the cited boxes in the UI.
-answer() returns None when Gemini is unavailable (no key, API error, no final answer): the caller falls back.
+The loop works over any toolset (app.answering.tools.BaseTools): image plans (PlanTools), vector PDFs
+(app.pdfplan.tools.PdfTools) and IFC models (app.ifc.agent_tools.IfcTools).
+answer_with() returns None only when Gemini is unavailable (no key, hourly cap, API / network error): the caller then
+uses the deterministic answerer. When the model itself fails to finish (step limit, no function call) the answer is
+not_found, never a template answer to a possibly different question.
 """
 
 import hashlib
@@ -19,7 +23,8 @@ import threading
 import time
 from collections import deque
 
-from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
+from app.answering.tools import (CONFIDENCE_ORDER, MAX_CITATIONS, NUMBER_IN_TEXT, BaseTools, PlanTools, ToolTrace,
+                                 backed, number_matches, written_decimals)
 from app.config import CACHE_DIR
 from app.models import Answer, ChatTurn, PlanGeometry, PlanGraph, PlanScaleCalibration
 from app.router import route
@@ -32,7 +37,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
-PROMPT_VERSION = "16"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "19"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
@@ -53,7 +58,7 @@ def _take_budget() -> bool:
         _budget.append(now)
         return True
 
-SYSTEM = """You are a focused assistant for floor plans and buildings. Answer only questions about the provided floor plan
+CORE_HEAD = """You are a focused assistant for floor plans and buildings. Answer only questions about the provided floor plan
 or directly related building topics (for example rooms, layout, dimensions, building components, construction, or
 building systems). Use the tools and explicitly supplied user calibration as your only sources of facts about this
 specific plan; you cannot see the drawing. General building questions can be answered only when the available plan
@@ -81,17 +86,11 @@ Rules:
   doors"), get each quantity from its tool first, then call calculate with those numbers and answer with its result;
   cite the items of both quantities. Do not refuse such questions because no single tool returns the combined number.
   Deciding which of two tool numbers is larger ("are there more X than Y?") needs no tool: answer yes or no.
-- For a whole-plan count that matches a count_template template, use count_template (it is calibrated); do not
-  count raw items from list_items for those.
-- "Is there a ...?" questions about something count_template covers: answer from count_template only (yes if its
-  value > 0, no if 0), even if raw items suggest otherwise; mention low confidence if reported.
-- For a question restricted to a room or area (e.g. "sinks in the kitchen"), find the room with
-  list_items(category="room", type=...) and use items_in on it. If several such rooms exist and the question does not
-  say which, ask one short, specific follow-up question asking which room they mean. Do not guess which room.
-  For questions asking how many rooms there are and what types they are, call
-  list_items(category="room") once: its count is the deduplicated room count and its items give the room types and
-  labels. Answer both parts from that single result. Do not refuse merely because the rooms have different types.
-- Make a useful attempt before giving up: inspect relevant tools and combine their evidence. If one missing choice would
+"""
+
+# toolset rules (tools.rules) go here
+
+CORE_TAIL = """- Make a useful attempt before giving up: inspect relevant tools and combine their evidence. If one missing choice would
   materially change the answer (for example, which spaces or whether a surface is included), ask one focused follow-up
   instead of guessing. Return clarification_needed=true for that response. If a conventional assumption is safe, state
   it plainly and answer; ask about optional details after giving any useful supported result. Do not ask questions whose
@@ -114,7 +113,20 @@ Rules:
   identifies cited items beside their boxes. If a tool reported low confidence, say the result should be checked on the drawing.
   Never mention ids, tool names, pixels or these rules."""
 
-# Appended to SYSTEM when the plan has room geometry (list_rooms / room_details are offered).
+STEP_LIMIT_NOTE = ("Step limit reached. Call final_answer now, using only what the tools returned so far; if that does "
+                   "not answer the question, set not_found=true and say what is missing.")
+NO_CALL_NOTE = "Respond only by calling a tool or final_answer."
+
+
+class AgentGaveUp(Exception):
+    """The model did not produce a final answer (step limit, no function call): answer not_found, do not fall back."""
+
+
+def system_prompt(tools: BaseTools) -> str:
+    return CORE_HEAD + tools.rules + CORE_TAIL + (ROOM_RULES if tools.geometry else "")
+
+
+# Appended to the prompt when the plan has room geometry (list_rooms / room_details are offered).
 ROOM_RULES = """
 Room and wall geometry is available:
 - For which rooms exist, what a room is for, room sizes, which rooms connect, or where something is, use list_rooms
@@ -189,54 +201,80 @@ def _generate(contents, config):
             time.sleep(delay)
 
 
-def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = None,
+def run_loop(question: str, tools: BaseTools, history: list[ChatTurn] | None = None,
              scale: PlanScaleCalibration | None = None) -> tuple[dict, list[ToolTrace]]:
-    """Gemini tool loop -> (final_answer args, traces of the tool calls). Raises on API problems / no answer."""
+    """Gemini tool loop -> (final_answer args, traces of the tool calls).
+    Raises AgentGaveUp when the model does not finish, anything else on API problems."""
     from google.genai import types
 
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM + (ROOM_RULES if tools.geometry else ""),
-        tools=[types.Tool(function_declarations=[
-            types.FunctionDeclaration(name=d["name"], description=d["description"], parameters_json_schema=d["parameters"])
-            for d in [*tools.declarations(), FINAL]])],
-        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING) if GEMINI_THINKING else None,
-    )
-    # the plan summary is always needed: send it with the question instead of spending a tool round trip on it
-    summary, _ = tools.plan_summary()
+    def make_config(final_only: bool):
+        calling = types.FunctionCallingConfig(mode="ANY", allowed_function_names=["final_answer"] if final_only else None)
+        return types.GenerateContentConfig(
+            system_instruction=system_prompt(tools),
+            tools=[types.Tool(function_declarations=[
+                types.FunctionDeclaration(name=d["name"], description=d["description"], parameters_json_schema=d["parameters"])
+                for d in [*tools.declarations(), FINAL]])],
+            tool_config=types.ToolConfig(function_calling_config=calling),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING) if GEMINI_THINKING else None,
+        )
+
+    def nudge(text: str):  # attach to the pending user turn (tool results) rather than adding a second user turn
+        last = contents[-1] if contents else None
+        if last is not None and getattr(last, "role", None) == "user" and getattr(last, "parts", None) is not None:
+            last.parts.append(types.Part(text=text))
+        else:
+            contents.append(types.Content(role="user", parts=[types.Part(text=text)]))
+
+    # the summary is always needed: send it with the question instead of spending a tool round trip on it
+    summary = tools.summary()
     history = history or []
     contents = [types.Content(role="model" if turn.role == "assistant" else "user", parts=[types.Part(text=turn.text)])
                 for turn in history]
-    scale_context = (
-        f"A user calibration is saved: {scale.distance} {scale.unit} across two selected points. "
-        "The drawing scale is known. This alone does not establish a room boundary or floor area."
-        if scale else "No user scale calibration is saved for this drawing."
-    )
-    prompt = f"Latest question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}\n\nDrawing scale: {scale_context}"
+    prompt = (f"Latest question (answer in its language): {question}\n\n"
+              f"{tools.summary_label}: {json.dumps(summary, ensure_ascii=False)}")
+    if tools.uses_scale:
+        scale_context = (
+            f"A user calibration is saved: {scale.distance} {scale.unit} across two selected points. "
+            "The drawing scale is known. This alone does not establish a room boundary or floor area."
+            if scale else "No user scale calibration is saved for this drawing."
+        )
+        prompt += f"\n\nDrawing scale: {scale_context}"
     contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+    config, final_config = make_config(False), make_config(True)
     traces: list[ToolTrace] = []
+    final_only = False  # once set, only final_answer may be called
     for step in range(MAX_STEPS):
+        if step == MAX_STEPS - 1 and not final_only:
+            nudge(STEP_LIMIT_NOTE)
+            final_only = True
         t0 = time.perf_counter()
-        response = _generate(contents, config)
-        log.info("step %d: %.1fs, calls %s", step, time.perf_counter() - t0,
-                 [c.name for c in response.function_calls or []])
+        response = _generate(contents, final_config if final_only else config)
         calls = response.function_calls or []
+        log.info("step %d: %.1fs, calls %s", step, time.perf_counter() - t0, [c.name for c in calls])
+        candidate = response.candidates[0].content if response.candidates else None
         if not calls:
-            raise ValueError(f"no function call in response: {response.text!r}")
-        contents.append(response.candidates[0].content)  # keeps thought signatures for the next turn
+            if final_only:
+                raise AgentGaveUp(f"no function call in response: {response.text!r}")
+            log.warning("no function call in response (%r): asking for final_answer", response.text)
+            if candidate is not None:
+                contents.append(candidate)
+            nudge(NO_CALL_NOTE + " " + STEP_LIMIT_NOTE)
+            final_only = True
+            continue
+        contents.append(candidate)  # keeps thought signatures for the next turn
         for call in calls:
             if call.name == "final_answer":
                 return dict(call.args or {}), traces
         parts = []
         for call in calls:
             result, trace = tools.call(call.name, dict(call.args or {}))
-            log.info("tool %s(%s) -> %s", call.name, call.args, json.dumps(result)[:300])
+            log.info("tool %s(%s) -> %s", call.name, call.args, json.dumps(result, default=str)[:300])
             traces.append(trace)
             parts.append(types.Part(function_response=types.FunctionResponse(
                 id=call.id, name=call.name, response={"result": result})))
         contents.append(types.Content(role="user", parts=parts))
-    raise ValueError(f"no final answer after {MAX_STEPS} steps")
+    raise AgentGaveUp(f"no final answer after {MAX_STEPS} steps")
 
 
 def explanation_problem(explanation: str, value, n_citations: int) -> str | None:
@@ -244,7 +282,7 @@ def explanation_problem(explanation: str, value, n_citations: int) -> str | None
     text = explanation.strip()
     if not text:
         return "empty"
-    if isinstance(value, int | float) and not re.search(rf"(?<![\d.,]){re.escape(_fmt(value))}(?!\d)", text):
+    if isinstance(value, int | float) and not _states(text, value):
         return f"value {_fmt(value)} not stated"
     for group in re.findall(r"\[([\d\s,\-–]+)\]", text):  # [3], [3, 4], [1-9], [1–9]
         for ref in re.findall(r"\d+", group):
@@ -265,13 +303,26 @@ def yes_no(text: str) -> bool | None:
     return True if words[0] in _YES else False if words[0] in _NO else None
 
 
+def _states(text: str, value) -> bool:
+    """The text states the value: as written, with a decimal comma (74,51) or rounded to fewer decimals."""
+    if re.search(rf"(?<![\d.,]){re.escape(_fmt(value))}(?!\d)", text):
+        return True
+    written = re.findall(r"(?<![\d.,])\d+(?:[.,]\d+)?(?![\d])", text)
+    return any(number_matches(float(w.replace(",", ".")), value, written_decimals(w))
+               or number_matches(value, float(w.replace(",", "."))) for w in written)
+
+
 def _fmt(v) -> str:
     return str(int(v)) if isinstance(v, float) and v.is_integer() else str(v)
 
 
-def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanTools) -> Answer:
+def _not_verified() -> Answer:
+    return Answer(answer=None, confidence="not_found", answered_by="llm",
+                  explanation="The answer could not be verified against the drawing analysis.")
+
+
+def validate(question: str, final: dict, traces: list[ToolTrace], tools: BaseTools) -> Answer:
     """Turn the model's final_answer into an Answer whose value and citations are backed by tool output."""
-    graph = tools.graph
     explanation = str(final.get("explanation") or "").strip()
     # The UI marks the supporting boxes directly, so inline numeric citation markers add noise.
     explanation = re.sub(r"\s*\[\s*\d+(?:\s*[-–,]\s*\d+)*\s*\]", "", explanation)
@@ -282,107 +333,122 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
         return Answer(answer=None, confidence="not_found", answered_by="llm",
                       explanation=explanation or "The question cannot be answered from this drawing.")
 
+    def items(ids) -> list:
+        return [it for it in (tools.item(i) for i in ids) if it is not None]
+
+    def confidence_of(t: ToolTrace) -> str:
+        if t.template_answer is not None:
+            return t.template_answer.confidence
+        return t.confidence or tools.raw_confidence
+
     citable = {i for t in traces for i in t.item_ids}
-    cited = [tools.by_id[i] for i in dict.fromkeys(final.get("cited_ids") or []) if i in citable and i in tools.by_id]
+    cited = items(i for i in dict.fromkeys(final.get("cited_ids") or []) if i in citable)[:MAX_CITATIONS]
     value = final.get("value")
     template = None
     combined: set[str] = set()  # templates a calculated value was built from
     if value is not None:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return _not_verified()
         # a calculated value belongs to the calculation, even when a single count happens to equal it
-        source = next((t for t in reversed(traces) if t.derived_from is not None and value in t.numbers), None) \
-            or next((t for t in traces if t.template_answer is not None and value in t.numbers), None) \
-            or next((t for t in traces if value in t.numbers), None)
+        source = next((t for t in reversed(traces) if t.derived_from is not None and backed(value, t.numbers)), None) \
+            or next((t for t in traces if t.template_answer is not None and backed(value, t.numbers)), None) \
+            or next((t for t in traces if backed(value, t.numbers)), None)
         if source is None:
             log.warning("value %r not returned by any tool; numbers were %s", value, [t.numbers for t in traces])
-            return Answer(answer=None, confidence="not_found", answered_by="llm",
-                          explanation="The answer could not be verified against the drawing analysis.")
+            return _not_verified()
         value = int(value) if float(value).is_integer() else value
-        raw_confidence = "high" if graph.source == "svg" else "low"
         if source.derived_from is not None:  # as reliable as its least reliable operand
-            parts = [t.template_answer.confidence if t.template_answer is not None else raw_confidence
-                     for t in source.derived_from]
-            confidence = min(parts, key=["not_found", "low", "medium", "high"].index, default="low")
+            confidence = min((confidence_of(t) for t in source.derived_from), key=CONFIDENCE_ORDER.index, default="low")
             combined = {t.template_answer.template for t in source.derived_from if t.template_answer is not None}
-            if not cited:
-                cited = [tools.by_id[i] for i in source.item_ids if i in tools.by_id]
         elif source.template_answer is not None:
             template = source.template_answer.template
             confidence = source.template_answer.confidence
             if not cited:
-                cited = list(source.template_answer.citations)
+                cited = list(source.template_answer.citations)[:MAX_CITATIONS]
         else:
-            confidence = "high" if graph.source == "svg" else "low"  # raw items, not a calibrated count
+            confidence = confidence_of(source)
+        if not cited:
+            cited = items(source.item_ids)[:MAX_CITATIONS]
         answer, unit = value, final.get("unit") or "count"
     else:
         answer, unit = str(final["text"]), None
-        confidence = "medium" if graph.source == "svg" else "low"
+        confidence = tools.text_confidence
         # Text responses can combine an inventory with its count. Ground stated numbers in tool output.
         number_text = re.sub(r"\[[^\]]*\]", "", answer)
-        stated_numbers = [float(n) for n in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", number_text)]
-        available_numbers = {float(n) for trace in traces for n in trace.numbers}
-        if any(number not in available_numbers for number in stated_numbers):
+        stated_numbers = [(float(n), written_decimals(n)) for n in NUMBER_IN_TEXT.findall(number_text)]
+        available_numbers = [float(n) for trace in traces for n in [*trace.numbers, *trace.mentioned]
+                             if not isinstance(n, bool)]
+        if any(not backed(number, available_numbers, d) for number, d in stated_numbers):
             log.warning("text answer contains numbers not returned by tools: %s", stated_numbers)
-            return Answer(answer=None, confidence="not_found", answered_by="llm",
-                          explanation="The answer could not be verified against the drawing analysis.")
-        # a yes/no answer usually rests on a count ("Is there a sauna?" -> saunas = 0): link it, and check it agrees
-        counted = [t.template_answer for t in traces if t.template_answer is not None]
-        basis = next((a for a in counted if a.template == route(question)), None) \
-            or (counted[0] if len(counted) == 1 else None)
-        if basis is not None:
-            polarity = yes_no(answer)
-            if polarity is not None and polarity != (bool(basis.answer)):
-                log.warning("text answer %r contradicts %s = %s", answer, basis.template, basis.answer)
-                return Answer(answer=None, confidence="not_found", answered_by="llm",
-                              explanation="The answer could not be verified against the drawing analysis.")
-            template, confidence = basis.template, basis.confidence
-            if not cited:
-                cited = list(basis.citations)
+            return _not_verified()
+        if tools.cross_check_router:
+            # a yes/no answer usually rests on a count ("Is there a sauna?" -> saunas = 0): link it, check it agrees
+            counted = [t.template_answer for t in traces if t.template_answer is not None]
+            basis = next((a for a in counted if a.template == route(question)), None) \
+                or (counted[0] if len(counted) == 1 else None)
+            if basis is not None:
+                polarity = yes_no(answer)
+                if polarity is not None and polarity != (bool(basis.answer)):
+                    log.warning("text answer %r contradicts %s = %s", answer, basis.template, basis.answer)
+                    return _not_verified()
+                template, confidence = basis.template, basis.confidence
+                if not cited:
+                    cited = list(basis.citations)
 
-    routed = route(question)
-    if routed and template != routed and routed not in combined and confidence in ("high", "medium"):
-        log.warning("router says %s, agent used %s: confidence lowered", routed, template)
-        confidence = "low"
+    if tools.cross_check_router:
+        routed = route(question)
+        if routed and template != routed and routed not in combined and confidence in ("high", "medium"):
+            log.warning("router says %s, agent used %s: confidence lowered", routed, template)
+            confidence = "low"
     if value is not None and value != 0 and not cited:
         confidence = "low"
 
     if problem := explanation_problem(explanation, value, len(cited)):
-        log.warning("explanation replaced (%s): %r", problem, explanation)
-        explanation = f"Answer: {answer}" + (f" ({template})" if template else "") + "; supporting items are highlighted."
+        if explanation and problem.startswith("value"):  # e.g. "No beams in the model" for 0: keep the model's words
+            log.info("explanation prefixed with the value (%s)", problem)
+            explanation = f"{_fmt(answer)}{f' {unit}' if unit and unit != 'count' else ''}: {explanation}"
+        else:
+            log.warning("explanation replaced (%s): %r", problem, explanation)
+            explanation = (f"Answer: {answer}" + (f" ({template})" if template else "")
+                           + "; supporting items are highlighted.")
     return Answer(answer=answer, unit=unit, template=template, confidence=confidence, explanation=explanation,
                   citations=cited, answered_by="llm")
 
 
-def _cache_path(question: str, graph: PlanGraph, scale: PlanScaleCalibration | None,
-                geometry: PlanGeometry | None = None):
-    parts = [GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question,
-             graph.model_dump(mode="json"), scale.model_dump(mode="json") if scale else None]
-    if geometry is not None:  # appended only when present: cache keys of geometry-less answers are unchanged
-        parts += [ROOM_RULES, geometry.model_dump(mode="json")]
-    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False)
+def _cache_path(question: str, tools: BaseTools, scale: PlanScaleCalibration | None):
+    parts = [GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, system_prompt(tools), tools.declarations(), question,
+             tools.fingerprint(), scale.model_dump(mode="json") if scale and tools.uses_scale else None]
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False, default=str)
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
 
-def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
-           scale: PlanScaleCalibration | None = None, use_cache: bool = True,
-           geometry: PlanGeometry | None = None) -> Answer | None:
-    """history = prior chat turns (answers with history are not cached); scale = the user's drawing calibration.
+GAVE_UP = "I could not reach a verified answer from the drawing analysis for this question."
+
+
+def answer_with(question: str, tools: BaseTools, history: list[ChatTurn] | None = None,
+                scale: PlanScaleCalibration | None = None, use_cache: bool = True) -> Answer | None:
+    """The agent over any toolset. None = Gemini unavailable (no key, hourly cap, API error): the caller falls back
+    to the deterministic answerer. history = prior chat turns (answers with history are not cached);
     use_cache=False skips reading the answer cache (fresh Gemini run, e.g. to measure run-to-run noise)."""
     if not os.environ.get("GEMINI_API_KEY"):
         return None
     history = history or []
-    cache = _cache_path(question, graph, scale, geometry) if not history else None
+    cache = _cache_path(question, tools, scale) if not history else None
     if use_cache and cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
     if not _take_budget():
-        log.warning("Gemini hourly cap (%d) reached: falling back to the template answerer", GEMINI_MAX_PER_HOUR)
+        log.warning("Gemini hourly cap (%d) reached: falling back to the deterministic answerer", GEMINI_MAX_PER_HOUR)
         return None
-    tools = PlanTools(graph, geometry)
     try:
         final, traces = run_loop(question, tools, history, scale)
-    except Exception as error:  # network, quota, timeout, malformed output: caller falls back
+    except AgentGaveUp as error:  # the model, not the service, failed: an honest miss, not a template guess
+        log.warning("Gemini agent gave up: %s", error)
+        result = Answer(answer=None, confidence="not_found", answered_by="llm", explanation=GAVE_UP)
+    except Exception as error:  # network, quota, timeout, SDK problems: caller falls back
         log.warning("Gemini agent failed: %s", error)
         return None
-    result = validate(question, final, traces, tools)
+    else:
+        result = validate(question, final, traces, tools)
     try:
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -390,3 +456,15 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     except OSError:
         pass
     return result
+
+
+def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
+           scale: PlanScaleCalibration | None = None, use_cache: bool = True,
+           geometry: PlanGeometry | None = None) -> Answer | None:
+    """Image plans: the agent over PlanTools (see answer_with)."""
+    return answer_with(question, PlanTools(graph, geometry), history, scale, use_cache)
+
+
+def gave_up(result: Answer | None) -> bool:
+    """The agent answered not_found because the model did not finish (for the benchmark's error column)."""
+    return result is not None and result.answer is None and result.explanation == GAVE_UP
