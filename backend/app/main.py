@@ -22,6 +22,29 @@ app = FastAPI(title="Junc API", version="0.1.0")
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
 # "llm" = Gemini agent with tools over the plan (falls back to "template" without GEMINI_API_KEY or on API errors).
 ANSWERER = os.environ.get("ANSWERER", "llm")
+# "on" = uploads go through app.floorprep (orientation fix, background whitening, despeckle, crop) before analysis.
+PREPROCESS = os.environ.get("PREPROCESS", "on")
+
+
+def _preprocess_upload(image):
+    """First step for uploads: returns (model-ready PIL image, has_penmarks, preprocessing info).
+
+    Pen marks are checked on the original upload (margin notes survive there); the flag is stored for a
+    later frontier-model step. A failing pen check (e.g. CLIP weights unavailable) gives None, not an error.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from app.floorprep import detect_penmarks, preprocess
+
+    bgr = np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
+    try:
+        has_penmarks = bool(detect_penmarks(bgr))
+    except Exception:  # noqa: BLE001 - optional signal, never blocks analysis
+        has_penmarks = None
+    result = preprocess(bgr, split=False)
+    out = Image.fromarray(np.ascontiguousarray(result.images[0][:, :, ::-1]))
+    return out, has_penmarks, result.info
 
 
 def _check_path(path: str):
@@ -134,13 +157,29 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
         image = Image.open(io.BytesIO(image_bytes))
         image.verify()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image.save(cache_path, format="PNG")
     except (UnidentifiedImageError, OSError) as error:
         raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
+
+    has_penmarks, prep_info = None, None
+    if PREPROCESS == "on":
+        image, has_penmarks, prep_info = _preprocess_upload(image)
+    image.save(cache_path, format="PNG")  # the models (and item coordinates) use this image
     try:
-        return graph_from_image(cache_key, cache_path)
+        graph = graph_from_image(cache_key, cache_path)
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
+    return graph.model_copy(update={"has_penmarks": has_penmarks, "preprocessing": prep_info})
+
+
+@app.get("/api/plans/{plan_id}/processed-image")
+def get_processed_plan_image(plan_id: UUID) -> FileResponse:
+    """The preprocessed image the models analysed (PlanGraph item coordinates refer to it)."""
+    from app.config import CACHE_DIR
+
+    path = CACHE_DIR / "uploads" / f"{plan_id}.png"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Plan has not been analyzed yet")
+    return FileResponse(path, media_type="image/png")
 
 
 def _template_answer(question: str, graph) -> Answer:

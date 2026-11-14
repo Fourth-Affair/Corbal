@@ -32,6 +32,12 @@ class PlanGraph(BaseModel):
     items: list[PlanItem] = Field(default_factory=list)
     # model source only: per-template counts from the fusion models (items are the supporting evidence)
     counts: dict[str, int] = Field(default_factory=dict)
+    # Uploads only (app.floorprep). True = hand-written pen/pencil annotations detected; such plans are meant
+    # for a later frontier-model step that interprets the marks. None = not checked.
+    has_penmarks: bool | None = None
+    # Uploads only: what preprocessing did (orientation, scale, crop box). Item coordinates are pixels of the
+    # preprocessed image, which /api/plans/{id}/processed-image serves.
+    preprocessing: dict | None = None
 
 
 class AskRequest(BaseModel):
