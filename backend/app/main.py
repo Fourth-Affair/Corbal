@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, Response
 from app.config import DATASET_DIR
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import Answer, AskRequest, Layer, PlanGraph
+from app.models import Answer, AskRequest, Layer, PlanGraph, PlanQuestionRequest
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
@@ -70,6 +70,37 @@ def get_plan(plan_id: UUID) -> dict:
     return plans[0]
 
 
+def _knowledge_request(plan_id: UUID, method: str = "GET", body: dict | None = None):
+    """Read or persist the analyzed graph using backend-only Supabase credentials."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    query = urlencode({"on_conflict": "plan_id"}) if method == "POST" else urlencode({"plan_id": f"eq.{plan_id}", "select": "graph"})
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
+    if method == "POST":
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    data = json.dumps(body).encode() if body is not None else None
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_knowledge?{query}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read()) if response.status != 204 and response.headers.get("Content-Length") != "0" else None
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail="Supabase plan knowledge request failed") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+
+
+def _saved_graph(plan_id: UUID) -> PlanGraph | None:
+    rows = _knowledge_request(plan_id)
+    if not rows:
+        return None
+    try:
+        return PlanGraph.model_validate(rows[0]["graph"])
+    except (KeyError, ValueError) as error:
+        raise HTTPException(status_code=500, detail="Saved plan analysis is invalid") from error
+
+
 @app.get("/api/plans/{plan_id}/image")
 def get_plan_image(plan_id: UUID) -> Response:
     """Stream the private source image for a plan to its frontend viewer."""
@@ -100,6 +131,8 @@ def get_plan_image(plan_id: UUID) -> Response:
 @app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
 def analyze_plan(plan_id: UUID) -> PlanGraph:
     """Download the uploaded source image from Supabase and analyze it with the plan models."""
+    if graph := _saved_graph(plan_id):
+        return graph
     plan = get_plan(plan_id)
     images = [image for image in plan.get("plan_images", []) if image.get("role") == "source"]
     if not images:
@@ -138,9 +171,25 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
     except (UnidentifiedImageError, OSError) as error:
         raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
     try:
-        return graph_from_image(cache_key, cache_path)
+        graph = graph_from_image(cache_key, cache_path)
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
+    _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
+    return graph
+
+
+@app.post("/api/plans/{plan_id}/ask", response_model=Answer)
+def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
+    """Answer a question using the analysis saved for this plan in Supabase."""
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    if ANSWERER == "llm":
+        from app.answering.agent import answer
+
+        if (result := answer(req.question, graph)) is not None:
+            return result
+    return _template_answer(req.question, graph)
 
 
 def _template_answer(question: str, graph) -> Answer:

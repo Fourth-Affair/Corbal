@@ -9,12 +9,18 @@ type PlanRecord = {
   plan_images?: Array<{ upload_status?: string; role?: string }>;
 };
 
+type ChatMessage = { role: "user" | "assistant"; text: string };
+
 export default function PlanPage({ params }: { params: Promise<{ planId: string }> }) {
   const [planId, setPlanId] = useState("");
   const [plan, setPlan] = useState<PlanRecord | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [analysisStatus, setAnalysisStatus] = useState("Preparing your floor plan…");
+  const [ready, setReady] = useState(false);
+  const [question, setQuestion] = useState("");
+  const [sending, setSending] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   useEffect(() => {
     let objectUrl: string | null = null;
@@ -57,9 +63,15 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             const analysisResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/analyze`, { method: "POST" });
             const result = await analysisResponse.json();
             if (!analysisResponse.ok) throw new Error(result.detail || "Analysis failed");
-            if (!cancelled) setAnalysisStatus("Floor plan ready");
-          } catch {
-            if (!cancelled) setAnalysisStatus("Image ready · Analysis unavailable");
+            if (!cancelled) {
+              setAnalysisStatus("Floor plan ready");
+              setReady(true);
+            }
+          } catch (analysisError) {
+            if (!cancelled) {
+              const reason = analysisError instanceof Error ? analysisError.message : "Unknown analysis error";
+              setAnalysisStatus(`Analysis unavailable: ${reason}`);
+            }
           }
         }
       } catch (loadError) {
@@ -71,6 +83,29 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [params]);
+
+  async function submitQuestion(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const submitted = question.trim();
+    if (!submitted || !ready || sending || !planId) return;
+    setQuestion("");
+    setMessages(current => [...current, { role: "user", text: submitted }]);
+    setSending(true);
+    try {
+      const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/ask`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: submitted }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Could not answer that question");
+      const answer = result.answer === null ? result.explanation : `${result.answer}${result.unit ? ` ${result.unit}` : ""}. ${result.explanation}`;
+      setMessages(current => [...current, { role: "assistant", text: answer }]);
+    } catch (askError) {
+      const message = askError instanceof Error ? askError.message : "Could not answer that question";
+      setMessages(current => [...current, { role: "assistant", text: message }]);
+    } finally {
+      setSending(false);
+    }
+  }
 
   const imageStatus = plan?.plan_images?.find(image => image.role === "source")?.upload_status;
   return (
@@ -93,8 +128,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
-          <div className="conversation" aria-live="polite"><div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>Plan loaded from your saved workspace.</p><span>Ask about quantities, rooms, and materials.</span></div></div>
-          <form className="composer" onSubmit={event => event.preventDefault()}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" disabled /><div className="composer-footer"><span>Analysis will be available when connected</span><button className="send-button" type="submit" disabled aria-label="Send question">↑</button></div></form>
+          <div className="conversation" aria-live="polite">{messages.length === 0 ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p></div>)}</div>
+          <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
         </aside>
       </div>
     </main>

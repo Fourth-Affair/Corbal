@@ -133,7 +133,7 @@ This setup uses the anon key, which is intended to be exposed in browser apps. T
 
 The migrations in `supabase/migrations/` create `plans` and `plan_images`, then add RPCs that create the plan and image-link rows in one database transaction. The frontend calls the RPC before uploading the file, so a missing table or RPC stops the upload. The image row tracks `pending`, `uploaded`, or `failed`. Storage is a separate service, so its upload cannot share the database transaction; the initial RPC ensures the backend has the image path linked to a plan before upload starts. Each uploaded image gets a plan UUID, and `plans.metadata` is JSONB for future plan data.
 
-Apply both migrations with the Supabase CLI from the repository root:
+Apply all migrations with the Supabase CLI from the repository root:
 
 ```sh
 supabase login
@@ -141,8 +141,10 @@ supabase link --project-ref your-project-ref
 supabase db push
 ```
 
-Or paste the migration SQL files into Supabase **SQL Editor** in timestamp order. Keep the migration files in source control either way. If you already ran the first migration manually, run only the second migration in SQL Editor.
+Or paste the migration SQL files into Supabase **SQL Editor** in timestamp order. Keep the migration files in source control either way. If you already applied the plan and image migrations, apply the remaining migrations in order.
 
 Set `SUPABASE_SERVICE_ROLE_KEY` in the root `.env` for Docker Compose, using the service role secret from **Project Settings → API**. This key is only passed to FastAPI and must never use a `NEXT_PUBLIC_` prefix. The backend lookup endpoint is `GET /api/plans/{plan_id}`; it returns the plan and linked image metadata, including each `bucket_id` and `object_path`. It uses the service key to read the RLS-protected tables.
 
 After saving the plan and its source image association, the frontend calls `POST /api/plans/{plan_id}/analyze`. The backend downloads that source image from private Supabase Storage, runs the image-only plan pipeline, and returns a `PlanGraph` with image dimensions, detected items, and predicted counts. The frontend proxies this request through its `/api/plans/{planId}/analyze` route so the browser does not need direct backend network access. The request is synchronous and may take a while while the models load or analyze a large plan.
+
+The backend also saves that graph in the private `plan_knowledge` table (migration `202611140004_plan_knowledge.sql`). On later visits, the backend reuses the saved graph instead of running the image pipeline again. The plan page enables its chat after analysis finishes; questions are sent to `POST /api/plans/{plan_id}/ask`, which loads the saved graph and passes it to the Gemini agent (or the deterministic template answerer when Gemini is unavailable). The service role key stays in the backend, and the frontend only talks to it through Next.js API routes. Configure `GEMINI_API_KEY` to enable the natural-language agent.

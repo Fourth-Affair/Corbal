@@ -39,6 +39,10 @@ class AskRequest(BaseModel):
     question: str
 
 
+class PlanQuestionRequest(BaseModel):
+    question: str
+
+
 class Answer(BaseModel):
     answer: int | float | str | None
     unit: str | None = None
