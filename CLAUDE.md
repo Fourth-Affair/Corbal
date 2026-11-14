@@ -111,7 +111,13 @@ uv run python -m app.bench diff <runA.jsonl> <runB.jsonl>   # paired delta, 95% 
 # symbol detector on a Verda GPU VM (VERDA_CLIENT_ID/SECRET in .env). The VM downloads CubiCasa5K itself;
 # the challenge preview images (= test) are held out. VM is deleted at the end unless --keep.
 uv run python scripts/verda_train.py list                   # GPU types, prices, availability
-uv run python scripts/verda_train.py run                    # -> dataset/models/ (staging; copy to models/ + refit to adopt)
+uv run python scripts/verda_train.py run                    # -> dataset/models/sweep/ (staging; copy to models/ + refit to adopt)
+# sweep on an existing VM (never deleted by the script): trains presets A-D from verda_remote.sh (A = shipped recipe,
+# B/C = imgsz 1600 + rot90, D = 1024 native-res tiles), evaluates each + "current" with det_eval (val picks thresholds,
+# test reported), caches detections and refits the fusion models on the VM (fit-on val and train+val; questions from
+# the dataset zip). Works from Windows (tar over ssh). --skip-upload reuses an earlier upload; attach --host re-follows.
+uv run python scripts/verda_train.py run --host <ip> --sweep "current A B C D" --questions-zip ~/junction-dataset.zip
+uv run python -m app.cubicasa.det_eval --splits val test    # per-class AP50/recall + count exact-match, error buckets
 # local alternative (needs dataset/cubicasa5k-original):
 uv run python -m app.cubicasa.export_yolo --holdout ../dataset/junction-dataset-preview/questions.jsonl
 uv run python -m app.cubicasa.train --device 0 --onnx      # -> dataset/models/ (staging; copy to models/ + refit to adopt)
