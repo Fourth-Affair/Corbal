@@ -142,6 +142,8 @@ def panel_walls(img, geo) -> Image.Image:
         c.d.rectangle(op.bbox, outline=rgb("#00acc1"), width=c.lw)
         if op.symbol:
             c.text((op.bbox[0], op.bbox[3]), op.symbol[0].upper(), "#00838f", small=True)
+    for p0, p1 in getattr(geo, "passages", []):  # virtual walls across door-less passages
+        c.d.line([tuple(p0), tuple(p1)], fill=rgb("#e91e63"), width=c.lw * 3)
     if geo.scale and geo.scale.dimensions:
         for dm in geo.scale.dimensions:
             c.d.line([tuple(dm.p0), tuple(dm.p1)], fill=rgb("#d35400"), width=c.lw * 3)
@@ -298,7 +300,7 @@ def inspect(rel: str, path: Path):
     panels = []
     if geo is not None:
         panels += [("1 rooms (fill = type; dashed = weak; grey = unknown; red = size / conflict)", panel_rooms(img, geo)),
-                   ("2 walls, centrelines (red exterior), openings (cyan), room borders, scale lines (orange)",
+                   ("2 walls, centrelines (red exterior), openings (cyan), virtual walls (pink), scale lines (orange)",
                     panel_walls(img, geo))]
     panels.append(("3 detections: YOLO solid, net dashed, OCR thin (teal = room label)", panel_detections(img, graph, tokens)))
     panels.append(("4 ground truth (SVG)", panel_truth(img, gt)) if gt else ("4 original", img.convert("RGB")))
