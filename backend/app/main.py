@@ -1,6 +1,30 @@
-from fastapi import FastAPI
+import io
+import os
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, Response
+
+from app.config import DATASET_DIR
+from app.cubicasa.answer import count
+from app.cubicasa.graph import get_graph, resolve_dataset_path
+from app.models import Answer, AskRequest, Layer
+from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
+
+# "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
+PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")
+
+
+def _check_path(path: str):
+    try:
+        p = resolve_dataset_path(path)
+    except FileNotFoundError:
+        raise HTTPException(404, f"File not found: {path}") from None
+    if p.parent != (DATASET_DIR / "data" / "cubicasa5k").resolve() or p.suffix != ".png":
+        raise HTTPException(400, "Only data/cubicasa5k/*.png files are supported so far.")
+    return p
 
 
 @app.get("/health")
@@ -8,6 +32,80 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/hello")
-async def hello() -> dict[str, str]:
-    return {"message": "Hello from FastAPI"}
+@app.post("/api/ask")
+def ask(req: AskRequest) -> Answer:
+    _check_path(req.path)
+    template = route(req.question)
+    if template is None:
+        return Answer(answer=None, confidence="not_found",
+                      explanation="This question type is not supported yet.")
+    try:
+        graph = get_graph(req.path, PLAN_SOURCE)
+    except FileNotFoundError as e:  # e.g. model weights or original labels missing
+        return Answer(answer=None, template=template, confidence="not_found",
+                      explanation=f"Parser unavailable: {e}")
+    return count(graph, template)
+
+
+@app.get("/api/image")
+def image(path: str = Query(...)):
+    return FileResponse(_check_path(path), media_type="image/png")
+
+
+def _layer(name: str, path: str) -> Layer:
+    from app.cubicasa import layers
+
+    p = _check_path(path)
+    try:
+        return layers.LAYERS[name](path, p)
+    except FileNotFoundError as e:  # model weights not installed
+        raise HTTPException(503, str(e)) from e
+
+
+@app.get("/api/walls")
+def walls(path: str = Query(...)) -> Layer:
+    """Wall regions and door/window openings in the wall (wall segmenter, or the CubiCasa net as fallback)."""
+    return _layer("walls", path)
+
+
+@app.get("/api/symbols")
+def symbols(path: str = Query(...)) -> Layer:
+    """One box per door, window and fixture from the symbol detector."""
+    return _layer("symbols", path)
+
+
+@app.get("/api/text")
+def text(path: str = Query(...)) -> Layer:
+    """OCR tokens with boxes; room labels (e.g. "MH", "KPH") are mapped to a room type."""
+    return _layer("text", path)
+
+
+@app.get("/api/render")
+def render(path: str = Query(...), question: str | None = Query(None),
+           layer: Literal["answer", "walls", "symbols", "text"] = Query("answer")):
+    """The plan with the counted items (layer=answer, needs question) or one perception layer drawn on top."""
+    from PIL import Image, ImageDraw
+
+    from app.cubicasa import layers
+
+    p = _check_path(path)
+    if layer == "answer":
+        if not question:
+            raise HTTPException(400, "layer=answer needs a question")
+        answer = ask(AskRequest(path=path, question=question))
+        img = Image.open(p).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        for i, it in enumerate(answer.citations, 1):
+            if it.polygon:
+                draw.polygon(it.polygon, outline=(220, 30, 30), width=4)
+            else:
+                draw.rectangle(it.bbox, outline=(220, 30, 30), width=4)
+            draw.text((it.bbox[0] + 4, it.bbox[1] + 2), str(i), fill=(220, 30, 30))
+    else:
+        try:
+            img = layers.render(layer, path, p)
+        except FileNotFoundError as e:
+            raise HTTPException(503, str(e)) from e
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png")
