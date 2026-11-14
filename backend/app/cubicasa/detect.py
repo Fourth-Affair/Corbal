@@ -31,6 +31,10 @@ ICON_ITEMS = {"window": ("window", ""), "door": ("door", ""), "toilet": ("fixtur
 ROOM_ITEMS = {"bedroom": "bedroom", "bath": "bathroom", "kitchen": "kitchen", "living": "living",
               "outdoor": "balcony", "entry": "entry", "storage": "storage", "garage": "garage"}
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+if not log.handlers:
+    log.addHandler(logging.StreamHandler())
+log.propagate = False
 
 
 @lru_cache(maxsize=1)
