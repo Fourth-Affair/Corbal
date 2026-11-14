@@ -15,6 +15,7 @@ type PlanCitation = {
   bbox: [number, number, number, number];
   polygon?: Array<[number, number]> | null;
 };
+type ScaleCalibration = { points: [[number, number], [number, number]]; distance: number; unit: "m" | "cm" | "ft" | "in" };
 
 export default function PlanPage({ params }: { params: Promise<{ planId: string }> }) {
   const [planId, setPlanId] = useState("");
@@ -28,6 +29,15 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
   const [citations, setCitations] = useState<PlanCitation[]>([]);
+  const [scale, setScale] = useState<ScaleCalibration | null>(null);
+  const [scaleMode, setScaleMode] = useState(false);
+  const [measureMode, setMeasureMode] = useState(false);
+  const [scalePoints, setScalePoints] = useState<Array<[number, number]>>([]);
+  const [measurePoints, setMeasurePoints] = useState<Array<[number, number]>>([]);
+  const [scaleDistance, setScaleDistance] = useState("");
+  const [scaleUnit, setScaleUnit] = useState<ScaleCalibration["unit"]>("m");
+  const [scaleSaving, setScaleSaving] = useState(false);
+  const [scaleError, setScaleError] = useState<string | null>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -63,6 +73,16 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         }
         if (cancelled) return;
         setPlan(record);
+        const savedScale = await fetch(`/api/plans/${encodeURIComponent(id)}/scale`, { cache: "no-store" });
+        if (savedScale.ok) {
+          const saved = await savedScale.json();
+          if (saved?.points?.length === 2) {
+            setScale(saved);
+            setScalePoints(saved.points);
+            setScaleDistance(String(saved.distance));
+            setScaleUnit(saved.unit);
+          }
+        }
         const imageResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/image`, { cache: "no-store" });
         if (!imageResponse.ok) {
           const body = await imageResponse.json();
@@ -125,6 +145,51 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     }
   }
 
+  function markScalePoint(event: React.MouseEvent<SVGSVGElement>) {
+    if ((!scaleMode && !measureMode) || !imageSize) return;
+    const svg = event.currentTarget;
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const transform = svg.getScreenCTM();
+    if (!transform) return;
+    const imagePoint = point.matrixTransform(transform.inverse());
+    const pixelPoint: [number, number] = [Math.max(0, Math.min(imageSize.width, imagePoint.x)), Math.max(0, Math.min(imageSize.height, imagePoint.y))];
+    if (scaleMode) {
+      const next = [...scalePoints.slice(0, 1), pixelPoint];
+      setScalePoints(next);
+      setScaleError(null);
+      if (next.length === 2) setScaleMode(false);
+    } else {
+      const next = [...measurePoints.slice(0, 1), pixelPoint];
+      setMeasurePoints(next);
+      if (next.length === 2) setMeasureMode(false);
+    }
+  }
+
+  async function saveScale(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (scalePoints.length !== 2 || !Number(scaleDistance) || !planId) return;
+    setScaleSaving(true);
+    setScaleError(null);
+    try {
+      const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/scale`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ points: scalePoints, distance: Number(scaleDistance), unit: scaleUnit }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Could not save scale");
+      setScale(result);
+    } catch (saveError) {
+      setScaleError(saveError instanceof Error ? saveError.message : "Could not save scale");
+    } finally { setScaleSaving(false); }
+  }
+
+  const pxPerUnit = scale ? Math.hypot(scale.points[1][0] - scale.points[0][0], scale.points[1][1] - scale.points[0][1]) / scale.distance : null;
+  const measuredDistance = scale && pxPerUnit && measurePoints.length === 2
+    ? Math.hypot(measurePoints[1][0] - measurePoints[0][0], measurePoints[1][1] - measurePoints[0][1]) / pxPerUnit
+    : null;
+
   const imageStatus = plan?.plan_images?.find(image => image.role === "source")?.upload_status;
   return (
     <main className="workspace">
@@ -134,6 +199,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           <span>{plan?.metadata?.filename ?? "Loading plan…"}</span>
         </div>
         <div className="toolbar-actions">
+          {ready && <button className={`toolbar-button${scale ? " primary-button" : ""}`} type="button" onClick={() => { setScaleMode(true); setScalePoints([]); setScaleError(null); }}>{scale ? "Adjust scale" : "Set scale"}</button>}
+          {ready && scale && <button className="toolbar-button" type="button" onClick={() => { setMeasureMode(true); setMeasurePoints([]); setScaleMode(false); }}>Measure distance</button>}
           <span className="connection-status"><i /> {error ?? (imageStatus === "uploaded" ? analysisStatus : "Loading saved plan…")}</span>
           <Link className="toolbar-button" href="/">Upload another plan</Link>
         </div>
@@ -141,20 +208,22 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       <div className="work-area">
         <section className="drawing-panel" aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
-            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && citations.length > 0 && <svg className="citation-overlay" viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" aria-label={`Highlighted ${citations.length} supporting items`}>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode ? " scale-selecting" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={markScalePoint} aria-label={scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
               {citations.map((item, index) => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
                 return <g className="citation-mark" key={`${item.id}-${index}`}>
                   {points ? <polygon points={points} /> : <rect x={x0} y={y0} width={Math.max(1, x1 - x0)} height={Math.max(1, y1 - y0)} />}
-                  <circle cx={x0} cy={y0} r="18" />
-                  <text x={x0} y={y0}>{index + 1}</text>
+                  <circle cx={x0} cy={y0} r="18" /><text x={x0} y={y0}>{index + 1}</text>
                 </g>;
               })}
-            </svg>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
+              {scalePoints.length > 0 && <g className="scale-mark"><line x1={scalePoints[0][0]} y1={scalePoints[0][1]} x2={(scalePoints[1] ?? scalePoints[0])[0]} y2={(scalePoints[1] ?? scalePoints[0])[1]} />{scalePoints.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="18"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
+              {measurePoints.length > 0 && <g className="scale-mark"><line x1={measurePoints[0][0]} y1={measurePoints[0][1]} x2={(measurePoints[1] ?? measurePoints[0])[0]} y2={(measurePoints[1] ?? measurePoints[0])[1]} />{measurePoints.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="18"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
+            </svg>}{(scaleMode || measureMode) && <div className="scale-hint">{scaleMode ? (scalePoints.length === 0 ? "Click the first end of a known distance" : "Click the other end of that distance") : (measurePoints.length === 0 ? "Click the start of the distance to measure" : "Click the end of the distance")}</div>}{scale && pxPerUnit && <div className="scale-card"><strong>Plan scale set</strong><span>{scale.distance} {scale.unit} across selected points</span>{measuredDistance !== null && <span>Measured distance: {measuredDistance.toFixed(2)} {scale.unit}</span>}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
+          {scalePoints.length === 2 && <form className="scale-form" onSubmit={saveScale}><div><strong>Set drawing scale</strong><span>Enter the real distance between your two points.</span></div><input aria-label="Known distance" type="number" min="0.001" step="any" placeholder="Distance" value={scaleDistance} onChange={event => setScaleDistance(event.target.value)} required /><select aria-label="Distance unit" value={scaleUnit} onChange={event => setScaleUnit(event.target.value as ScaleCalibration["unit"])}><option value="m">metres</option><option value="cm">centimetres</option><option value="ft">feet</option><option value="in">inches</option></select><button className="toolbar-button primary-button" disabled={scaleSaving}>{scaleSaving ? "Saving…" : "Save scale"}</button>{scaleError && <p role="alert">{scaleError}</p>}</form>}
           <div className="chat-header"><div><h1>Ask about this plan</h1><p>Questions, quantities, and room details</p></div></div>
           <div className="conversation" aria-live="polite" ref={conversationRef}>{messages.length === 0 && !sending ? <div className="empty-conversation"><div className="chat-mark" aria-hidden="true">↗</div><p>{ready ? "Plan analysis is ready." : "Preparing the saved plan analysis…"}</p><span>Ask about quantities, rooms, and detected items.</span></div> : <>{messages.map((message, index) => <div className={`chat-message ${message.role}`} key={`${index}-${message.role}`}><span>{message.role === "user" ? "You" : "Stoa"}</span><p>{message.text}</p></div>)}{sending && <div className="chat-message assistant thinking-message" role="status"><span>Stoa</span><p><i className="thinking-spinner" aria-hidden="true" />Thinking through the plan…</p></div>}</>}</div>
           <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
