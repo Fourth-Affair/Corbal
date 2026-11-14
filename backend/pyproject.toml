@@ -20,6 +20,8 @@ dependencies = [
     "google-genai>=3.3.0",
     "onnx>=1.23.2",
     "segmentation-models-pytorch>=0.6.0",
+    "ezdxf>=1.4.5",
+    "pypdfium2>=5.15.2",
 ]
 
 # CPU-only torch wheels (no CUDA download). Switch the index to a cu12x one on a GPU box.

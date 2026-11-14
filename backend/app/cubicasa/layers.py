@@ -84,7 +84,7 @@ def symbols(rel: str, path: Path) -> Layer:
     from app.cubicasa.detect import _det_items
 
     if not symdet.available():
-        raise FileNotFoundError("symbol detector weights not installed (dataset/models/symbol-det.onnx)")
+        raise FileNotFoundError("symbol detector weights not installed (models/symbol-det.onnx)")
     img = _image(path)
     items = _det_items(symdet.detect(rel, img))
     counts: dict[str, float] = {}

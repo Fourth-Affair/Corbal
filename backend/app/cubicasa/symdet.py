@@ -46,11 +46,19 @@ def available() -> bool:
 
 
 def fingerprint() -> str | None:
+    """Identifies the detector weights by content (not mtime: a git checkout must not invalidate the fusion models)."""
     p = weights_path()
     if p is None:
         return None
     st = p.stat()
-    return f"{p.name}-{st.st_size:x}-{int(st.st_mtime):x}"
+    return _content_hash(p, st.st_size, st.st_mtime_ns)
+
+
+@lru_cache(maxsize=4)
+def _content_hash(p: Path, size: int, mtime_ns: int) -> str:  # size/mtime only key the cache
+    import hashlib
+
+    return f"{p.name}-{hashlib.sha256(p.read_bytes()).hexdigest()[:12]}"
 
 
 @lru_cache(maxsize=1)
@@ -59,7 +67,7 @@ def _model():
 
     p = weights_path()
     if p is None:
-        raise FileNotFoundError("symbol detector weights not found (dataset/models/symbol-det.onnx)")
+        raise FileNotFoundError("symbol detector weights not found (models/symbol-det.onnx)")
     return YOLO(str(p), task="detect")
 
 

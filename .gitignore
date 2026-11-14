@@ -21,3 +21,7 @@ dataset/
 *.pt
 stoa-share.zip
 junction-dataset*.zip
+
+# 208 MB third-party weights: fetched, never committed
+models/cubicasa-net.pkl
+!models/wallseg.pt
