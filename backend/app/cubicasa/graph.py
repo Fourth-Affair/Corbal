@@ -9,7 +9,8 @@ from pathlib import Path
 from app.config import CACHE_DIR, DATASET_DIR
 from app.models import PlanGraph
 
-GRAPH_VERSION = 2  # bump when graph_from_image changes what it stores (2: room regions carry their outline)
+GRAPH_VERSION = 4  # bump when graph_from_image changes what it stores (2: room regions carry their outline;
+                   # 3: counts without the file-name variant features; 4: count_probability / count_borderline)
 
 
 def resolve_dataset_path(rel: str) -> Path:

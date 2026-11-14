@@ -10,6 +10,8 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
+from app.profiling import stage
+
 MIN_LONG_SIDE = 1600  # upscale small plans so 1-2 letter labels (MH, KH, K) are detectable
 
 
@@ -27,8 +29,10 @@ def read_text(img: Image.Image, min_score: float = 0.5) -> list[tuple[str, tuple
     s = max(1.0, MIN_LONG_SIDE / max(W, H))
     work = img.resize((round(W * s), round(H * s)), Image.BICUBIC) if s > 1 else img
     arr = np.asarray(work)
-    eng = _engine()
-    boxes, _ = eng.text_det(arr) if hasattr(eng, "text_det") else (None, None)
+    with stage("engine_load"):
+        eng = _engine()
+    with stage("detect"):
+        boxes, _ = eng.text_det(arr) if hasattr(eng, "text_det") else (None, None)
     if boxes is None or len(boxes) == 0:
         return []
 
@@ -45,7 +49,8 @@ def read_text(img: Image.Image, min_score: float = 0.5) -> list[tuple[str, tuple
             metas.append((x0, y0, x1, y1))
     if not crops:
         return []
-    rec, _ = eng.text_rec(crops)  # one batched call for all crops/orientations
+    with stage("recognise"):
+        rec, _ = eng.text_rec(crops)  # one batched call for all crops/orientations
     best: dict = {}
     for meta, (text, score) in zip(metas, rec):
         if float(score) > best.get(meta, ("", -1.0))[1]:

@@ -9,8 +9,9 @@ Regions touching the image border are outside. A room's type combines (app.cubic
 inside it (strong), the fixtures inside it (strong when decisive: toilet, shower, sauna stove, ...) and the 2019 net's
 room-class pixels (weak), with a tier: strong / weak / unknown. Wall segments come from app.cubicasa.wallvec.
 Openings (or detected doors/windows when the wall model has no opening class) link the rooms they touch.
-Everything is in image pixels; the scale (m/px) is derived from written room areas when they agree, and the user's
-calibration replaces it when the geometry is served.
+Everything is in image pixels; the scale (m/px) is derived from dimension lines, else written room areas (two that
+agree, or one room that passes the single-room checks), and the user's calibration replaces it when the geometry is
+served.
 """
 
 import re
@@ -25,6 +26,7 @@ from skimage.measure import find_contours
 from app.cubicasa.room_types import Fixture, classify
 from app.cubicasa.rooms_dict import room_purpose
 from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallSegment, WallShape
+from app.profiling import steps
 
 # CubiCasa net classes by index (fuse.ROOM / fuse.ICON order)
 _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
@@ -37,6 +39,11 @@ SCALE_CROSS_CHECK = 0.10  # dimension-line and written-area scales further apart
 _AREA_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:m2|m²|m\^2|sqm|㎡)", re.IGNORECASE)
 _BARE_AREA_RE = re.compile(r"^\s*(\d{1,3}[.,]\d{1,2})\s*$")
 BARE_AREA_MIN_SCORE = 0.8  # OCR confidence for a unit-less area (a misread digit would skew the scale)
+# One room alone may set the scale only when its reading is clean, its outline well bounded, its written area
+# plausible for its type, and the scale it gives lies inside the door / fixture size band (size_priors.symbol_scale).
+SINGLE_ROOM_MIN_SCORE = 0.9  # OCR confidence of a lone bare decimal
+SINGLE_ROOM_MIN_SOLIDITY = 0.85  # room area / convex hull area: merged or leaking spaces are ragged
+SINGLE_ROOM_BAND_SLACK = 1.1  # the room's m/px may sit this far outside the symbol band
 MIN_ROOM_FRAC = 1e-3  # of the image area
 MAX_ROOM_FRAC = 0.5
 MAX_POINTS = 400
@@ -101,22 +108,54 @@ def _labeled_area(labels: list[RoomLabel]) -> float | None:
     Finnish convention) when the room also carries a purpose label. Bare decimals in one space are summed: an open
     plan ("OH 26.5" + "KEITTIÖ 17.0") or two rooms the wall map merged. Integers are not areas ("20" is usually a
     misread "2.0"); a wrong number is caught by the agreement test in scale_from_written_areas."""
-    m = _AREA_RE.search(" ".join(lb.text for lb in labels))
+    reading = _area_reading(labels)
+    return reading[0] if reading else None
+
+
+def _area_reading(labels: list[RoomLabel]) -> tuple[float, bool] | None:
+    """(written area, clean): clean = one unambiguous reading, a number with a unit or a single bare decimal read
+    with OCR score >= SINGLE_ROOM_MIN_SCORE (not a sum of several numbers)."""
+    joined = " ".join(lb.text for lb in labels)
+    m = _AREA_RE.search(joined)
     if m:
-        return float(m.group(1).replace(",", "."))
+        return float(m.group(1).replace(",", ".")), len(_AREA_RE.findall(joined)) == 1
     if not any(lb.room_type for lb in labels):
         return None
-    vals = [float(b.group(1).replace(",", ".")) for lb in labels
+    hits = [(float(b.group(1).replace(",", ".")), lb.score) for lb in labels
             if (lb.score is None or lb.score >= BARE_AREA_MIN_SCORE) and (b := _BARE_AREA_RE.match(lb.text))]
-    vals = [v for v in vals if 0.5 <= v <= 300]
-    return round(sum(vals), 2) if vals else None
+    hits = [(v, s) for v, s in hits if 0.5 <= v <= 300]
+    if not hits:
+        return None
+    clean = len(hits) == 1 and (hits[0][1] is None or hits[0][1] >= SINGLE_ROOM_MIN_SCORE)
+    return round(sum(v for v, _ in hits), 2), clean
 
 
-def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) -> PlanGeometry:
-    """Rooms, walls and openings of an image plan. `graph` (optional) supplies detected doors/windows."""
+def _room_written_area(labels: list[RoomLabel]) -> float | None:
+    """The room's written area: from the drawing's own labels when it has any (each label is one room: a space the
+    wall map merged sums them, and one label without an area means none), else from the OCR text."""
+    drawn = [lb for lb in labels if lb.source == "drawing"]
+    if not drawn:
+        return _labeled_area(labels)
+    areas = [_labeled_area([lb]) for lb in drawn]
+    return round(sum(areas), 2) if all(a is not None for a in areas) else None
+
+
+def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None,
+                        drawing_labels: list[RoomLabel] | None = None) -> PlanGeometry:
+    """Rooms, walls and openings of an image plan. `graph` (optional) supplies detected doors/windows.
+    `drawing_labels` (image pixels): room labels known exactly (a PDF's own text); they replace the OCR tokens they
+    cover and count as sure labels for the room type, the label split and the written area."""
+    with steps() as step:  # stage timings for app.profiling (no-op without an active profile)
+        return _geometry_from_image(rel, path, graph, step, drawing_labels or [])
+
+
+def _geometry_from_image(rel: str, path: Path, graph: PlanGraph | None, step,
+                         drawing_labels: list[RoomLabel]) -> PlanGeometry:
     from app.cubicasa import layers
 
+    step("walls")
     cls, model = layers.wall_classes(rel, path)
+    step("thickness")
     H, W = cls.shape
     barrier = cls > 0
     # wall thickness: twice the median distance-to-background along the wall skeleton
@@ -127,15 +166,24 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     t = float(2 * np.median(edt[skel])) if skel.any() else 4.0
     t = min(max(t, 2.0), 0.05 * max(H, W))
     closed = ndimage.binary_closing(barrier, iterations=max(1, round(t / 4))) | barrier
+    step("text")
     text = layers.text(rel, path)
+
+    def covered(bbox) -> bool:  # an OCR reading of text the drawing already gives exactly
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        return any(d.bbox[0] <= cx <= d.bbox[2] and d.bbox[1] <= cy <= d.bbox[3] for d in drawing_labels)
+
+    found = [RoomLabel(text=tok.text, bbox=tok.bbox, score=round(tok.score, 3), room_type=room_purpose(tok.text))
+             for tok in text.tokens if not covered(tok.bbox)] + list(drawing_labels)
+    step("spaces")
     lab, n = ndimage.label(~closed)
     room_cuts = []
     if SPLIT_BY_LABELS:  # a bedroom open to the living room: cut between the two labels at the narrowest line
         from app.cubicasa.room_split import split_by_labels
         from app.cubicasa.room_types import LABEL_STRONG_SCORE
 
-        label_seeds = [((tk.bbox[0] + tk.bbox[2]) / 2, (tk.bbox[1] + tk.bbox[3]) / 2, purpose) for tk in text.tokens
-                       if tk.score >= LABEL_STRONG_SCORE and (purpose := room_purpose(tk.text))]
+        label_seeds = [((lb.bbox[0] + lb.bbox[2]) / 2, (lb.bbox[1] + lb.bbox[3]) / 2, lb.room_type) for lb in found
+                       if (lb.score or 0) >= LABEL_STRONG_SCORE and lb.room_type]
         lab, room_cuts = split_by_labels(lab, label_seeds, t, CUT_MIN_ROOM_FRAC * H * W)
         n = int(lab.max())
     outside = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))) - {0}
@@ -150,8 +198,8 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     # OCR tokens -> rooms (token centre, else the most common room within one wall thickness)
     labels_of: dict[int, list[RoomLabel]] = {k: [] for k in keep}
     r = max(2, round(t))
-    for tok in text.tokens:
-        cx, cy = int((tok.bbox[0] + tok.bbox[2]) / 2), int((tok.bbox[1] + tok.bbox[3]) / 2)
+    for lb in found:
+        cx, cy = int((lb.bbox[0] + lb.bbox[2]) / 2), int((lb.bbox[1] + lb.bbox[3]) / 2)
         if not (0 <= cx < W and 0 <= cy < H):
             continue
         k = int(lab[cy, cx])
@@ -160,11 +208,12 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
             win = win[np.isin(win, keep)]
             k = int(np.bincount(win).argmax()) if win.size else 0
         if k in labels_of:
-            labels_of[k].append(RoomLabel(text=tok.text, bbox=tok.bbox, score=round(tok.score, 3),
-                                          room_type=room_purpose(tok.text)))
+            labels_of[k].append(lb)
 
+    step("fixtures")
     seg, icons = _net_maps(rel, (H, W))
     fixtures_of = _fixtures_by_room(lab, graph, icons)
+    step("rooms")
     tol = max(1.0, 0.002 * max(H, W))
     rooms: list[RoomShape] = []
     for k in keep:
@@ -186,8 +235,9 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
         rooms.append(RoomShape(id=room_id[k], type=c.type, tier=c.tier, purposes=c.purposes, scores=c.scores,
                                evidence=c.evidence, conflicts=c.conflicts, name=name, labels=labels,
                                polygon=shape[0], bbox=_box(sl), area_px=float(sizes[k - 1]),
-                               labeled_area_m2=_labeled_area(labels), neighbours=neighbours))
+                               labeled_area_m2=_room_written_area(labels), neighbours=neighbours))
 
+    step("walls_openings")
     walls = _walls(cls == 1, "wall", tol)
     openings = _openings(cls, lab, room_id, outside, t, graph, tol)
     by_id = {rm.id: rm for rm in rooms}
@@ -201,6 +251,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     def to_id(v: int) -> str | None:
         return room_id.get(v) or ("outside" if v in outside else None)
 
+    step("wall_segments")
     segments = _building_segments(vectorise(cls, lab, to_id, t, openings), cls, lab, keep, t)
     for sg in segments:
         for rid in set(sg.rooms_left) | set(sg.rooms_right):
@@ -208,10 +259,11 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
                 by_id[rid].walls.append(sg.id)
     from app.cubicasa.size_priors import symbol_scale
 
+    step("scale")
     sym = symbol_scale(graph)
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
                         walls=walls, openings=openings, wall_segments=segments, room_cuts=room_cuts,
-                        scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym)), symbol_scale=sym)
+                        scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym), sym), symbol_scale=sym)
 
 
 def _building_segments(segments: list[WallSegment], cls: np.ndarray, lab: np.ndarray, keep: list[int],
@@ -259,30 +311,66 @@ def _dimension_scale(path: Path, tokens, sym: PlanScale | None) -> PlanScale | N
     return dims
 
 
-def plan_scale(rooms: list[RoomShape], dims: PlanScale | None) -> PlanScale | None:
+def plan_scale(rooms: list[RoomShape], dims: PlanScale | None, sym: PlanScale | None = None) -> PlanScale | None:
     """The plan's own scale: dimension lines (a direct length measurement) when they agree, else written room areas
     (measured through the room outlines, so segmentation errors leak in). When both exist and differ by more than
     SCALE_CROSS_CHECK, the chosen one carries a warning."""
-    areas = scale_from_written_areas(rooms)
+    areas = scale_from_written_areas(rooms, sym)
     if dims and areas and abs(dims.m_per_px - areas.m_per_px) > SCALE_CROSS_CHECK * areas.m_per_px:
         dims.warning = (f"dimension lines give {dims.m_per_px * 1000:.2f} mm per pixel, the written room areas "
                         f"{areas.m_per_px * 1000:.2f}: check the scale")
     return dims or areas
 
 
-def scale_from_written_areas(rooms: list[RoomShape]) -> PlanScale | None:
+def scale_from_written_areas(rooms: list[RoomShape], sym: PlanScale | None = None) -> PlanScale | None:
     """m/px from rooms whose area is written inside them: sqrt(m² / px) per room, the median when >= 2 rooms agree
-    within SCALE_AGREE. One room alone is not trusted (an OCR misread would silently scale everything)."""
+    within SCALE_AGREE. Without such agreement one room may set it alone (single_room_scale): an OCR misread would
+    silently scale everything, so that needs a clean reading, a well-bounded room and the symbol size band (`sym`)."""
     est = [(rm.id, (rm.labeled_area_m2 / rm.area_px) ** 0.5) for rm in rooms
            if rm.labeled_area_m2 and rm.labeled_area_m2 > 0 and rm.area_px > 0]
-    if len(est) < 2:
+    if len(est) >= 2:
+        med = float(np.median([v for _, v in est]))
+        agree = [(rid, v) for rid, v in est if abs(v - med) <= SCALE_AGREE * med]
+        if len(agree) >= 2:
+            return PlanScale(m_per_px=float(np.median([v for _, v in agree])), source="written_areas",
+                             rooms=[rid for rid, _ in agree])
+    return single_room_scale(rooms, sym)
+
+
+def single_room_scale(rooms: list[RoomShape], sym: PlanScale | None) -> PlanScale | None:
+    """m/px from the one room that passes every check in `_single_room_estimate`; None when no room or several
+    (several rooms that pass but disagree: one of them is wrong and nothing says which)."""
+    if sym is None or not sym.low or not sym.high:
+        return None  # no independent check of the reading
+    est = [(rm.id, v) for rm in rooms if (v := _single_room_estimate(rm, sym)) is not None]
+    if len(est) != 1:
         return None
-    med = float(np.median([v for _, v in est]))
-    agree = [(rid, v) for rid, v in est if abs(v - med) <= SCALE_AGREE * med]
-    if len(agree) < 2:
+    rid, v = est[0]
+    return PlanScale(m_per_px=v, source="written_areas", rooms=[rid])
+
+
+def _single_room_estimate(rm: RoomShape, sym: PlanScale) -> float | None:
+    from app.cubicasa.size_priors import ROOM_AREA_M2
+
+    reading = _area_reading(rm.labels)
+    if reading is None or not reading[1] or reading[0] <= 0 or rm.area_px <= 0:
         return None
-    return PlanScale(m_per_px=float(np.median([v for _, v in agree])), source="written_areas",
-                     rooms=[rid for rid, _ in agree])
+    area_m2 = reading[0]
+    if len({lb.room_type for lb in rm.labels if lb.room_type}) > 1:
+        return None  # two purposes in one space: likely two rooms the wall map merged
+    if len(rm.polygon) < 3:
+        return None
+    poly = Polygon(rm.polygon)
+    if not poly.is_valid or poly.convex_hull.area <= 0 or poly.area / poly.convex_hull.area < SINGLE_ROOM_MIN_SOLIDITY:
+        return None
+    if rm.tier != "unknown" and rm.type in ROOM_AREA_M2:
+        lo, hi = ROOM_AREA_M2[rm.type]
+        if not lo <= area_m2 <= hi:
+            return None  # e.g. "bathroom 65 m²": a misread or a number that is not this room's area
+    v = (area_m2 / rm.area_px) ** 0.5
+    if not sym.low / SINGLE_ROOM_BAND_SLACK <= v <= sym.high * SINGLE_ROOM_BAND_SLACK:
+        return None
+    return v
 
 
 def _fixtures_by_room(lab: np.ndarray, graph: PlanGraph | None, icons: np.ndarray | None) -> dict[int, list[Fixture]]:
@@ -392,7 +480,8 @@ def geometry_from_graph(graph: PlanGraph) -> PlanGeometry:
             continue
         x0, y0, x1, y1 = it.bbox
         area = abs(Polygon(it.polygon).area) if len(it.polygon) >= 3 else (x1 - x0) * (y1 - y0)
-        labels = [RoomLabel(text=it.text, bbox=it.bbox, room_type=room_purpose(it.text.split()[0]) if it.text else None)]             if it.text else []
+        labels = [RoomLabel(text=it.text, bbox=it.bbox, room_type=_drawing_purpose(it.text), source="drawing")] \
+            if it.text else []
         purpose = labels[0].room_type if labels else None
         rtype = purpose or (it.cls if it.cls not in ("", "room", "other") else None)
         evidence = [RoomEvidence(source="drawing", type=rtype, weight=6.0, detail=f'drawing text "{it.text}"')] \
@@ -403,6 +492,74 @@ def geometry_from_graph(graph: PlanGraph) -> PlanGeometry:
                                labeled_area_m2=_labeled_area(labels)))
     return PlanGeometry(image=graph.image, width=graph.width, height=graph.height, model="pdf", rooms=rooms,
                         scale=scale_from_written_areas(rooms))
+
+
+def _scaled_geometry(geo: PlanGeometry, s: float, image: str, width: int, height: int) -> PlanGeometry:
+    """`geo` with every coordinate and length multiplied by `s` (areas by s², metres per unit divided by s)."""
+    def pt(p):
+        return (round(p[0] * s, 2), round(p[1] * s, 2))
+
+    def pts(ps):
+        return [pt(p) for p in ps]
+
+    def box(b):
+        return (round(b[0] * s, 2), round(b[1] * s, 2), round(b[2] * s, 2), round(b[3] * s, 2))
+
+    def scale(sc: PlanScale | None) -> PlanScale | None:
+        if sc is None:
+            return None
+        return sc.model_copy(update={
+            "m_per_px": sc.m_per_px / s, "low": sc.low / s if sc.low else sc.low,
+            "high": sc.high / s if sc.high else sc.high,
+            "dimensions": [d.model_copy(update={"bbox": box(d.bbox), "p0": pt(d.p0), "p1": pt(d.p1)})
+                           for d in sc.dimensions]})
+
+    for rm in geo.rooms:
+        rm.polygon, rm.bbox, rm.area_px = pts(rm.polygon), box(rm.bbox), rm.area_px * s * s
+        rm.labels = [lb.model_copy(update={"bbox": box(lb.bbox)}) for lb in rm.labels]
+    for w in geo.walls + geo.openings:
+        w.polygon, w.bbox, w.area_px = pts(w.polygon), box(w.bbox), w.area_px * s * s
+        w.holes = [pts(h) for h in w.holes]
+    for sg in geo.wall_segments:
+        sg.p0, sg.p1, sg.length_px, sg.thickness_px = pt(sg.p0), pt(sg.p1), sg.length_px * s, sg.thickness_px * s
+    return geo.model_copy(update={
+        "image": image, "width": width, "height": height,
+        "wall_thickness_px": round(geo.wall_thickness_px * s, 2) if geo.wall_thickness_px else geo.wall_thickness_px,
+        "room_cuts": [(pt(a), pt(b)) for a, b in geo.room_cuts],
+        "scale": scale(geo.scale), "symbol_scale": scale(geo.symbol_scale)})
+
+
+def _drawing_purpose(text: str) -> str | None:
+    """Room purpose of a PDF room label ("Camera da letto 1.03 23.5 m²"): its name without the room number and area,
+    else the name's first word."""
+    words = [w for w in (text or "").split() if not any(c.isdigit() for c in w) and w.casefold() not in ("m²", "m2")]
+    if not words:
+        return None
+    return room_purpose(" ".join(words)) or room_purpose(words[0])
+
+
+def geometry_from_pdf(graph: PlanGraph, rel: str, path: Path, k: float) -> PlanGeometry:
+    """PDF plans. With room outlines from a DXF the rooms are exact (geometry_from_graph). Otherwise the image
+    geometry of page 1 rendered at `path` (`k` pixels per PDF point, cached under `rel`): walls, openings and room
+    shapes from the wall map, with the PDF's own room labels (name, number, printed area) as sure labels for the
+    room types and written areas. Returned in PDF points, like the graph."""
+    if any(it.category == "room" and it.polygon for it in graph.items):
+        return geometry_from_graph(graph)
+
+    def px(b):
+        return (b[0] * k, b[1] * k, b[2] * k, b[3] * k)
+
+    from PIL import Image
+
+    W, H = Image.open(path).size  # header only
+    items = [it.model_copy(update={"bbox": px(it.bbox),
+                                   "polygon": [(x * k, y * k) for x, y in it.polygon] if it.polygon else it.polygon})
+             for it in graph.items]
+    px_graph = graph.model_copy(update={"image": rel, "width": W, "height": H, "items": items})
+    labels = [RoomLabel(text=it.text, bbox=px(it.bbox), score=1.0, room_type=_drawing_purpose(it.text),
+                        source="drawing") for it in graph.items if it.category == "room" and it.text]
+    geo = geometry_from_image(rel, path, px_graph, drawing_labels=labels)
+    return _scaled_geometry(geo, 1 / k, graph.image, graph.width, graph.height)
 
 
 def main() -> None:

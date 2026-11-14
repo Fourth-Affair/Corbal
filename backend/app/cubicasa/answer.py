@@ -54,16 +54,37 @@ EVIDENCE: dict[str, Pred] = {
 }
 
 
+# Classifier probability of the count -> confidence. Preview plans, refit out of fold: p >= 0.95 was right 96% of the
+# time (65% of those answers), 0.8-0.95 74%, below 0.8 60%. The old tier ("medium") was right 91%.
+HIGH_PROBABILITY = 0.95
+MEDIUM_PROBABILITY = 0.80
+
+
+def _model_confidence(graph: PlanGraph, template: str, n: int, ev: list[PlanItem]) -> tuple[str, str]:
+    """(confidence, note) of a counting-model answer: the classifier's probability when it has one, the detections
+    near the cut-off for threshold-count rules (never high: those counts are the least reliable), else whether the
+    highlighted evidence matches the count."""
+    p = graph.count_probability.get(template)
+    if p is not None:
+        tier = "high" if p >= HIGH_PROBABILITY else "medium" if p >= MEDIUM_PROBABILITY else "low"
+        return tier, f" Counting model probability {p:.0%}."
+    b = graph.count_borderline.get(template)
+    if b is not None:
+        return ("medium", "") if b == 0 else \
+            ("low", f" {b} detection{'s' if b != 1 else ''} close to the counting threshold: check the highlights.")
+    scores = [it.score for it in ev[:n] if it.score is not None]
+    return ("medium" if len(ev) == n and (not scores or min(scores) >= 0.6) else "low"), ""
+
+
 def count(graph: PlanGraph, template: str) -> Answer:
     if graph.counts and template in graph.counts:
         n = graph.counts[template]
         ev = sorted((it for it in graph.items if EVIDENCE[template](it)), key=lambda it: -(it.score or 0))
-        scores = [it.score for it in ev[:n] if it.score is not None]
-        confidence = "medium" if len(ev) == n and (not scores or min(scores) >= 0.6) else "low"
+        confidence, why = _model_confidence(graph, template, n, ev)
         note = "" if len(ev) == n else f" ({len(ev)} candidate regions highlighted; count adjusted by the fusion model)"
         reviewed_note = " Includes user-reviewed corrections." if graph.user_correction_count or any(it.user_verified for it in ev) else ""
         return Answer(answer=n, unit="count", template=template, confidence=confidence,
-                      explanation=f"Estimated {n} {COUNTERS.get(template, (None, template))[1]}{note}.{reviewed_note}",
+                      explanation=f"Estimated {n} {COUNTERS.get(template, (None, template))[1]}{note}.{why}{reviewed_note}",
                       citations=ev)
 
     if template == "saunas":

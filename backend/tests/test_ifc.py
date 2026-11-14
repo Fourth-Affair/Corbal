@@ -228,3 +228,43 @@ def test_api_routes_ifc(tiny, tmp_path, monkeypatch):
     assert body["answer"] == 0 and body["unit"] == "count"
     r = TestClient(app).post("/api/ask", json={"path": "data/missing.ifc", "question": "How many doors?"})
     assert r.status_code == 404
+
+
+# --- agent toolset ------------------------------------------------------------------------------------------------
+
+
+def test_agent_tools(tiny):
+    from app.ifc.agent_tools import IfcTools
+
+    m, ids, _ = tiny
+    t = IfcTools(m)
+    out, trace = t.call("count_elements", {"ifc_classes": ["IfcDoor"]})
+    assert out["value"] == 3 and set(trace.item_ids) == set(ids["doors"]) and trace.numbers == [3]
+    assert t.call("count_elements", {"ifc_classes": ["IfcColumn"]})[0]["value"] == 0  # absent class: 0, not an error
+    assert "error" in t.call("count_elements", {"ifc_classes": ["door"]})[0]  # not a class name
+    assert "error" in t.call("count_elements", {"ifc_classes": ["IfcDoor"], "storey": "Mars"})[0]
+    assert "error" in t.call("count_elements", {"ifc_classes": ["IfcDoor"], "colour": "red"})[0]
+    out, trace = t.call("space_areas", {})
+    assert out["value"] == pytest.approx(36.5) and 36.5 in trace.numbers
+    out, _ = t.call("sum_quantity", {"ifc_classes": ["IfcWall"], "quantity": "length"})
+    assert out["value"] == pytest.approx(11.5)
+    assert t.item(ids["toilet"]).id == ids["toilet"] and t.item("nope") is None
+
+
+def test_agent_validate_with_ifc_tools(tiny):
+    from app.answering import agent
+    from app.ifc.agent_tools import IfcTools
+
+    m, ids, _ = tiny
+    t = IfcTools(m)
+    _, doors = t.call("count_elements", {"ifc_classes": ["IfcDoor"]})
+    final = {"not_found": False, "value": 3, "explanation": "There are 3 doors."}
+    a = agent.validate("How many doors are there?", final, [doors], t)
+    # the cubicasa router would say "doors" with no template: that must not lower an IFC answer
+    assert (a.answer, a.confidence) == (3, "high") and {c.id for c in a.citations} == set(ids["doors"])
+    _, areas = t.call("space_areas", {})
+    a = agent.validate("Total floor area?", {"not_found": False, "value": 36.5, "unit": "m2",
+                                             "explanation": "36.5 m² in total."}, [doors, areas], t)
+    assert a.answer == 36.5 and a.confidence == "medium" and len(a.citations) == 3  # one area is from geometry
+    a = agent.validate("Total floor area?", {"not_found": False, "value": 40, "explanation": "40 m²."}, [areas], t)
+    assert a.confidence == "not_found"

@@ -1,10 +1,20 @@
 # Production stack for a single server (see deploy/README.md):
 #   docker compose -f compose.prod.yaml up -d --build
 # Only Caddy is published (80/443, automatic HTTPS). Frontend and backend stay on the internal network.
+
+# Docker's default json-file log driver never rotates: cap every service's logs so a long-running server
+# does not fill its disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   caddy:
     build: ./deploy/caddy
     restart: unless-stopped
+    logging: *logging
     ports:
       - "80:80"
       - "443:443"
@@ -29,6 +39,7 @@ services:
         NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
         NEXT_PUBLIC_SUPABASE_BUCKET: ${NEXT_PUBLIC_SUPABASE_BUCKET:-plans}
     restart: unless-stopped
+    logging: *logging
     environment:
       BACKEND_URL: http://backend:8000
       NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
@@ -42,6 +53,7 @@ services:
     build:
       context: ./backend
     restart: unless-stopped
+    logging: *logging
     # One process: inference releases the GIL, and GEMINI_MAX_PER_HOUR is counted per process.
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips '*'
     environment:
@@ -50,9 +62,16 @@ services:
       MODELS_DIR: /models
       PLAN_SOURCE: model
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Same default as app/answering/agent.py; set GEMINI_MODEL in .env when Google retires the model id.
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
       GEMINI_MAX_PER_HOUR: ${GEMINI_MAX_PER_HOUR:-300}
       MAX_CONCURRENT_ANALYSES: ${MAX_CONCURRENT_ANALYSES:-1}
-      ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-240}
+      ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-45}
+      # Larger uploads are downscaled first: peak memory ~1.7 GB + 0.27 GB per megapixel (see app/config.py)
+      MAX_ANALYSIS_PIXELS: ${MAX_ANALYSIS_PIXELS:-16000000}
+      # Speed options, off by default; see "Analysis speed" in CLAUDE.md before turning them on
+      WALLSEG_MAX_PIXELS: ${WALLSEG_MAX_PIXELS:-0}
+      PARALLEL_WALLS: ${PARALLEL_WALLS:-0}
       SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     volumes:

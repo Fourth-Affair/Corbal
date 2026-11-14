@@ -3,7 +3,7 @@
 #
 #   deploy/deploy.sh <ip> all       # first time: setup + push + up
 #   deploy/deploy.sh <ip> setup     # Docker, firewall (22/80/443), fail2ban (once per server)
-#   deploy/deploy.sh <ip> push      # code (tracked files of the working tree), CubiCasa weights, .env, warm cache
+#   deploy/deploy.sh <ip> push      # code (tracked files of the working tree), CubiCasa weights, .env, Gemini answer cache
 #   deploy/deploy.sh <ip> up        # build + (re)start the stack
 #   deploy/deploy.sh <ip> update    # push + up: deploy a new version
 #   deploy/deploy.sh <ip> ci        # code only + up (GitHub Actions): .env, weights and cache stay on the server
@@ -75,7 +75,7 @@ cmd_push() {
     remote "umask 077; cat > $REMOTE_DIR/.env"
 
   local warm=()
-  for d in dataset/cache/agent dataset/cache/graphs; do [[ -d $d ]] && warm+=("$d"); done
+  for d in dataset/cache/agent; do [[ -d $d ]] && warm+=("$d"); done  # Gemini answers (uploaded plans' graphs live in Supabase)
   if (( ${#warm[@]} )); then
     echo "==> warm cache: ${warm[*]}"
     remote "mkdir -p $REMOTE_DIR/dataset/cache"

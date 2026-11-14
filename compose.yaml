@@ -33,7 +33,9 @@ services:
       PLAN_SOURCE: ${PLAN_SOURCE:-model}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       MAX_CONCURRENT_ANALYSES: ${MAX_CONCURRENT_ANALYSES:-1}
-      ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-240}
+      ANALYSIS_QUEUE_TIMEOUT: ${ANALYSIS_QUEUE_TIMEOUT:-45}
+      # Model warm-up at startup (app/warmup.py) costs ~10-20 s of CPU on every hot reload: off in dev
+      WARMUP: ${WARMUP:-0}
       SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     volumes:

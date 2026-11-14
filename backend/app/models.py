@@ -44,6 +44,9 @@ class PlanGraph(BaseModel):
     items: list[PlanItem] = Field(default_factory=list)
     # model source only: per-template counts from the fusion models (items are the supporting evidence)
     counts: dict[str, int] = Field(default_factory=dict)
+    # how sure the counting model is (app.cubicasa.answer.count turns these into the answer's confidence):
+    count_probability: dict[str, float] = Field(default_factory=dict)  # classifier probability of the count
+    count_borderline: dict[str, int] = Field(default_factory=dict)  # threshold-count rules: detections near the cut-off
     floor_outlines: list[PlanOutline] = Field(default_factory=list)
     room_outlines: list[PlanOutline] = Field(default_factory=list)
     user_correction_count: int = 0  # number of append-only human correction events applied to this copy
@@ -111,6 +114,7 @@ class Answer(BaseModel):
     clarification_needed: bool = False
     citations: list[PlanItem] = Field(default_factory=list)
     answered_by: Literal["template", "llm"] = "template"  # template = router + counter, llm = Gemini agent (values still tool-computed)
+    area_scope: str | None = None  # area questions: "floor" or the room type asked about (which outlines to review)
 
 
 class TextToken(BaseModel):
@@ -145,6 +149,7 @@ class RoomLabel(BaseModel):
     bbox: tuple[float, float, float, float]
     score: float | None = None
     room_type: str | None = None  # the purpose the text names (e.g. "MH" -> bedroom, "OH" -> living), if any
+    source: Literal["ocr", "drawing"] = "ocr"  # drawing = the PDF's own text (exact, not an OCR reading)
 
 
 class RoomEvidence(BaseModel):

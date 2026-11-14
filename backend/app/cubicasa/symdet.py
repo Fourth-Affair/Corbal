@@ -20,6 +20,7 @@ from uuid import uuid4
 from PIL import Image
 
 from app.config import CACHE_DIR, DATASET_DIR, MODELS_DIR
+from app.profiling import stage
 from app.cubicasa.features import FEAT_DIR
 
 DET_NAMES = ["door", "window", "toilet", "sink", "double_sink", "shower", "bathtub", "sauna_stove"]
@@ -186,7 +187,8 @@ def detect(rel: str, img: Image.Image | None = None) -> list[dict]:
     if hit is not None:
         return hit
     img = (img or Image.open(image_path(rel))).convert("RGB")
-    dets = predict_image(img)
+    with stage("predict"):
+        dets = predict_image(img)
     meta = weights_meta()
     p = det_path(rel)
     p.parent.mkdir(parents=True, exist_ok=True)
