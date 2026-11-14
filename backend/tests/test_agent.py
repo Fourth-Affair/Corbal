@@ -180,3 +180,50 @@ def test_yes_no_linked_to_count(tools):
                                       ("Nej", False), ("Ja", True), ("WC-istuin ja suihku", None)])
 def test_yes_no(text, pol):
     assert agent.yes_no(text) is pol
+
+
+class FlakyModels:
+    """Raises the scripted errors first, then returns a response."""
+
+    def __init__(self, errors):
+        self.errors, self.calls = list(errors), 0
+
+    def generate_content(self, model, contents, config):
+        self.calls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return "ok"
+
+
+def _flaky(monkeypatch, errors, retries=1):
+    models = FlakyModels(errors)
+    monkeypatch.setattr(agent, "_get_client", lambda: SimpleNamespace(models=models))
+    monkeypatch.setattr(agent, "GEMINI_RETRIES", retries)
+    monkeypatch.setattr(agent, "GEMINI_RETRY_BACKOFF_S", 0)
+    return models
+
+
+def test_generate_retries_transient_errors(monkeypatch):
+    import httpx
+    from google.genai import errors
+
+    models = _flaky(monkeypatch, [httpx.ReadTimeout("The read operation timed out")])
+    assert agent._generate([], None) == "ok" and models.calls == 2
+    models = _flaky(monkeypatch, [errors.ServerError(503, {"error": {"message": "overloaded"}})])
+    assert agent._generate([], None) == "ok" and models.calls == 2
+    models = _flaky(monkeypatch, [errors.ClientError(429, {"error": {"message": "quota"}})])
+    assert agent._generate([], None) == "ok" and models.calls == 2
+
+
+def test_generate_does_not_retry_bad_requests_and_gives_up(monkeypatch):
+    import httpx
+    from google.genai import errors
+
+    models = _flaky(monkeypatch, [errors.ClientError(400, {"error": {"message": "bad"}})])
+    with pytest.raises(errors.ClientError):
+        agent._generate([], None)
+    assert models.calls == 1
+    models = _flaky(monkeypatch, [httpx.ReadTimeout("t"), httpx.ReadTimeout("t")])
+    with pytest.raises(httpx.ReadTimeout):
+        agent._generate([], None)
+    assert models.calls == 2

@@ -37,7 +37,8 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     from tool output, confidence from the producing tool (count_template → counting model; raw items → low; router
     disagreement → low), explanation must state the value and use existing `[k]` refs. Answers cached in
     `CACHE_DIR/agent`. `GEMINI_THINKING` (default `LOW`: 2-3x faster than the model default, same answers;
-    `MINIMAL` is rejected by gemini-3.8-flash). Yes/no answers are linked to, and checked against, a count_template
+    `MINIMAL` is rejected by gemini-3.8-flash). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
+    (`GEMINI_TIMEOUT_S` per call, default 30). Yes/no answers are linked to, and checked against, a count_template
     result. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
   - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
     counts), `list_items`, `items_in` (bbox containment; a room label uses the room region around it).

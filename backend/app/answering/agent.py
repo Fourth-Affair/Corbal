@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "30"))
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | MEDIUM | HIGH; "" = model default
+GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
+GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 8
 PROMPT_VERSION = "7"  # bump when prompt or tools change, so cached answers are not reused
 
@@ -84,6 +86,37 @@ def _get_client():
     return _client
 
 
+def _retryable(error: Exception) -> bool:
+    """Transient: timeouts, network errors, rate limits (429) and server errors (5xx). Bad requests / auth are not.
+
+    Transport errors are matched by class name and cause: google-genai raises them from its own httpx fork
+    (httpx2.ReadTimeout), so isinstance checks against httpx would miss them."""
+    from google.genai import errors
+
+    if isinstance(error, errors.APIError):
+        return error.code == 429 or (error.code or 0) >= 500
+    e = error
+    while e is not None:
+        names = {c.__name__ for c in type(e).__mro__}
+        if names & {"TimeoutException", "NetworkError", "RemoteProtocolError", "TimeoutError", "ConnectionError"}:
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def _generate(contents, config):
+    """generate_content with GEMINI_RETRIES retries on transient errors (exponential backoff)."""
+    for attempt in range(GEMINI_RETRIES + 1):
+        try:
+            return _get_client().models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+        except Exception as error:
+            if attempt == GEMINI_RETRIES or not _retryable(error):
+                raise
+            delay = GEMINI_RETRY_BACKOFF_S * 2**attempt
+            log.warning("Gemini call failed (%s), retry %d/%d in %.1fs", error, attempt + 1, GEMINI_RETRIES, delay)
+            time.sleep(delay)
+
+
 def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = None) -> tuple[dict, list[ToolTrace]]:
     """Gemini tool loop -> (final_answer args, traces of the tool calls). Raises on API problems / no answer."""
     from google.genai import types
@@ -107,7 +140,7 @@ def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = N
     traces: list[ToolTrace] = []
     for step in range(MAX_STEPS):
         t0 = time.perf_counter()
-        response = _get_client().models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+        response = _generate(contents, config)
         log.info("step %d: %.1fs, calls %s", step, time.perf_counter() - t0,
                  [c.name for c in response.function_calls or []])
         calls = response.function_calls or []
