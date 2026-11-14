@@ -6,6 +6,7 @@
 #   deploy/deploy.sh <ip> push      # code (tracked files of the working tree), CubiCasa weights, .env, warm cache
 #   deploy/deploy.sh <ip> up        # build + (re)start the stack
 #   deploy/deploy.sh <ip> update    # push + up: deploy a new version
+#   deploy/deploy.sh <ip> ci        # code only + up (GitHub Actions): .env, weights and cache stay on the server
 #   deploy/deploy.sh <ip> status    # container health + site URL
 #   deploy/deploy.sh <ip> logs [service]   # follow logs (caddy | frontend | backend)
 #   deploy/deploy.sh <ip> down      # stop the stack
@@ -21,14 +22,14 @@ COMPOSE="docker compose -f compose.prod.yaml"
 
 env_value() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -1 | tr -d "\"'" || true; }
 
-COMMANDS=" setup push up update all status logs down ssh "
+COMMANDS=" setup push up update ci all status logs down ssh "
 if [[ $# -ge 1 && $COMMANDS != *" $1 "* ]]; then
   HOST=$1; shift
 else
   HOST=${DEPLOY_HOST:-$(env_value DEPLOY_HOST)}
 fi
 CMD=${1:-}; shift || true
-[[ -n $HOST && -n $CMD ]] || { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[[ -n $HOST && -n $CMD ]] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30)
 remote() { ssh "${SSH_OPTS[@]}" "root@$HOST" "$@"; }
@@ -39,7 +40,7 @@ cmd_setup() {
   remote 'bash -s' < deploy/bootstrap.sh
 }
 
-cmd_push() {
+push_code() {
   echo "==> push code to $HOST:$REMOTE_DIR"
   local untracked
   untracked=$(git ls-files --others --exclude-standard -- backend frontend deploy models compose.prod.yaml)
@@ -55,7 +56,10 @@ cmd_push() {
     find . -mindepth 1 -maxdepth 1 ! -name .env ! -name dataset ! -name models -exec rm -rf {} +
     [ -d models ] && find models -mindepth 1 ! -name cubicasa-net.pkl -exec rm -rf {} + || true
     tar -x -C $REMOTE_DIR"
+}
 
+cmd_push() {
+  push_code
   if remote "test -s $REMOTE_DIR/models/cubicasa-net.pkl"; then
     echo "==> CubiCasa weights already on the server"
   elif [[ -f $WEIGHTS_SRC ]]; then
@@ -96,11 +100,22 @@ cmd_status() {
   fi
 }
 
+cmd_ci() {
+  # The server must have been set up once from a laptop (`all`): CI never sends secrets or weights.
+  remote "test -s $REMOTE_DIR/.env && test -s $REMOTE_DIR/models/cubicasa-net.pkl" ||
+    { echo "error: $REMOTE_DIR/.env or the CubiCasa weights missing on the server: run 'deploy.sh $HOST all' once"; exit 1; }
+  push_code
+  cmd_up
+  curl -fsS -o /dev/null -m 20 --retry 12 --retry-delay 5 --retry-all-errors "https://$(site_address)" ||
+    { echo "error: site not answering after deploy"; remote "cd $REMOTE_DIR && $COMPOSE ps && $COMPOSE logs --tail 50"; exit 1; }
+}
+
 case $CMD in
   setup)  cmd_setup ;;
   push)   cmd_push ;;
   up)     cmd_up ;;
   update) cmd_push; cmd_up ;;
+  ci)     cmd_ci ;;
   all)    cmd_setup; cmd_push; cmd_up ;;
   status) cmd_status ;;
   logs)   remote "cd $REMOTE_DIR && $COMPOSE logs -f --tail 200 $*" ;;
