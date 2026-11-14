@@ -78,11 +78,23 @@ class PlanFeedbackRequest(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
+class PlanReference(BaseModel):
+    bbox: tuple[float, float, float, float]
+    item_id: str | None = None
+    label: str = "selected area"
+
+
 class PlanQuestionRequest(BaseModel):
     question: str
     history: list["ChatTurn"] = Field(default_factory=list, max_length=40)
     scale: PlanScaleCalibration | None = None
     floor_outlines: list[PlanOutline] = Field(default_factory=list, max_length=20)
+    references: list[PlanReference] = Field(default_factory=list, max_length=10)
+
+
+class BuildingQuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    floors: list[dict[str, str]] = Field(min_length=1, max_length=20)
 
 
 class ChatTurn(BaseModel):

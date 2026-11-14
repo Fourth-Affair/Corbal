@@ -35,7 +35,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
-PROMPT_VERSION = "18"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "19"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
@@ -77,6 +77,16 @@ Scope:
 Use the prior conversation to resolve follow-up references (for example, "what about the kitchen?"). Treat the
 latest question as the request to answer. Prior assistant replies are context only; verify plan facts with tools.
 
+When the request includes user-selected drawing locations, treat them as strong spatial context. For a clicked item
+(a reference with an item id), use it as the example object and its category/type to resolve "this" or "like this";
+do not treat its small box as a region to count within. For a dragged rectangle, use its pixel bounds to constrain
+the answer. If the rectangle contains no matching detected evidence, say that clearly instead of guessing what the
+drawing depicts.
+For a count constrained to a selected rectangle, call count_items_in_area with the supplied rectangle coordinates,
+category, and type. If the user states a per-item assumption (for example, one bed per bedroom), count the relevant
+rooms in that rectangle and apply the stated assumption; make clear that this is an estimate from detected rooms,
+not a count of furniture drawn in the plan.
+
 Rules:
 - Never count, add, subtract or estimate yourself. Use a calculation tool for derived quantities; every numeric answer
   must exactly match a tool result. Separate quantities that are measured from assumptions such as waste allowance.
@@ -86,6 +96,8 @@ Rules:
   Deciding which of two tool numbers is larger ("are there more X than Y?") needs no tool: answer yes or no.
 - For a whole-plan count that matches a count_template template, use count_template (it is calibrated); do not
   count raw items from list_items for those.
+- For any count restricted to a user-selected rectangle, use count_items_in_area instead of count_template, since the
+  template counts the whole plan.
 - "Is there a ...?" questions about something count_template covers: answer from count_template only (yes if its
   value > 0, no if 0), even if raw items suggest otherwise; mention low confidence if reported.
 - For a question restricted to a room or area (e.g. "sinks in the kitchen"), find the room with
@@ -106,6 +118,12 @@ Rules:
   detection; when it supports the answer, make clear that the result uses a user correction.
 - If a user calibration is supplied with the latest question, treat the drawing scale as known and never say it is
   missing. A scale can support measurements, but it does not by itself establish room boundaries or floor area.
+- When no user calibration is supplied, do not silently treat an inferred scale as a reliable default. For questions
+  about real-world lengths, areas, or quantities that depend on them, clearly say that the user has not calibrated the
+  drawing and proactively invite them to set the scale using a known distance on the plan. You may still give a result
+  supported by areas printed on the drawing, but identify it as derived from those labels and recommend calibration
+  for reliable measurements. A symbol-based scale is only a rough estimate; never present it as measured. Keep this
+  reminder brief and relevant to metric questions, not unrelated counts or layout questions.
 - Finish by calling final_answer exactly once:
   value = the number (omit for yes/no or text answers and use text instead);
   cited_ids = ids of the items that support the answer, taken from tool results (for count_template: its

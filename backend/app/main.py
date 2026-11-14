@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, Response
 
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
+from app.models import (Answer, AskRequest, BuildingQuestionRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
                         PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest, PlanScale,
                         PlanScaleCalibration)
 from app.router import route
@@ -788,12 +788,26 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
                 detail="I couldn't load the saved plan just now. Your question is still in the chat; please try again in a moment.",
             ) from error
         raise
-    question = req.question.casefold()
-    area_question = any(term in question for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
+    original_question = req.question
+    if req.references:
+        refs = []
+        for index, reference in enumerate(req.references, 1):
+            x0, y0, x1, y1 = reference.bbox
+            refs.append(f"reference {index}: {reference.label}" +
+                        (f" (detected item id {reference.item_id})" if reference.item_id else "") +
+                        f", image pixel rectangle x={x0:.0f}..{x1:.0f}, y={y0:.0f}..{y1:.0f}")
+        req.question += "\n\nThe user pointed to these location(s) on the drawing: " + "; ".join(refs) + ". Use them to resolve phrases such as this/these/here and focus the answer on the selected location."
+    question = original_question.casefold()
+    if not req.references and re.search(r"\b(in|inside|within) (this|that|the selected) area\b", question):
+        return Answer(answer=None, confidence="not_found", clarification_needed=True,
+                      explanation="Select the area on the drawing with Refer to drawing, then ask again so I can limit the count to that part of the plan.")
+    area_question = any(term in question for term in ("size", "how large", "how big", "square metre", "square meter", "square foot", "square feet", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter", "area estimate", "area of", "calculate area", "what is the area"))
+    if not req.references and re.search(r"\barea\b", question) and not re.search(r"\bhow many\b", question):
+        area_question = True
     # Short follow-ups inherit a room-area context from the most recent user turn.
     # Keep this deliberately narrow so an old topic in a long conversation cannot
     # turn a new, unrelated size question into an area calculation.
-    if not area_question and re.search(r"\b(it|that|this|there|its|their)\b", question):
+    if not area_question and not req.references and re.search(r"\b(it|that|this|there|its|their)\b", question):
         for turn in reversed(req.history):
             if turn.role == "user":
                 earlier = turn.text.casefold()
@@ -887,6 +901,39 @@ def _template_answer(question: str, graph) -> Answer:
     if template is None:
         return Answer(answer=None, confidence="not_found", explanation="This question type is not supported yet.")
     return count(graph, template)
+
+
+@app.post("/api/buildings/ask")
+def ask_building(req: BuildingQuestionRequest) -> dict:
+    """Answer count questions across independently analyzed floors, with a per-floor breakdown."""
+    results: list[tuple[str, Answer]] = []
+    graphs: list[PlanGraph] = []
+    for floor in req.floors:
+        try:
+            plan_id = UUID(floor["id"])
+        except (KeyError, ValueError):
+            raise HTTPException(status_code=400, detail="Each floor needs a valid plan id") from None
+        graph = _saved_graph(plan_id)
+        if graph is None:
+            raise HTTPException(status_code=409, detail=f"{floor.get('name', 'A floor')} is still being analyzed")
+        graph = _apply_corrections(graph, _corrections_request(plan_id) or [])
+        graphs.append(graph)
+        results.append((floor.get("name", "Floor"), _template_answer(req.question, graph)))
+
+    floor_results = [{"id": floor["id"], "name": floor.get("name", "Floor"),
+                      "answer": result.answer, "unit": result.unit, "confidence": result.confidence,
+                      "explanation": result.explanation, "citations": [item.model_dump(mode="json") for item in result.citations],
+                      "width": graph.width, "height": graph.height}
+                     for floor, (_, result), graph in zip(req.floors, results, graphs)]
+    if any(result.answer is None or not isinstance(result.answer, (int, float)) for _, result in results):
+        detail = "; ".join(f"{name}: {result.explanation}" for name, result in results if result.answer is None)
+        return {"answer": None, "confidence": "not_found", "explanation": detail or "This question cannot yet be combined across floors.", "floors": floor_results}
+    total = sum(result.answer for _, result in results)
+    breakdown = "; ".join(f"{name}: {result.answer}" for name, result in results)
+    confidence = "low" if any(result.confidence == "low" for _, result in results) else "medium"
+    return {"answer": total, "unit": results[0][1].unit, "confidence": confidence,
+            "explanation": f"Across {len(results)} selected floors ({breakdown}). Evidence is highlighted on each plan below.",
+            "floors": floor_results}
 
 
 @app.post("/api/ask")
