@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import time
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -97,13 +98,21 @@ def _knowledge_request(plan_id: UUID, method: str = "GET", body: dict | None = N
         headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
     data = json.dumps(body).encode() if body is not None else None
     request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_knowledge?{query}", data=data, headers=headers, method=method)
-    try:
-        with urlopen(request, timeout=20) as response:
-            return json.loads(response.read()) if response.status != 204 and response.headers.get("Content-Length") != "0" else None
-    except HTTPError as error:
-        raise HTTPException(status_code=502, detail="Supabase plan knowledge request failed") from error
-    except (URLError, TimeoutError) as error:
-        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=20) as response:
+                return json.loads(response.read()) if response.status != 204 and response.headers.get("Content-Length") != "0" else None
+        except HTTPError as error:
+            if error.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.25 * (2 ** attempt))
+                continue
+            raise HTTPException(status_code=502, detail="Supabase plan knowledge request failed") from error
+        except (URLError, TimeoutError, ConnectionError) as error:
+            if attempt == 2:
+                raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+            # Supabase occasionally closes an otherwise healthy connection. Retry brief transport
+            # failures before surfacing an error to the user.
+            time.sleep(0.25 * (2 ** attempt))
 
 
 def _saved_graph(plan_id: UUID) -> PlanGraph | None:
@@ -446,19 +455,36 @@ def get_plan_image(plan_id: UUID) -> Response:
 @app.post("/api/plans/{plan_id}/analyze", response_model=PlanGraph)
 def analyze_plan(plan_id: UUID) -> PlanGraph:
     """Download the uploaded source file from Supabase and analyze it (image pipeline, or the PDF parser)."""
-    if graph := _saved_graph(plan_id):
+    request_started = time.perf_counter()
+    stage_times: dict[str, float] = {}
+
+    def timed(stage: str, operation):
+        started = time.perf_counter()
+        try:
+            return operation()
+        finally:
+            stage_times[stage] = time.perf_counter() - started
+
+    def finish(graph: PlanGraph, cache_hit: bool = False) -> PlanGraph:
+        log.info("plan analysis timing plan_id=%s source=%s cache_hit=%s stages_s=%s total_s=%.3f",
+                 plan_id, graph.source, cache_hit,
+                 {name: round(seconds, 3) for name, seconds in stage_times.items()},
+                 time.perf_counter() - request_started)
         return graph
-    image_bytes = _download_source(plan_id)
+
+    if graph := timed("saved_graph_lookup", lambda: _saved_graph(plan_id)):
+        return finish(graph, cache_hit=True)
+    image_bytes = timed("source_download", lambda: _download_source(plan_id))
     if _is_pdf_bytes(image_bytes):  # vector PDF: deterministic parser, coordinates in PDF points
         from app.pdfplan.answer import plan_graph
 
         try:
-            graph = plan_graph(str(_upload_pdf(plan_id, image_bytes)), image=f"uploads/{plan_id}.pdf")
+            graph = timed("pdf_parse", lambda: plan_graph(str(_upload_pdf(plan_id, image_bytes)), image=f"uploads/{plan_id}.pdf"))
         except Exception as error:  # noqa: BLE001  unreadable or encrypted PDF
             raise HTTPException(status_code=422, detail=f"Uploaded PDF could not be read: {error}") from error
-        _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
-        _store_geometry_safely(plan_id, graph)
-        return graph
+        timed("knowledge_persist", lambda: _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")}))
+        timed("geometry_store", lambda: _store_geometry_safely(plan_id, graph))
+        return finish(graph)
 
     # Use the real uploaded image with the existing image-only detector pipeline. A plan-specific
     # cache key prevents unrelated uploads from sharing feature files.
@@ -470,20 +496,23 @@ def analyze_plan(plan_id: UUID) -> PlanGraph:
     cache_key = f"uploads/{plan_id}.png"
     cache_path = CACHE_DIR / cache_key
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    def prepare_image():
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            image.verify()
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            image.save(cache_path, format="PNG")
+        except (UnidentifiedImageError, OSError) as error:
+            raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
+
+    timed("image_decode_and_cache", prepare_image)
     try:
-        image = Image.open(io.BytesIO(image_bytes))
-        image.verify()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image.save(cache_path, format="PNG")
-    except (UnidentifiedImageError, OSError) as error:
-        raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
-    try:
-        graph = graph_from_image(cache_key, cache_path)
+        graph = timed("image_pipeline", lambda: graph_from_image(cache_key, cache_path))
     except FileNotFoundError as error:
         raise HTTPException(status_code=503, detail=f"Plan analysis models are unavailable: {error}") from error
-    _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
-    _store_geometry_safely(plan_id, graph)
-    return graph
+    timed("knowledge_persist", lambda: _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")}))
+    timed("geometry_store", lambda: _store_geometry_safely(plan_id, graph))
+    return finish(graph)
 
 
 # ---------------------------------------------------------------- plan geometry (rooms, walls, openings)
@@ -619,7 +648,15 @@ def get_plan_geometry(plan_id: UUID, uncertain: bool = Query(True, description="
 @app.post("/api/plans/{plan_id}/ask", response_model=Answer)
 def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     """Answer a question using the analysis saved for this plan in Supabase."""
-    graph = _saved_graph(plan_id)
+    try:
+        graph = _saved_graph(plan_id)
+    except HTTPException as error:
+        if error.status_code == 502:
+            raise HTTPException(
+                status_code=503,
+                detail="I couldn't load the saved plan just now. Your question is still in the chat; please try again in a moment.",
+            ) from error
+        raise
     if graph is None:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
     graph = _apply_corrections(graph, _corrections_request(plan_id) or [])

@@ -95,6 +95,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .chat-message.assistant { margin-right: auto; background: #f4f5f3; color: #46534a; }
 .chat-message span { display: block; margin-bottom: 4px; color: #829087; font-size: 10px; font-weight: 700; }
 .chat-message p { margin: 0; }
+.answer-confidence { display: block; margin-top: 5px; color: #8a6b36; font-size: 10px; }
 .answer-feedback { margin-top: 7px; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
 .answer-feedback button { padding: 4px 7px; border: 1px solid #e2e8e2; border-radius: 5px; background: #fff; color: #7b867d; font: inherit; font-size: 9px; cursor: pointer; }
 .answer-feedback button:hover { border-color: #a9c2ad; color: #385b43; }

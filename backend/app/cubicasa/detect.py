@@ -8,6 +8,8 @@ counting:    per-template fusion models (app.cubicasa.fit) over the evidence fea
 """
 
 import json
+import logging
+import time
 from functools import lru_cache
 
 import joblib
@@ -28,6 +30,7 @@ ICON_ITEMS = {"window": ("window", ""), "door": ("door", ""), "toilet": ("fixtur
               "sink": ("fixture", "sink"), "bathtub": ("fixture", "bathtub"), "sauna_bench": ("fixture", "sauna_bench")}
 ROOM_ITEMS = {"bedroom": "bedroom", "bath": "bathroom", "kitchen": "kitchen", "living": "living",
               "outdoor": "balcony", "entry": "entry", "storage": "storage", "garage": "garage"}
+log = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -207,20 +210,35 @@ def room_outline_candidates(rel: str) -> list[PlanOutline]:
 
 
 def graph_from_image(rel: str, path) -> PlanGraph:
-    img = Image.open(path).convert("RGB")
-    compute(rel, img)  # cached perception outputs
-    f = image_features(rel)
-    dets = symdet.detect(rel, img) if symdet.available() else None
+    started = time.perf_counter()
+    stages: dict[str, float] = {}
+
+    def timed(stage, operation):
+        stage_started = time.perf_counter()
+        try:
+            return operation()
+        finally:
+            stages[stage] = time.perf_counter() - stage_started
+
+    img = timed("image_load", lambda: Image.open(path).convert("RGB"))
+    timed("perception", lambda: compute(rel, img))  # cached perception outputs
+    f = timed("feature_extraction", lambda: image_features(rel))
+    dets = timed("symbol_detection", lambda: symdet.detect(rel, img) if symdet.available() else None)
     if dets is not None:
         f.update(symdet.det_features(dets))
     elif _bundle().get("symdet"):
         raise FileNotFoundError("fusion models need the symbol detector (models/symbol-det.onnx)")
     counts = {}
-    for t, spec in _fusion().items():
-        X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
-        counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
-    with np.load(feature_paths(rel)[0]) as z:
-        floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
+    def predict_counts():
+        for t, spec in _fusion().items():
+            X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
+            counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
+    timed("count_prediction", predict_counts)
+
+    def find_outlines():
+        with np.load(feature_paths(rel)[0]) as z:
+            return _floor_outline_candidates(z["rooms"], z["rooms_conf"])
+    floor_outlines = timed("floor_outlines", find_outlines)
     floor_items = []
     for outline in floor_outlines:
         xs, ys = zip(*outline.polygon)
@@ -231,6 +249,9 @@ def graph_from_image(rel: str, path) -> PlanGraph:
             polygon=outline.polygon,
             score=outline.score,
         ))
-    items = _evidence(rel, dets) + floor_items
-    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
-                     counts=counts, floor_outlines=floor_outlines)
+    items = timed("evidence_assembly", lambda: _evidence(rel, dets) + floor_items)
+    graph = timed("graph_build", lambda: PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
+                                                    counts=counts, floor_outlines=floor_outlines))
+    log.info("image analysis timing image=%s stages_s=%s total_s=%.3f", rel,
+             {name: round(seconds, 3) for name, seconds in stages.items()}, time.perf_counter() - started)
+    return graph
