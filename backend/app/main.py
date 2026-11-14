@@ -7,7 +7,9 @@ import os
 import re
 import threading
 import time
-from contextlib import asynccontextmanager
+from collections import OrderedDict
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -73,6 +75,11 @@ ANALYSIS_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("ANALYSIS_QUEUE_TIMEOUT",
 # peak memory (both networks' buffers at once). See "Analysis speed" in CLAUDE.md.
 PARALLEL_WALLS = os.environ.get("PARALLEL_WALLS", "0") != "0"
 _analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+_plan_locks: dict[UUID, list] = {}
+_plan_locks_guard = threading.Lock()
+_saved_graph_cache: OrderedDict[UUID, PlanGraph] = OrderedDict()
+_saved_graph_cache_lock = threading.Lock()
+_SAVED_GRAPH_CACHE_SIZE = 32
 # Uploads are analysed by background jobs (POST /analyze -> poll GET /analysis); one pool worker per slot.
 _jobs = AnalysisJobs(lambda plan_id: _analyze_plan(plan_id), workers=MAX_CONCURRENT_ANALYSES, ready=_models_ready)
 
@@ -232,22 +239,46 @@ def _persist_graph(plan_id: UUID, graph: PlanGraph) -> None:
         _cache_graph(plan_id, graph)
     except OSError as error:
         log.warning("plan %s: could not save local analysis cache (%s)", plan_id, error)
+    _remember_saved_graph(plan_id, graph)
     try:
         _knowledge_request(plan_id, "POST", {"plan_id": str(plan_id), "graph": graph.model_dump(mode="json")})
     except HTTPException as error:
         log.warning("plan %s: analysis saved locally; Supabase persistence failed (%s)", plan_id, error.detail)
 
 
+def _remember_saved_graph(plan_id: UUID, graph: PlanGraph) -> None:
+    with _saved_graph_cache_lock:
+        _saved_graph_cache[plan_id] = graph.model_copy(deep=True)
+        _saved_graph_cache.move_to_end(plan_id)
+        while len(_saved_graph_cache) > _SAVED_GRAPH_CACHE_SIZE:
+            _saved_graph_cache.popitem(last=False)
+
+
+def _cached_saved_graph(plan_id: UUID) -> PlanGraph | None:
+    with _saved_graph_cache_lock:
+        graph = _saved_graph_cache.get(plan_id)
+        if graph is None:
+            return None
+        _saved_graph_cache.move_to_end(plan_id)
+        return graph.model_copy(deep=True)
+
+
 def _saved_graph(plan_id: UUID) -> PlanGraph | None:
+    if graph := _cached_saved_graph(plan_id):
+        return graph
     try:
         rows = _knowledge_request(plan_id)
     except HTTPException:
         if graph := _read_cached_graph(plan_id):
             log.warning("plan %s: serving cached analysis while Supabase is unavailable", plan_id)
+            _remember_saved_graph(plan_id, graph)
             return graph
         raise
     if not rows:
-        return _read_cached_graph(plan_id)
+        graph = _read_cached_graph(plan_id)
+        if graph is not None:
+            _remember_saved_graph(plan_id, graph)
+        return graph
     try:
         graph = PlanGraph.model_validate(rows[0]["graph"])
         if graph.source == "model":
@@ -273,6 +304,7 @@ def _saved_graph(plan_id: UUID) -> PlanGraph | None:
             _cache_graph(plan_id, graph)
         except OSError as error:
             log.warning("plan %s: could not refresh local analysis cache (%s)", plan_id, error)
+        _remember_saved_graph(plan_id, graph)
         return graph
     except (KeyError, ValueError) as error:
         raise HTTPException(status_code=500, detail="Saved plan analysis is invalid") from error
@@ -426,6 +458,18 @@ def get_plan_scale(plan_id: UUID) -> dict | None:
 
 @app.put("/api/plans/{plan_id}/scale")
 def save_plan_scale(plan_id: UUID, calibration: dict) -> dict:
+    if "accepted_m_per_px" in calibration:
+        try:
+            m_per_px = float(calibration["accepted_m_per_px"])
+            source = calibration["accepted_source"]
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="Provide the detected scale and its source") from None
+        if m_per_px <= 0 or source not in ("dimensions", "written_areas"):
+            raise HTTPException(status_code=422, detail="Detected scale must be positive and come from dimensions or written areas")
+        get_plan(plan_id)  # ensure this plan exists before writing its confirmation
+        return _scale_request(plan_id, "PUT", {"plan_id": str(plan_id), "points": None, "distance": None,
+                                                   "unit": None, "accepted_m_per_px": m_per_px,
+                                                   "accepted_source": source})
     try:
         points = calibration["points"]
         x1, y1 = (float(value) for value in points[0])
@@ -448,7 +492,8 @@ def _scale_request(plan_id: UUID, method: str = "GET", body: dict | None = None)
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not supabase_url or not service_key:
         raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
-    query = urlencode({"on_conflict": "plan_id"}) if method == "PUT" else urlencode({"plan_id": f"eq.{plan_id}", "select": "points,distance,unit"})
+    query = urlencode({"on_conflict": "plan_id"}) if method == "PUT" else urlencode(
+        {"plan_id": f"eq.{plan_id}", "select": "points,distance,unit,accepted_m_per_px,accepted_source"})
     headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
     if method == "PUT":
         headers["Prefer"] = "resolution=merge-duplicates,return=representation"
@@ -787,6 +832,10 @@ def with_metrics(geometry: PlanGeometry, calibration: PlanScaleCalibration | Non
     written room areas; geometry.scale says which one was used."""
     if calibration and (m := _metres_per_unit(calibration)):
         geometry.scale = PlanScale(m_per_px=m, source="calibration")
+    elif not calibration:
+        accepted = _saved_detected_scale(geometry.image)
+        if accepted:
+            geometry.scale = PlanScale(m_per_px=accepted["accepted_m_per_px"], source=accepted["accepted_source"])
     if geometry.scale:
         m = geometry.scale.m_per_px
         for room in geometry.rooms:
@@ -820,6 +869,28 @@ def _saved_scale(plan_id: UUID) -> PlanScaleCalibration | None:
         return PlanScaleCalibration.model_validate(row) if row else None
     except (HTTPException, ValueError):
         return None
+
+
+def _saved_detected_scale(image: str) -> dict | None:
+    """A user-confirmed OCR scale is trusted for measurements, unlike an unconfirmed estimate."""
+    try:
+        plan_id = UUID(Path(image).stem)
+        row = _scale_request(plan_id)
+        if row and row.get("accepted_m_per_px") and row.get("accepted_source"):
+            return row
+    except (HTTPException, ValueError):
+        pass
+    return None
+
+
+def _saved_detected_scale_for_plan(plan_id: UUID) -> dict | None:
+    try:
+        row = _scale_request(plan_id)
+        if row and row.get("accepted_m_per_px") and row.get("accepted_source"):
+            return row
+    except HTTPException:
+        pass
+    return None
 
 
 @app.get("/api/plans/{plan_id}/geometry", response_model=PlanGeometry)
@@ -901,11 +972,10 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     area_question = any(term in question for term in ("size", "how large", "how big", "square metre", "square meter", "square foot", "square feet", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter", "area estimate", "area of", "calculate area", "what is the area"))
     if not req.references and re.search(r"\barea\b", question) and not re.search(r"\bhow many\b", question):
         area_question = True
-    # Short follow-ups inherit a room-area context from the most recent user turn.
-    # Keep this deliberately narrow so an old topic in a long conversation cannot
-    # turn a new, unrelated size question into an area calculation.
+    # Short measurement follow-ups inherit the most recent explicit room reference.
+    # Ignore intervening assistant turns and generic user turns such as "what is it?".
     if not area_question and not req.references and re.search(r"\b(it|that|this|there|its|their)\b", question):
-        for turn in reversed(req.history):
+        for turn in reversed(req.history[-8:]):
             if turn.role == "user":
                 earlier = turn.text.casefold()
                 area_question = any(term in earlier for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²"))

@@ -62,7 +62,7 @@ type PlanGeometry = {
   // the plan's own scale: printed dimension figures (with the segments they label) or areas written in the rooms
   scale?: {
     m_per_px: number;
-    source: "calibration" | "written_areas" | "dimensions";
+    source: "calibration" | "written_areas" | "dimensions" | "symbols";
     warning?: string | null;
     rooms?: string[];
     dimensions?: Array<{ text: string; value_mm: number; p0: [number, number]; p1: [number, number] }>;
@@ -197,6 +197,22 @@ function linkRoomBoundaries(items: EvidenceItem[], outlines: FloorOutline[]) {
   });
 }
 
+type CachedFloorView = {
+  plan: PlanRecord;
+  imageBlob: Blob;
+  scale: ScaleCalibration | null;
+  detectedScaleAccepted: boolean;
+  imageSize: { width: number; height: number };
+  evidenceItems: EvidenceItem[];
+  floorOutlines: FloorOutline[];
+  savedOutlines: FloorOutline[];
+  correctionEvents: Array<{ action: string }>;
+  geometry?: PlanGeometry | null;
+};
+const floorViewCache = new Map<string, CachedFloorView>();
+const FLOOR_VIEW_CACHE_MAX_ITEMS = 4;
+const FLOOR_VIEW_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+
 export default function PlanPage({ params }: { params: Promise<{ planId: string }> }) {
   const [planId, setPlanId] = useState("");
   const [plan, setPlan] = useState<PlanRecord | null>(null);
@@ -217,6 +233,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
   const [citations, setCitations] = useState<PlanCitation[]>([]);
   const [scale, setScale] = useState<ScaleCalibration | null>(null);
+  const [detectedScaleAccepted, setDetectedScaleAccepted] = useState(false);
+  const [detectedScaleSaving, setDetectedScaleSaving] = useState(false);
   const [scaleLoaded, setScaleLoaded] = useState(false);
   const [scaleMode, setScaleMode] = useState(false);
   const [measureMode, setMeasureMode] = useState(false);
@@ -328,6 +346,12 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   // Room geometry once the analysis is ready; refetched when the scale changes (areas in m² depend on it)
   useEffect(() => {
     if (!ready || !planId) return;
+    const cachedView = floorViewCache.get(planId);
+    if (cachedView?.geometry) {
+      setGeometry(cachedView.geometry);
+      setGeometryError(null);
+      return;
+    }
     let cancelled = false;
     void (async () => {
       try {
@@ -347,6 +371,11 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           const linkedItems = linkRoomBoundaries(evidenceItemsRef.current, roomOutlines);
           evidenceItemsRef.current = linkedItems;
           setEvidenceItems(linkedItems);
+          const currentView = floorViewCache.get(planId);
+          if (currentView) {
+            currentView.geometry = body;
+            currentView.evidenceItems = linkedItems;
+          }
         }
       } catch (geometryLoadError) {
         if (!cancelled) setGeometryError(geometryLoadError instanceof Error ? geometryLoadError.message : "Rooms could not be loaded");
@@ -362,12 +391,63 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
 
   useEffect(() => {
     let objectUrl: string | null = null;
+    let imageBlob: Blob | null = null;
+    let loadedScale: ScaleCalibration | null = null;
+    let loadedDetectedScaleAccepted = false;
     let cancelled = false;
     void params.then(async ({ planId: id }) => {
       setPlanId(id);
+      setError(null);
+      setReady(false);
+      setPlan(null);
+      setImageUrl(null);
+      setImageSize(null);
+      setGeometry(null);
+      setCitations([]);
+      setScale(null);
+      setDetectedScaleAccepted(false);
+      setScaleLoaded(false);
+      setScaleMode(false);
+      setMeasureMode(false);
+      setOutlineMode(false);
+      setReferenceMode(false);
+      setCorrectionMode(false);
       const uploadError = new URLSearchParams(window.location.search).get("uploadError");
       if (uploadError) {
         setError(uploadError);
+        return;
+      }
+      const cachedView = floorViewCache.get(id);
+      if (cachedView) {
+        setError(null);
+        setPlan(cachedView.plan);
+        const floors = JSON.parse(localStorage.getItem("junc-building-floors") || "[]") as BuildingFloor[];
+        const currentFloor = { id, name: cachedView.plan.metadata?.filename ?? "Floor plan" };
+        const nextFloors = floors.some(floor => floor.id === id) ? floors : [...floors, currentFloor];
+        setBuildingFloors(nextFloors);
+        localStorage.setItem("junc-building-floors", JSON.stringify(nextFloors));
+        setScale(cachedView.scale);
+          setDetectedScaleAccepted(cachedView.detectedScaleAccepted);
+        setScaleLoaded(true);
+        if (cachedView.scale) {
+          setScalePoints(cachedView.scale.points);
+          setScaleUnit(cachedView.scale.unit);
+        } else {
+          setScalePoints([]);
+          setScaleUnit("m");
+        }
+        setImageSize(cachedView.imageSize);
+        setEvidenceItems(cachedView.evidenceItems);
+        evidenceItemsRef.current = cachedView.evidenceItems;
+        setFloorOutlines(cachedView.floorOutlines);
+        setSavedOutlines(cachedView.savedOutlines);
+        roomBoundaryLinkRef.current = roomBoundaryLinks(cachedView.evidenceItems, [...cachedView.floorOutlines, ...cachedView.savedOutlines]);
+        setCorrectionEvents(cachedView.correctionEvents);
+        setGeometry(cachedView.geometry ?? null);
+        objectUrl = URL.createObjectURL(cachedView.imageBlob);
+        setImageUrl(objectUrl);
+        setAnalysisStatus("Loaded saved floor analysis");
+        setReady(true);
         return;
       }
       try {
@@ -397,6 +477,9 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           const savedScale = await fetch(`/api/plans/${encodeURIComponent(id)}/scale`, { cache: "no-store" });
           if (savedScale.ok) {
             const saved = await savedScale.json();
+            loadedScale = saved?.points?.length === 2 ? saved : null;
+            loadedDetectedScaleAccepted = Boolean(saved?.accepted_m_per_px);
+            setDetectedScaleAccepted(loadedDetectedScaleAccepted);
             if (saved?.points?.length === 2) {
               setScale(saved);
               setScalePoints(saved.points);
@@ -414,25 +497,32 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           const body = await imageResponse.json();
           throw new Error(body.detail || "Plan image could not be loaded");
         }
-        objectUrl = URL.createObjectURL(await imageResponse.blob());
+        imageBlob = await imageResponse.blob();
+        objectUrl = URL.createObjectURL(imageBlob);
         if (!cancelled) {
           setImageUrl(objectUrl);
           setAnalysisStatus("Image ready · Analyzing floor plan…");
           try {
             const result: any = await runAnalysis(id, () => cancelled, status => { if (!cancelled) setAnalysisStatus(status); });
             if (!cancelled) {
+              let cachedEvidence: EvidenceItem[] = Array.isArray(result.items) ? result.items : [];
+              let cachedFloorOutlines: FloorOutline[] = Array.isArray(result.floor_outlines) ? result.floor_outlines : [];
+              let cachedSavedOutlines: FloorOutline[] = [];
+              let cachedCorrectionEvents: Array<{ action: string }> = [];
               if (result.width && result.height) setImageSize({ width: result.width, height: result.height });
-              setEvidenceItems(Array.isArray(result.items) ? result.items : []);
-              evidenceItemsRef.current = Array.isArray(result.items) ? result.items : [];
-              setFloorOutlines(Array.isArray(result.floor_outlines) ? result.floor_outlines : []);
+              setEvidenceItems(cachedEvidence);
+              evidenceItemsRef.current = cachedEvidence;
+              setFloorOutlines(cachedFloorOutlines);
               try {
                 const correctionResponse = await fetch(`/api/plans/${encodeURIComponent(id)}/corrections`, { cache: "no-store" });
                 if (correctionResponse.ok) {
                   const corrections = await correctionResponse.json();
                   const correctedItems = Array.isArray(corrections.items) ? corrections.items : result.items ?? [];
+                  cachedEvidence = correctedItems;
+                  cachedCorrectionEvents = Array.isArray(corrections.events) ? corrections.events : [];
                   setEvidenceItems(correctedItems);
                   evidenceItemsRef.current = correctedItems;
-                  setCorrectionEvents(Array.isArray(corrections.events) ? corrections.events : []);
+                  setCorrectionEvents(cachedCorrectionEvents);
                 }
               } catch { /* Keep the plan usable if correction history is temporarily unavailable. */ }
               try {
@@ -441,14 +531,31 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                   const outlineData = await outlineResponse.json();
                   const candidates = Array.isArray(outlineData.candidates) ? outlineData.candidates : [];
                   const saved = Array.isArray(outlineData.saved) ? outlineData.saved.map((outline: FloorOutline) => ({ ...outline, decision: outline.decision ?? "accepted" })) : [];
+                  cachedFloorOutlines = candidates;
+                  cachedSavedOutlines = saved;
                   setFloorOutlines(candidates);
                   setSavedOutlines(saved);
                   roomBoundaryLinkRef.current = roomBoundaryLinks(evidenceItemsRef.current, [...candidates, ...saved]);
                   const linkedItems = linkRoomBoundaries(evidenceItemsRef.current, [...candidates, ...saved]);
+                  cachedEvidence = linkedItems;
                   evidenceItemsRef.current = linkedItems;
                   setEvidenceItems(linkedItems);
                 }
               } catch { /* Keep the scanned plan usable if saved outlines are temporarily unavailable. */ }
+              if (imageBlob && result.width && result.height) {
+                const cachedView: CachedFloorView = {
+                  plan: record!, imageBlob, scale: loadedScale, detectedScaleAccepted: loadedDetectedScaleAccepted, imageSize: { width: result.width, height: result.height },
+                  evidenceItems: cachedEvidence, floorOutlines: cachedFloorOutlines, savedOutlines: cachedSavedOutlines,
+                  correctionEvents: cachedCorrectionEvents,
+                };
+                floorViewCache.set(id, cachedView);
+                const cachedBytes = () => [...floorViewCache.values()].reduce((sum, view) => sum + view.imageBlob.size, 0);
+                while (floorViewCache.size > FLOOR_VIEW_CACHE_MAX_ITEMS || cachedBytes() > FLOOR_VIEW_CACHE_MAX_BYTES) {
+                  const oldest = floorViewCache.keys().next().value;
+                  if (!oldest) break;
+                  floorViewCache.delete(oldest);
+                }
+              }
               setAnalysisStatus("Floor plan ready");
               setReady(true);
             }
@@ -484,6 +591,12 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       setEvidenceItems(updatedItems);
       evidenceItemsRef.current = updatedItems;
       setCorrectionEvents(result.events ?? []);
+      const cachedView = floorViewCache.get(planId);
+      if (cachedView) {
+        cachedView.evidenceItems = updatedItems;
+        cachedView.correctionEvents = result.events ?? [];
+        cachedView.geometry = null;
+      }
       if (action === "update" && item?.category === "room") {
         const linkedOutlines = getAllRoomOutlines();
         const linkedId = itemId ? roomBoundaryLinkRef.current[itemId] : undefined;
@@ -508,6 +621,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           const outlineResult = await outlineResponse.json();
           if (!outlineResponse.ok) throw new Error(outlineResult.detail || "Room type saved, but its outline could not be updated");
           setSavedOutlines(outlineResult.saved ?? next);
+          const cachedView = floorViewCache.get(planId);
+          if (cachedView) cachedView.savedOutlines = outlineResult.saved ?? next;
           setFloorOutlines(current => current.map(outline => outline.id === updatedOutline.id ? updatedOutline : outline));
           if (itemId) roomBoundaryLinkRef.current[itemId] = updatedOutline.id;
           setEvidenceItems(current => current.map(candidate => candidate.id === itemId ? { ...candidate, bbox: bounds, polygon: geometry } : candidate));
@@ -585,7 +700,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setMessages(current => [...current, { role: "user", text: submitted }]);
     setSending(true);
     try {
-      const requestBody = JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale, references: drawingReferences,
+      const recentHistory = messages.slice(-8).map(({ role, text }) => ({ role, text }));
+      const requestBody = JSON.stringify({ question: submitted, history: recentHistory, scale, references: drawingReferences,
         floor_outlines: savedOutlines.filter(outline => outline.scope !== "room" || geometry?.rooms.some(room => room.id === outline.id) || outline.id.endsWith("-user")) });
       let response: Response;
       for (let attempt = 0; ; attempt++) {
@@ -599,18 +715,28 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       if (!response.ok) throw new Error(result.detail || "Could not answer that question");
       const explanation = typeof result.explanation === "string" ? result.explanation : "";
       if (typeof result.area_scope === "string") areaScopeRef.current[submitted] = result.area_scope;
-      const needsScale = !scale && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
-      const needsOutline = Boolean(metersPerPixel) && /boundary|outline/i.test(explanation) && !hasRequiredOutline(submitted);
+      const detectedScaleAvailable = Boolean(geometry?.scale && ["dimensions", "written_areas"].includes(geometry.scale.source));
+      const measurementIntent = /\b(area|size|how big|how large|square metres?|square meters?|m²|measure|measurement|dimensions?)\b/i.test(submitted);
+      const requestedRoom = result.area_scope === "floor" ? null : getRequestedRoomType(submitted) ?? (/\b(it|that|this|its|their)\b/i.test(submitted)
+        ? [...recentHistory].reverse().filter(turn => turn.role === "user").map(turn => getRequestedRoomType(turn.text)).find(Boolean) ?? null
+        : null);
+      const areaQuestionForUI = requestedRoom ? `${submitted} ${requestedRoom.label}` : submitted;
+      const needsScale = measurementIntent && !scale && !detectedScaleAvailable && /scale|known distance/i.test(explanation) && /area|dimension|measure/i.test(explanation);
+      // A detected scale can answer area questions before the user sets a manual scale.
+      // Keep the outline review available when the server asks for a boundary.
+      const needsOutline = measurementIntent && /boundary|outline/i.test(explanation) && !hasRequiredOutline(areaQuestionForUI);
       const needsMeasurement = Boolean(scale) && /\b(measure|measurement|distance|length|width|wide|long)\b/i.test(submitted);
-      const answer = needsMeasurement
+      const answer = measurementIntent && !scale && detectedScaleAvailable && result.answer === null
+        ? `I found a possible scale of ${geometry!.scale!.m_per_px.toFixed(5)} metres per pixel. Confirm it in the scale prompt before I use it for measurements.`
+        : needsMeasurement
         ? "I can measure that on the plan. Choose the two points you want to measure, and I’ll calculate the distance."
         : needsScale
         ? "Let’s set the drawing scale first. Click the two ends of a distance you know on the plan, such as a wall with a printed measurement. Then enter that real distance and unit to calibrate the drawing."
         : needsOutline
-          ? getRequestedRoomType(submitted)
-            ? floorOutlines.some(outline => outline.scope === "room" && outline.room_type === getRequestedRoomType(submitted)?.roomType)
-              ? `I found a suggested ${getRequestedRoomType(submitted)?.label.toLowerCase()} outline. Review it, adjust it if needed, and accept it to calculate an area estimate.`
-              : `I couldn’t detect a clear ${getRequestedRoomType(submitted)?.label.toLowerCase()} outline. Draw or edit it, then accept it to calculate an area estimate.`
+          ? requestedRoom
+            ? floorOutlines.some(outline => outline.scope === "room" && outline.room_type === requestedRoom.roomType)
+              ? `I found a suggested ${requestedRoom.label.toLowerCase()} outline. Review it, adjust it if needed, and accept it to calculate an area estimate.`
+              : `I couldn’t detect a clear ${requestedRoom.label.toLowerCase()} boundary. Draw or edit the outline, then accept it to calculate an area estimate.`
             : floorOutlines.some(outline => outline.scope !== "room")
               ? "I found a suggested floor outline. Review it, adjust it if needed, and accept it to calculate an area estimate."
               : "I couldn’t detect a clear floor outline. Draw or edit it, then accept it to calculate an area estimate."
@@ -620,10 +746,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       setMessages(current => [...current, { role: "assistant", text: provisional ? `Possible answer: ${answer}` : answer, ...(provisional ? { originalText: answer } : {}), evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id), evidence: result.citations ?? [], confidence: result.confidence }]);
       setDrawingReferences([]);
       if (needsScale) {
-        setPendingAreaQuestion(submitted);
+        setPendingAreaQuestion(areaQuestionForUI);
         startScaleCalibration();
       } else if (needsOutline) {
-        setPendingAreaQuestion(submitted);
+        setPendingAreaQuestion(areaQuestionForUI);
       } else if (needsMeasurement) {
         setMeasurementRequested(true);
       }
@@ -698,7 +824,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     }
     return targetRoom
       ? savedOutlines.some(outline => outline.scope === "room" && outline.room_type === targetRoom.roomType && outline.decision !== "rejected")
-      : savedOutlines.some(outline => outline.scope !== "room" && outline.decision !== "rejected");
+      : savedOutlines.some(outline => outline.decision === "accepted");
   }
 
   function getReviewOutlines(questionText?: string) {
@@ -925,6 +1051,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not save the floor outline");
       setSavedOutlines(result.saved ?? next);
+      const cachedView = floorViewCache.get(planId);
+      if (cachedView) cachedView.savedOutlines = result.saved ?? next;
       setOutlineMode(false);
       setEditingOutlineId(null);
       if (outline.scope === "room") {
@@ -959,6 +1087,8 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not remove the outline");
       setSavedOutlines([]);
+      const cachedView = floorViewCache.get(planId);
+      if (cachedView) cachedView.savedOutlines = [];
       setOutlinePoints([]);
       setOutlineMode(false);
       setEditingOutlineId(null);
@@ -1002,6 +1132,13 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || "Could not save scale");
       setScale(result);
+      setDetectedScaleAccepted(false);
+      const cachedView = floorViewCache.get(planId);
+      if (cachedView) {
+        cachedView.scale = result;
+        cachedView.detectedScaleAccepted = false;
+        cachedView.geometry = null;
+      }
       setScaleMode(false);
       setScalePoints(result.points);
       setScaleDistance(String(result.distance));
@@ -1009,6 +1146,26 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     } catch (saveError) {
       setScaleError(saveError instanceof Error ? saveError.message : "Could not save scale");
     } finally { setScaleSaving(false); }
+  }
+
+  async function confirmDetectedScale() {
+    const detected = geometry?.scale;
+    if (!planId || !detected || !["dimensions", "written_areas"].includes(detected.source)) return;
+    setDetectedScaleSaving(true);
+    setScaleError(null);
+    try {
+      const response = await fetch(`/api/plans/${encodeURIComponent(planId)}/scale`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accepted_m_per_px: detected.m_per_px, accepted_source: detected.source }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Could not save scale confirmation");
+      setDetectedScaleAccepted(true);
+      const cachedView = floorViewCache.get(planId);
+      if (cachedView) cachedView.detectedScaleAccepted = true;
+    } catch (saveError) {
+      setScaleError(saveError instanceof Error ? saveError.message : "Could not save scale confirmation");
+    } finally { setDetectedScaleSaving(false); }
   }
 
   const pxPerUnit = scale ? Math.hypot(scale.points[1][0] - scale.points[0][0], scale.points[1][1] - scale.points[0][1]) / scale.distance : null;
@@ -1022,17 +1179,18 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       Math.hypot(scale.points[1][0] - scale.points[0][0], scale.points[1][1] - scale.points[0][1])
     : autoScale?.m_per_px ?? null;
   const areaM2 = (polygon: Array<[number, number]>) => {
-    if (!metersPerPixel || polygon.length < 3) return null;
+    const effectiveMetersPerPixel = metersPerPixel ?? (detectedScaleAccepted ? geometry?.scale?.m_per_px ?? null : null);
+    if (!effectiveMetersPerPixel || polygon.length < 3) return null;
     const pixelArea = Math.abs(polygon.reduce((sum, [x, y], index) => {
       const [nextX, nextY] = polygon[(index + 1) % polygon.length];
       return sum + x * nextY - nextX * y;
     }, 0)) / 2;
-    return pixelArea * metersPerPixel * metersPerPixel;
+    return pixelArea * effectiveMetersPerPixel * effectiveMetersPerPixel;
   };
   const acceptedArea = savedOutlines.filter(outline => outline.decision !== "rejected")
     .reduce((sum, outline) => sum + (areaM2(outline.polygon) ?? 0), 0);
   const displayOutlines = pendingAreaQuestion
-    ? getReviewOutlines(pendingAreaQuestion).filter(outline => outline.decision !== "rejected")
+    ? getReviewOutlines(pendingAreaQuestion)
     : correctionMode ? getAllRoomOutlines().filter(outline => outline.decision !== "rejected")
       : savedOutlines.filter(outline => outline.decision !== "rejected");
   const reviewedOutlines = pendingAreaQuestion ? getReviewOutlines(pendingAreaQuestion) : [];
@@ -1178,7 +1336,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
               {scaleMode && scalePoints.length > 0 && <g className="scale-mark"><line x1={scalePoints[0][0]} y1={scalePoints[0][1]} x2={(scalePoints[1] ?? scalePoints[0])[0]} y2={(scalePoints[1] ?? scalePoints[0])[1]} />{scalePoints.map(([x, y], index) => <g key={index}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measurePoints.length > 0 && <g className="scale-mark measurement-mark"><line x1={measurePoints[0][0]} y1={measurePoints[0][1]} x2={(measurePoints[1] ?? measurePoints[0])[0]} y2={(measurePoints[1] ?? measurePoints[0])[1]} />{measurePoints.map(([x, y], index) => <g className="measurement-handle" key={index} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingMeasurePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingMeasurePoint(null); }} onClick={event => event.stopPropagation()}><circle cx={x} cy={y} r="10"/><text x={x} y={y}>{index + 1}</text></g>)}</g>}
               {measuredDistance !== null && measurePoints.length === 2 && <g className="measurement-label" pointerEvents="none"><rect x={(measurePoints[0][0] + measurePoints[1][0]) / 2 - Math.max(52, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 7)} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 - 15} width={Math.max(104, `${measuredDistance.toFixed(2)} ${scale?.unit}`.length * 14)} height="30" rx="7"/><text x={(measurePoints[0][0] + measurePoints[1][0]) / 2} y={(measurePoints[0][1] + measurePoints[1][1]) / 2 + 5}>{measuredDistance.toFixed(2)} {scale?.unit}</text></g>}
-              {displayOutlines.filter(outline => outlineMode ? outline.id === editingOutlineId : outline.scope !== "room").map((outline, index) => {
+              {displayOutlines.filter(outline => outlineMode ? outline.id === editingOutlineId : pendingAreaQuestion || outline.scope !== "room").map((outline, index) => {
                 const editing = outlineMode && outline.id === editingOutlineId;
                 const polygon = editing ? outlinePoints : outline.polygon;
                 if (polygon.length < 3) return null;
@@ -1186,20 +1344,34 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 const area = areaM2(polygon);
                 const label = area !== null ? `${area.toFixed(1)} m²` : `${outline.label ?? `Room ${index + 1}`} · scale needed`;
                 const width = Math.max(104, label.length * 12);
-                return <g className={`floor-outline-mark${outline.decision === "accepted" ? " accepted" : ""}${editing ? " editing" : ""}`} key={outline.id}>
+                return <g className={`floor-outline-mark${outline.decision === "accepted" ? " accepted" : ""}${outline.decision === "rejected" ? " rejected" : ""}${editing ? " editing" : ""}`} key={outline.id}>
                   <polygon points={polygon.map(([x, y]) => `${x},${y}`).join(" ")} />
                   <g className="room-outline-label" pointerEvents="none"><rect x={labelX - width / 2} y={labelY - 18} width={width} height="36" rx="8"/><text x={labelX} y={labelY + 1}>{label}</text></g>
                   {editing && outlinePoints.map(([x, y], pointIndex) => <circle key={pointIndex} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(pointIndex); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}
                 </g>;
+              })}
+              {pendingAreaQuestion && !outlineMode && reviewedOutlines.filter(outline => outline.decision !== "accepted" && outline.polygon.length >= 3).map(outline => {
+                const [x, y] = outline.polygon.reduce(([left, top], [px, py]) => [Math.min(left, px), Math.min(top, py)], [Infinity, Infinity] as [number, number]);
+                return <foreignObject key={`review-controls-${outline.id}`} x={x + 8} y={y + 8} width="132" height="28" className="room-review-overlay">
+                  <div className="room-review-chip" onClick={event => event.stopPropagation()}>
+                    <div className="room-review-chip-actions">
+                      <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion, outline.id)}>Adjust</button>
+                      <button className="toolbar-button primary-button" type="button" disabled={outlineSaving || outline.decision === "accepted"} onClick={() => void saveOutlineDecision(outline, "accepted")}>{outline.decision === "accepted" ? "Accepted" : "Accept"}</button>
+                      <button className="toolbar-button reject-button" type="button" disabled={outlineSaving || outline.decision === "rejected"} onClick={() => void saveOutlineDecision(outline, "rejected")}>{outline.decision === "rejected" ? "Rejected" : "Reject"}</button>
+                    </div>
+                  </div>
+                </foreignObject>;
               })}
               {outlineMode && manualOutlineTarget?.scope !== "room" && outlinePoints.length >= 3 && !displayOutlines.some(outline => outline.id === editingOutlineId) && <g className="floor-outline-mark editing"><polygon points={outlinePoints.map(([x, y]) => `${x},${y}`).join(" ")} />{outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
             </svg>}{animationStage !== null && <div className="analysis-animation-caption" aria-live="polite"><strong>{["Tracing the structure", "Finding the rooms", "Spotting doors, windows & fixtures", "Analysis complete"][animationStage]}</strong><span>{["Walls are being mapped", "Rooms are taking shape", "Detected details are appearing", "Your plan is ready to explore"][animationStage]}</span></div>}{referenceMode && <div className="scale-hint">Click a detected item or drag around any area, then ask about it.</div>}{(scaleMode || measureMode) && <div className="scale-hint">{scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
+          {ready && !scale && !detectedScaleAccepted && geometry?.scale && ["dimensions", "written_areas"].includes(geometry.scale.source) && <section className="scale-form" aria-label="Confirm detected drawing scale"><div><strong>We found a drawing scale</strong><span>{geometry.scale.source === "dimensions" ? `OCR matched ${geometry.scale.dimensions?.length ?? 0} printed dimensions` : "The written room areas agree with the plan geometry"}. Estimate: {geometry.scale.m_per_px.toFixed(5)} metres per pixel{geometry.scale.warning ? ` · ${geometry.scale.warning}` : ""}. Is this right?</span></div><button className="toolbar-button primary-button" type="button" disabled={detectedScaleSaving} onClick={() => void confirmDetectedScale()}>{detectedScaleSaving ? "Saving…" : "Use this scale"}</button><button className="toolbar-button" type="button" onClick={startScaleCalibration}>Correct scale</button>{scaleError && <p role="alert">{scaleError}</p>}</section>}
           {scaleMode && scalePoints.length === 2 && <form className="scale-form" onSubmit={saveScale}><div><strong>Enter the printed distance</strong><span>Use the value shown between the points on the plan, then choose its unit.</span></div><input aria-label="Known distance" type="number" min="0.001" step="any" placeholder="Distance" value={scaleDistance} onChange={event => setScaleDistance(event.target.value)} required /><select aria-label="Distance unit" value={scaleUnit} onChange={event => setScaleUnit(event.target.value as ScaleCalibration["unit"])}><option value="m">metres</option><option value="cm">centimetres</option><option value="ft">feet</option><option value="in">inches</option></select><button className="toolbar-button primary-button" disabled={scaleSaving || !scaleDistance}>{scaleSaving ? "Saving…" : "Save scale"}</button>{scaleError && <p role="alert">{scaleError}</p>}</form>}
           {pendingAreaQuestion && <section className="room-review" aria-label="Review room areas">
             <div className="room-review-heading"><strong>Review detected {getRequestedRoomType(pendingAreaQuestion)?.label.toLowerCase() ?? "room"} areas</strong><span>Each outline is separate. Check the painted area; adjust points only where needed.</span></div>
+            {reviewedOutlines.length > 0 && <p className="room-review-placement">Use the controls placed inside each room on the plan.</p>}
             {getReviewOutlines(pendingAreaQuestion).map((outline, index) => {
               const area = areaM2(outline.polygon);
               return <article className={`room-review-row${outline.decision === "accepted" ? " is-accepted" : outline.decision === "rejected" ? " is-rejected" : ""}`} key={outline.id}>
