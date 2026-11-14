@@ -5,7 +5,7 @@ import numpy as np
 from app.cubicasa.room_types import Fixture, classify
 from app.cubicasa.rooms import scale_from_written_areas
 from app.cubicasa.wallvec import vectorise
-from app.models import RoomLabel, RoomShape
+from app.models import PlanScale, RoomLabel, RoomShape
 
 
 def lb(text, purpose, score=0.95):
@@ -70,7 +70,57 @@ def test_scale_from_two_agreeing_written_areas():
     s = scale_from_written_areas([room(1, 4000, 10.0), room(2, 6000, 15.1), room(3, 5000, 40.0)])
     assert s is not None and s.source == "written_areas" and abs(s.m_per_px - 0.05) / 0.05 < 0.01
     assert set(s.rooms) == {"space-1", "space-2"}  # the misread 40 m² is left out
-    assert scale_from_written_areas([room(1, 4000, 10.0)]) is None  # one room alone is not trusted
+    assert scale_from_written_areas([room(1, 4000, 10.0)]) is None  # one room alone, no symbol band: not trusted
+
+
+def _labelled_room(i, labels, rtype="bedroom", w=80, h=50, polygon=None):
+    from app.cubicasa.rooms import _labeled_area
+
+    poly = polygon or [(0, 0), (w, 0), (w, h), (0, h)]
+    from shapely.geometry import Polygon
+
+    return RoomShape(id=f"space-{i}", type=rtype, tier="strong", polygon=poly, bbox=(0, 0, w, h),
+                     area_px=Polygon(poly).area, labels=labels, labeled_area_m2=_labeled_area(labels))
+
+
+# 80 x 50 px room, 10.0 m² -> sqrt(10 / 4000) = 0.05 m/px; the symbol band 0.04-0.06 agrees
+_BAND = PlanScale(m_per_px=0.049, source="symbols", low=0.04, high=0.06)
+
+
+def test_single_clean_room_sets_the_scale():
+    rm = _labelled_room(1, [lb("MH", "bedroom"), lb("10,0 m2", None)])
+    s = scale_from_written_areas([rm, _labelled_room(2, [lb("OH", "living")], "living")], _BAND)
+    assert s is not None and s.source == "written_areas" and s.rooms == ["space-1"]
+    assert abs(s.m_per_px - 0.05) < 1e-9
+    bare = _labelled_room(1, [lb("MH", "bedroom"), lb("10.0", None, score=0.97)])
+    assert scale_from_written_areas([bare], _BAND) is not None  # a single bare decimal read with high confidence
+
+
+def test_single_room_needs_every_check():
+    good = [lb("MH", "bedroom"), lb("10,0 m2", None)]
+    assert scale_from_written_areas([_labelled_room(1, good)]) is None  # no symbol band to check against
+    far = PlanScale(m_per_px=0.1, source="symbols", low=0.08, high=0.12)
+    assert scale_from_written_areas([_labelled_room(1, good)], far) is None  # disagrees with door / fixture sizes
+    summed = [lb("MH", "bedroom"), lb("6.0", None), lb("4.0", None)]
+    assert scale_from_written_areas([_labelled_room(1, summed)], _BAND) is None  # two numbers summed: not one reading
+    shaky = [lb("MH", "bedroom"), lb("10.0", None, score=0.85)]
+    assert scale_from_written_areas([_labelled_room(1, shaky)], _BAND) is None  # bare decimal, OCR not sure enough
+    merged = [lb("MH", "bedroom"), lb("KEITTIÖ", "kitchen"), lb("10,0 m2", None)]
+    assert scale_from_written_areas([_labelled_room(1, merged)], _BAND) is None  # two purposes: merged rooms
+    # U-shaped outline (solidity 0.6): a space leaking around a wall end
+    u = [(0, 0), (100, 0), (100, 67), (70, 67), (70, 20), (30, 20), (30, 67), (0, 67)]
+    assert scale_from_written_areas([_labelled_room(1, good, polygon=u)], _BAND) is None
+    bath = [lb("KPH", "bathroom"), lb("10,0 m2", None)]
+    big = _labelled_room(1, [lb("KPH", "bathroom"), lb("65,0 m2", None)], "bathroom", w=204, h=160)
+    assert scale_from_written_areas([big], _BAND) is None  # 65 m² is no bathroom: a misread
+    assert scale_from_written_areas([_labelled_room(1, bath, "bathroom")], _BAND) is not None
+    # two clean rooms that disagree: one is wrong and nothing says which
+    wide = PlanScale(m_per_px=0.045, source="symbols", low=0.03, high=0.07)
+    other = _labelled_room(2, [lb("MH", "bedroom"), lb("4,6 m2", None)])  # 0.034 m/px vs 0.05: both in the band
+    assert scale_from_written_areas([_labelled_room(1, good), other], wide) is None
+    # ... but when the band rules one out, the other one sets the scale
+    s = scale_from_written_areas([_labelled_room(1, good), other], _BAND)
+    assert s is not None and s.rooms == ["space-1"]
 
 
 def test_wall_segments_of_two_rooms():
