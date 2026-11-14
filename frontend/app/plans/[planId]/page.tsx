@@ -99,6 +99,44 @@ function evidenceLabel(item: EvidenceItem, items: EvidenceItem[]) {
   return peers.length > 1 ? `${base}-${peers.indexOf(item) + 1}` : base;
 }
 
+function simplifyBoundary(points: Array<[number, number]>, maxPoints = 18): Array<[number, number]> {
+  if (points.length <= maxPoints) return points;
+  const distanceToSegment = (point: [number, number], start: [number, number], end: [number, number]) => {
+    const dx = end[0] - start[0], dy = end[1] - start[1];
+    const lengthSquared = dx * dx + dy * dy;
+    const t = lengthSquared ? Math.max(0, Math.min(1, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / lengthSquared)) : 0;
+    return Math.hypot(point[0] - (start[0] + t * dx), point[1] - (start[1] + t * dy));
+  };
+  const simplifyOpen = (path: Array<[number, number]>, tolerance: number): Array<[number, number]> => {
+    if (path.length <= 2) return path;
+    let farthest = 0, farthestIndex = 0;
+    for (let index = 1; index < path.length - 1; index++) {
+      const distance = distanceToSegment(path[index], path[0], path[path.length - 1]);
+      if (distance > farthest) { farthest = distance; farthestIndex = index; }
+    }
+    if (farthest <= tolerance) return [path[0], path[path.length - 1]];
+    return [...simplifyOpen(path.slice(0, farthestIndex + 1), tolerance).slice(0, -1), ...simplifyOpen(path.slice(farthestIndex), tolerance)];
+  };
+  let split = 1, longest = 0;
+  for (let index = 1; index < points.length; index++) {
+    const distance = Math.hypot(points[index][0] - points[0][0], points[index][1] - points[0][1]);
+    if (distance > longest) { longest = distance; split = index; }
+  }
+  const simplifyClosed = (tolerance: number) => {
+    const first = simplifyOpen(points.slice(0, split + 1), tolerance);
+    const second = simplifyOpen([...points.slice(split), points[0]], tolerance);
+    return [...first.slice(0, -1), ...second.slice(0, -1)];
+  };
+  let tolerance = 2, result = simplifyClosed(tolerance);
+  while (result.length > maxPoints && tolerance < longest) {
+    tolerance *= 1.5;
+    result = simplifyClosed(tolerance);
+  }
+  if (result.length <= maxPoints) return result;
+  const stride = result.length / maxPoints;
+  return Array.from({ length: maxPoints }, (_, index) => result[Math.floor(index * stride)]);
+}
+
 function outlineBounds(outline: FloorOutline): EvidenceItem["bbox"] {
   const xs = outline.polygon.map(([x]) => x);
   const ys = outline.polygon.map(([, y]) => y);
@@ -575,7 +613,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setManualOutlineTarget(manualTarget);
     setEditingOutlineId(manualTarget.id);
     setOutlineCandidateIndex(index);
-    setOutlinePoints((manualTarget.polygon ?? []).map(([x, y]) => [x, y]));
+    setOutlinePoints(simplifyBoundary((manualTarget.polygon ?? []).map(([x, y]) => [x, y])));
     setOutlineMode(true);
     setAddOutlinePointMode(false);
     setScaleMode(false);
@@ -903,12 +941,12 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                     <polygon points={polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ stroke: colour, fill: room.tier === "unknown" ? "none" : colour }}>
                       <title>{tooltip}</title>
                     </polygon>
-                    <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{caption}</text>
-                    {editingRoom && outlinePoints.map(([x, y], pointIndex) => <g className="room-boundary-handle" key={`corner-${pointIndex}`} transform={`translate(${x} ${y})`} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(pointIndex); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} aria-label={`Move corner ${pointIndex + 1}`}><circle className="handle-outer" r="12"/><circle className="handle-center" r="3"/></g>)}
-                    {editingRoom && outlinePoints.map(([x, y], pointIndex) => {
+                    {!editingRoom && <text x={(x0 + x1) / 2} y={(y0 + y1) / 2} style={{ fontSize }}>{caption}</text>}
+                    {editingRoom && outlinePoints.map(([x, y], pointIndex) => <g className="room-boundary-handle" key={`corner-${pointIndex}`} transform={`translate(${x} ${y})`} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(pointIndex); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} aria-label={`Move corner ${pointIndex + 1}`}><rect className="handle-outer" x="-5" y="-5" width="10" height="10" rx="2"/></g>)}
+                    {editingRoom && addOutlinePointMode && outlinePoints.map(([x, y], pointIndex) => {
                       const [nextX, nextY] = outlinePoints[(pointIndex + 1) % outlinePoints.length];
                       const insertAt = pointIndex + 1;
-                      return <g className="room-boundary-handle midpoint" key={`midpoint-${pointIndex}`} transform={`translate(${(x + nextX) / 2} ${(y + nextY) / 2})`} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setOutlinePoints(current => [...current.slice(0, insertAt), [(x + nextX) / 2, (y + nextY) / 2], ...current.slice(insertAt)]); setDraggingOutlinePoint(insertAt); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} aria-label={`Add and move boundary point ${insertAt}`}><circle className="handle-outer" r="8"/><circle className="handle-center" r="2"/></g>;
+                      return <g className="room-boundary-handle midpoint" key={`midpoint-${pointIndex}`} transform={`translate(${(x + nextX) / 2} ${(y + nextY) / 2})`} onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setOutlinePoints(current => [...current.slice(0, insertAt), [(x + nextX) / 2, (y + nextY) / 2], ...current.slice(insertAt)]); setDraggingOutlinePoint(insertAt); setAddOutlinePointMode(false); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} aria-label={`Add and move boundary point ${insertAt}`}><circle className="handle-outer" r="3.5"/></g>;
                     })}
                   </g>;
                 })}
@@ -975,7 +1013,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             <div className="room-review-footer">{scale ? `${reviewedAccepted.length} accepted · ${reviewedAcceptedArea.toFixed(1)} m² total` : "Set a drawing scale to show room areas"}{getReviewOutlines(pendingAreaQuestion).length === 0 && <button className="toolbar-button" type="button" onClick={() => startOutlineReview(pendingAreaQuestion)}>Draw room outline</button>}</div>
             {outlineError && <p role="alert">{outlineError}</p>}
           </section>}
-          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag the large corner handles to reshape the boundary. Drag a smaller midpoint handle to add a corner.</span></div><div className="outline-actions"><button className="toolbar-button" type="button" onClick={() => setAddOutlinePointMode(true)}>{addOutlinePointMode ? "Click plan to add point" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{scale && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
+          {outlineMode && <form className="outline-form" onSubmit={saveFloorOutline}><div className="outline-copy"><strong>{manualOutlineTarget?.scope === "room" ? `Adjust ${manualOutlineTarget.label?.toLowerCase() ?? "room"} boundary` : "Adjust whole-floor boundary"}</strong><span>Drag a square corner handle to reshape the boundary. Select Add point to show edge handles and add a corner.</span></div><div className="outline-actions"><button className={`toolbar-button${addOutlinePointMode ? " is-on" : ""}`} type="button" onClick={() => setAddOutlinePointMode(on => !on)}>{addOutlinePointMode ? "Choose an edge" : "Add point"}</button><button className="toolbar-button" type="button" onClick={() => setOutlinePoints(current => current.slice(0, -1))} disabled={outlinePoints.length <= 3}>Remove last</button><button className="toolbar-button primary-button" type="submit" disabled={outlineSaving || outlinePoints.length < 3}>{outlineSaving ? "Saving…" : "Save boundary"}</button><button className="toolbar-button" type="button" onClick={() => { setOutlineMode(false); setEditingOutlineId(null); }}>Cancel</button></div>{scale && areaM2(outlinePoints) !== null && <p>Area on plan: {areaM2(outlinePoints)?.toFixed(1)} m²</p>}{!scale && <p>Set a drawing scale to calculate the area.</p>}{outlineError && <p role="alert">{outlineError}</p>}</form>}
           {!pendingAreaQuestion && !outlineMode && savedOutlines.length > 0 && <div className="area-summary"><strong>Accepted outline areas</strong><span>{acceptedArea > 0 ? `Estimated total ${acceptedArea.toFixed(1)} m²` : "Set a drawing scale to calculate area"}</span><button className="toolbar-button" type="button" onClick={removeSavedOutline} disabled={outlineRemoving}>{outlineRemoving ? "Removing…" : "Remove outlines"}</button>{outlineError && <p role="alert">{outlineError}</p>}</div>}
           {correctionMode && <section className="correction-panel" aria-label="Review detected plan items">
             <div className="correction-heading"><strong>Review detections</strong><span>{correctionEvents.length ? `${correctionEvents.length} saved correction${correctionEvents.length === 1 ? "" : "s"} · used in this plan’s answers` : "Select a box, drag it to move, or drag its corner handle to resize it."}</span></div>

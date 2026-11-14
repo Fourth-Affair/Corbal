@@ -206,10 +206,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .room-layer .room-shape.weak polygon { stroke-dasharray: 8 5; stroke-width: 2; fill-opacity: 0.08; }
 .room-layer .room-shape.unknown polygon { stroke-dasharray: 4 4; stroke-width: 1.5; opacity: 0.8; }
 .room-layer .room-shape .room-boundary-handle { pointer-events: auto; cursor: move; }
-.room-layer .room-shape .room-boundary-handle .handle-outer { fill: #fff; stroke: #205d38; stroke-width: 4; vector-effect: non-scaling-stroke; }
-.room-layer .room-shape .room-boundary-handle .handle-center { fill: #205d38; stroke: white; stroke-width: 1; vector-effect: non-scaling-stroke; pointer-events: none; }
-.room-layer .room-shape .room-boundary-handle.midpoint .handle-outer { fill: #e7f1e9; stroke-width: 3; }
-.room-layer .room-shape .room-boundary-handle:hover .handle-outer { fill: #cce5d1; stroke-width: 5; }
+.room-layer .room-shape .room-boundary-handle .handle-outer { fill: #fff; stroke: #205d38; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+.room-layer .room-shape .room-boundary-handle.midpoint .handle-outer { fill: #205d38; stroke: white; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.room-layer .room-shape .room-boundary-handle:hover .handle-outer { fill: #b9ddc1; stroke-width: 3.5; }
 .room-layer text { fill: #1f2a23; font-weight: 700; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: rgba(255, 255, 255, 0.9); stroke-width: 4px; stroke-linejoin: round; }
 .room-layer .room-shape.weak text, .room-layer .room-shape.unknown text { fill: #5d6b63; font-weight: 600; }
 .wall-layer line { stroke-linecap: round; vector-effect: non-scaling-stroke; }
