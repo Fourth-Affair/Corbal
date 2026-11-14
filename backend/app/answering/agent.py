@@ -15,7 +15,9 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+from collections import deque
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
@@ -31,6 +33,25 @@ GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts pe
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
 PROMPT_VERSION = "15"  # bump when prompt or tools change, so cached answers are not reused
+# Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
+# beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
+GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))
+_budget: deque[float] = deque()
+_budget_lock = threading.Lock()
+
+
+def _take_budget() -> bool:
+    """Reserve one uncached Gemini question in the rolling-hour window; False when the cap is reached."""
+    if GEMINI_MAX_PER_HOUR <= 0:
+        return True
+    now = time.monotonic()
+    with _budget_lock:
+        while _budget and now - _budget[0] > 3600:
+            _budget.popleft()
+        if len(_budget) >= GEMINI_MAX_PER_HOUR:
+            return False
+        _budget.append(now)
+        return True
 
 SYSTEM = """You are a focused assistant for floor plans and buildings. Answer only questions about the provided floor plan
 or directly related building topics (for example rooms, layout, dimensions, building components, construction, or
@@ -337,6 +358,9 @@ def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = Non
     cache = _cache_path(question, graph, scale, geometry) if not history else None
     if use_cache and cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text(encoding="utf-8"))
+    if not _take_budget():
+        log.warning("Gemini hourly cap (%d) reached: falling back to the template answerer", GEMINI_MAX_PER_HOUR)
+        return None
     tools = PlanTools(graph, geometry)
     try:
         final, traces = run_loop(question, tools, history, scale)

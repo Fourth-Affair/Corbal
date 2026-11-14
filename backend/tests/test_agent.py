@@ -227,3 +227,14 @@ def test_generate_does_not_retry_bad_requests_and_gives_up(monkeypatch):
     with pytest.raises(httpx.ReadTimeout):
         agent._generate([], None)
     assert models.calls == 2
+
+
+def test_hourly_cap_falls_back(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setattr(agent, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(agent, "GEMINI_MAX_PER_HOUR", 1)
+    monkeypatch.setattr(agent, "_budget", agent.deque())
+    calls = []
+    monkeypatch.setattr(agent, "run_loop", lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(RuntimeError("x")))
+    assert agent.answer("how many sinks?", GRAPH) is None and len(calls) == 1
+    assert agent.answer("how many doors?", GRAPH) is None and len(calls) == 1  # cap reached: Gemini not called
