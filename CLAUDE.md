@@ -53,6 +53,10 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     `MINIMAL` is rejected by gemini-3.8-flash). `GEMINI_MAX_PER_HOUR` caps uncached questions per process (0 = off). Each Gemini call retries `GEMINI_RETRIES` (default 1) times on timeout / network error / 429 / 5xx
     (`GEMINI_TIMEOUT_S` per call, default 30). Yes/no answers are linked to, and checked against, a count_template
     result. No `GEMINI_API_KEY` / API error → router + template counter. `ANSWERER=template` disables it.
+  - Count confidence (`cubicasa/answer.py`): classifier templates use `graph.count_probability` (>= 0.95 high,
+    >= 0.8 medium, else low; preview: high 54% of answers at 98%); door / window rules use `graph.count_borderline`
+    (detections within 0.15 of the cut-off: 0 -> medium, else low, never high); otherwise the old evidence-match rule.
+    User corrections that change a count drop its probability.
   - `app/answering/tools.py` — deterministic tools over a PlanGraph: `plan_summary`, `count_template` (fusion
     counts), `list_items`, `items_in` (containment by the room's outline when it has one: fixtures by centre, doors
     and windows when they run along it; bounding box otherwise; a room label uses the room region around it),
@@ -85,7 +89,10 @@ dataset-specific rules. The benchmark is a regression check, not the objective.
     - ground truth: `labels_from_svg.py`.
     - scale: `dimensions.py` (printed dimension figures + tick-to-tick span of their lines; >= 2 figures agreeing
       within 4% and inside the door/fixture size band of `size_priors.py`), else written room areas (`rooms.py`,
-      bare decimals under a label count). Dimension lines win; a > 10% disagreement with written areas is a warning.
+      bare decimals under a label count; >= 2 rooms agreeing, else one room alone if it passes `single_room_scale`:
+      clean reading, one purpose, convex-ish outline, area plausible for its type, inside the symbol band). Dimension
+      lines win; a > 10% disagreement with written areas is a warning. `ask_plan` room areas and the outline review
+      use this scale when the user has not calibrated.
   - Routing is by file type, never by dataset folder: `.png/.jpg` -> image pipeline (`app/cubicasa/`), `.pdf` ->
     `app/pdfplan/`, `.ifc` -> `app/ifc/`. Uploaded PDFs (frontend) are stored in `CACHE_DIR/uploads/`, shown as page 1 rendered to PNG,
     saved as a `PlanGraph` with `source="pdf"` (PDF points) and answered by `app/pdfplan/`.

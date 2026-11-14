@@ -35,7 +35,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "MEDIUM")  # MINIMAL | LOW |
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "1"))  # extra attempts per call on timeout / 429 / 5xx
 GEMINI_RETRY_BACKOFF_S = float(os.environ.get("GEMINI_RETRY_BACKOFF_S", "1"))
 MAX_STEPS = 12
-PROMPT_VERSION = "19"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "20"  # bump when prompt or tools change, so cached answers are not reused
 # Cost cap for a public deployment: at most this many uncached Gemini questions per rolling hour (per process);
 # beyond it answer() returns None and the caller falls back to the template answerer. 0 = unlimited.
 GEMINI_MAX_PER_HOUR = int(os.environ.get("GEMINI_MAX_PER_HOUR", "0"))

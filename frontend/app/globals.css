@@ -124,7 +124,8 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .citation-mark circle { fill: #d94727; stroke: white; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .citation-mark text { fill: #fff; font: 700 20px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
 .citation-mark .citation-label rect { fill: #fff; stroke: #b84025; stroke-width: 1.5; vector-effect: non-scaling-stroke; filter: drop-shadow(0 2px 3px rgba(34, 45, 37, .25)); }
-.citation-mark .citation-label text { fill: #85321f; font: 700 13px 'DM Sans', sans-serif; dominant-baseline: central; }
+.citation-mark .citation-label { pointer-events: none; opacity: .92; }
+.citation-mark .citation-label text { fill: #85321f; font: 700 11px 'DM Sans', sans-serif; dominant-baseline: central; }
 .citation-mark.user-corrected .citation-label rect { fill: #edf7ef; stroke: #247044; }
 .citation-mark.user-corrected .citation-label text { fill: #205c37; }
 .upload-empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; }
