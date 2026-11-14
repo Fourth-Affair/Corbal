@@ -48,3 +48,20 @@ Also set a **budget alert / spending cap** for the Gemini key in Google AI Studi
   `docker compose -f compose.prod.yaml up -d`.
 - Docker-published ports bypass ufw. Don't add `ports:` to `frontend` or `backend`.
 - The CubiCasa net weights are CC BY-NC: fine for a public demo, not for a commercial service.
+
+## Automatic deployment (GitHub Actions)
+
+`.github/workflows/deploy.yml`: every push to `main` runs the backend tests, then `deploy/deploy.sh ci` (code only:
+`.env`, weights and cache stay on the server), then checks that the site answers. A failed image build leaves the
+running version in place. Manual run: Actions → Deploy → Run workflow.
+
+One-time setup (the server must have been deployed once with `deploy.sh <ip> all`):
+
+```sh
+ssh-keygen -t ed25519 -N "" -C github-actions-deploy -f /tmp/stoa_deploy_ci      # CI-only key, no passphrase
+ssh root@<ip> 'cat >> ~/.ssh/authorized_keys' < /tmp/stoa_deploy_ci.pub
+gh secret set DEPLOY_SSH_KEY     -R Vegss/Junc-2026-FA < /tmp/stoa_deploy_ci
+ssh-keyscan -t ed25519 <ip> | gh secret set DEPLOY_KNOWN_HOSTS -R Vegss/Junc-2026-FA
+printf '<ip>' | gh secret set DEPLOY_HOST -R Vegss/Junc-2026-FA
+rm /tmp/stoa_deploy_ci /tmp/stoa_deploy_ci.pub
+```
