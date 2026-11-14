@@ -5,7 +5,7 @@ from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
@@ -13,7 +13,8 @@ from fastapi.responses import FileResponse, Response
 from app.config import DATASET_DIR
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
-from app.models import Answer, AskRequest, Layer, PlanGraph, PlanItem, PlanOutlinesRequest, PlanQuestionRequest
+from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanGraph, PlanItem,
+                        PlanFeedbackRequest, PlanOutlinesRequest, PlanQuestionRequest)
 from app.router import route
 
 app = FastAPI(title="Junc API", version="0.1.0")
@@ -97,11 +98,20 @@ def _saved_graph(plan_id: UUID) -> PlanGraph | None:
         return None
     try:
         graph = PlanGraph.model_validate(rows[0]["graph"])
-        if not graph.floor_outlines and graph.source == "model":
-            from app.cubicasa.detect import floor_outline_candidates
+        if graph.source == "model":
+            from app.cubicasa.detect import floor_outline_candidates, room_outline_candidates
 
-            graph.floor_outlines = floor_outline_candidates(graph.image)
-            if graph.floor_outlines:
+            current_candidates = floor_outline_candidates(graph.image)
+            current_rooms = room_outline_candidates(graph.image)
+            changed = (
+                (current_candidates and [item.model_dump(mode="json") for item in current_candidates] !=
+                 [item.model_dump(mode="json") for item in graph.floor_outlines])
+                or (current_rooms and [item.model_dump(mode="json") for item in current_rooms] !=
+                    [item.model_dump(mode="json") for item in graph.room_outlines])
+            )
+            if changed:
+                graph.floor_outlines = current_candidates
+                graph.room_outlines = current_rooms
                 graph.items = [item for item in graph.items if item.category != "floor"] + [
                     PlanItem(id=outline.id, category="floor", bbox=(min(x for x, _ in outline.polygon),
                         min(y for _, y in outline.polygon), max(x for x, _ in outline.polygon),
@@ -112,6 +122,135 @@ def _saved_graph(plan_id: UUID) -> PlanGraph | None:
         return graph
     except (KeyError, ValueError) as error:
         raise HTTPException(status_code=500, detail="Saved plan analysis is invalid") from error
+
+
+def _corrections_request(plan_id: UUID, body: dict | None = None):
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    method = "POST" if body else "GET"
+    query = urlencode({"plan_id": f"eq.{plan_id}", "select": "action,item_id,original_item,corrected_item,created_at",
+                       "order": "created_at.asc,id.asc"})
+    headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
+    if body:
+        headers["Prefer"] = "return=minimal"
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_corrections?{query}",
+                      data=json.dumps(body).encode() if body else None, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=20) as response:
+            return None if body or response.status == 204 else json.loads(response.read())
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail="Supabase correction request failed") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+
+
+def _apply_corrections(graph: PlanGraph, events: list[dict]) -> PlanGraph:
+    """Apply append-only human edits to a copy of the model graph, retaining its original record."""
+    if not events:
+        return graph
+    original_items = list(graph.items)
+    items = list(graph.items)
+    for event in events:
+        item_id = event["item_id"]
+        items = [item for item in items if item.id != item_id]
+        corrected = event.get("corrected_item")
+        if corrected:
+            replacement = PlanItem.model_validate(corrected)
+            items.append(replacement)
+    if graph.counts:
+        baseline = graph.model_copy(deep=True)
+        baseline.items = original_items
+        baseline.counts = {}
+        edited = graph.model_copy(deep=True)
+        edited.items = items
+        edited.counts = {}
+        adjusted = dict(graph.counts)
+        for template, base_count in graph.counts.items():
+            before = count(baseline, template).answer or 0
+            after = count(edited, template).answer or 0
+            adjusted[template] = max(0, base_count + after - before)
+        graph = graph.model_copy(deep=True)
+        graph.counts = adjusted
+    graph = graph.model_copy(deep=True)
+    graph.items = items
+    graph.user_correction_count = len(events)
+    return graph
+
+
+@app.get("/api/plans/{plan_id}/corrections")
+def get_plan_corrections(plan_id: UUID) -> dict:
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    events = _corrections_request(plan_id) or []
+    corrected = _apply_corrections(graph, events)
+    return {"items": [item.model_dump(mode="json") for item in corrected.items], "events": events}
+
+
+@app.post("/api/plans/{plan_id}/corrections")
+def add_plan_correction(plan_id: UUID, req: PlanCorrectionRequest) -> dict:
+    graph = _saved_graph(plan_id)
+    if graph is None:
+        raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    existing_events = _corrections_request(plan_id) or []
+    effective = _apply_corrections(graph, existing_events)
+    if req.action == "add":
+        if req.item is None or req.item_id is not None:
+            raise HTTPException(status_code=422, detail="Adding an item requires item and no item_id")
+        item = req.item.model_copy(update={"id": f"user-{uuid4()}", "score": None, "raw": None, "user_verified": True})
+        if item.category in ("floor", "wall", "opening"):
+            raise HTTPException(status_code=422, detail="Only rooms, doors, windows, and fixtures can be added")
+        if (any(value < 0 for value in item.bbox) or item.bbox[2] > graph.width or item.bbox[3] > graph.height
+                or item.bbox[0] >= item.bbox[2] or item.bbox[1] >= item.bbox[3]):
+            raise HTTPException(status_code=422, detail="Item bounds must be inside the plan image")
+        item_id = item.id
+        before = None
+        after = item.model_dump(mode="json")
+    else:
+        if not req.item_id or (req.action == "delete" and req.item is not None) or (req.action == "update" and req.item is None):
+            raise HTTPException(status_code=422, detail="Updating requires item_id and item; deleting requires item_id only")
+        current = next((item for item in effective.items if item.id == req.item_id), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Plan item not found")
+        item_id = current.id
+        before = current.model_dump(mode="json")
+        after = None
+        if req.action == "update":
+            if req.item.category not in ("room", "door", "window", "fixture"):
+                raise HTTPException(status_code=422, detail="Only rooms, doors, windows, and fixtures can be corrected")
+            # Preserve the detection's location and identity; let the reviewer correct its interpretation.
+            after = current.model_copy(update={"category": req.item.category, "cls": req.item.cls,
+                                               "score": None, "user_verified": True}).model_dump(mode="json")
+    event = {"plan_id": str(plan_id), "action": req.action, "item_id": item_id,
+             "original_item": before, "corrected_item": after}
+    _corrections_request(plan_id, event)
+    events = _corrections_request(plan_id) or []
+    corrected = _apply_corrections(graph, events)
+    return {"items": [item.model_dump(mode="json") for item in corrected.items], "events": events}
+
+
+@app.post("/api/plans/{plan_id}/feedback")
+def add_plan_answer_feedback(plan_id: UUID, req: PlanFeedbackRequest) -> dict:
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not service_key:
+        raise HTTPException(status_code=503, detail="Supabase backend credentials are not configured")
+    body = {"plan_id": str(plan_id), **req.model_dump()}
+    request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_answer_feedback",
+                      data=json.dumps(body).encode(), headers={
+                          "apikey": service_key, "Authorization": f"Bearer {service_key}",
+                          "Content-Type": "application/json", "Prefer": "return=minimal",
+                      }, method="POST")
+    try:
+        with urlopen(request, timeout=20):
+            pass
+    except HTTPError as error:
+        raise HTTPException(status_code=502, detail="Supabase feedback request failed") from error
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(status_code=502, detail="Could not reach Supabase") from error
+    return {"saved": True}
 
 
 @app.get("/api/plans/{plan_id}/scale")
@@ -169,11 +308,15 @@ def _outline_request(plan_id: UUID, method: str = "GET", body: dict | None = Non
     headers = {"apikey": service_key, "Authorization": f"Bearer {service_key}", "Content-Type": "application/json"}
     if method == "PUT":
         headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    elif method == "DELETE":
+        headers["Prefer"] = "return=minimal"
     request = Request(f"{supabase_url.rstrip('/')}/rest/v1/plan_outlines?{query}",
                       data=json.dumps(body).encode() if body else None, headers=headers,
-                      method="POST" if method == "PUT" else "GET")
+                      method="POST" if method == "PUT" else method)
     try:
         with urlopen(request, timeout=20) as response:
+            if method == "DELETE":
+                return []
             rows = json.loads(response.read())
         return rows[0]["outlines"] if rows else []
     except HTTPError as error:
@@ -188,7 +331,8 @@ def get_plan_outline(plan_id: UUID) -> dict:
     graph = _saved_graph(plan_id)
     if graph is None:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
-    return {"candidates": [outline.model_dump(mode="json") for outline in graph.floor_outlines],
+    candidates = graph.floor_outlines + graph.room_outlines
+    return {"candidates": [outline.model_dump(mode="json") for outline in candidates],
             "saved": _outline_request(plan_id)}
 
 
@@ -203,6 +347,12 @@ def save_plan_outline(plan_id: UUID, req: PlanOutlinesRequest) -> dict:
     saved = _outline_request(plan_id, "PUT", {"plan_id": str(plan_id),
         "outlines": [outline.model_dump(mode="json") for outline in req.outlines]})
     return {"saved": saved}
+
+
+@app.delete("/api/plans/{plan_id}/outline")
+def delete_plan_outline(plan_id: UUID) -> dict:
+    _outline_request(plan_id, "DELETE")
+    return {"saved": []}
 
 
 @app.get("/api/plans/{plan_id}/image")
@@ -288,6 +438,39 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
     graph = _saved_graph(plan_id)
     if graph is None:
         raise HTTPException(status_code=409, detail="Plan analysis is not ready yet")
+    graph = _apply_corrections(graph, _corrections_request(plan_id) or [])
+    question = req.question.casefold()
+    area_question = any(term in question for term in ("area", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
+    if area_question:
+        if req.scale is None:
+            return Answer(answer=None, confidence="not_found", explanation="I need a known distance to establish the drawing scale before estimating floor area.")
+        room_terms = (("living room", "living"), ("kitchen", "kitchen"), ("bedroom", "bedroom"),
+                      ("bathroom", "bathroom"), ("bath", "bathroom"), ("balcony", "balcony"),
+                      ("sauna", "sauna"), ("garage", "garage"), ("storage", "storage"), ("entry", "entry"))
+        requested_room = next((room_type for term, room_type in room_terms if term in question), None)
+        if requested_room:
+            outlines = [outline for outline in req.floor_outlines if outline.scope == "room" and outline.room_type == requested_room]
+            if not outlines:
+                return Answer(answer=None, confidence="not_found", explanation=f"The {requested_room} boundary still needs to be reviewed or drawn before I can estimate its area.")
+        else:
+            outlines = [outline for outline in req.floor_outlines if outline.scope == "floor"]
+            if not outlines:
+                return Answer(answer=None, confidence="not_found", explanation="The drawing scale is available, but a whole-floor boundary still needs to be reviewed or drawn before I can estimate floor area.")
+        calibration_pixels = ((req.scale.points[1][0] - req.scale.points[0][0]) ** 2 +
+                              (req.scale.points[1][1] - req.scale.points[0][1]) ** 2) ** 0.5
+        if calibration_pixels <= 0:
+            return Answer(answer=None, confidence="not_found", explanation="The scale reference points are too close together. Please recalibrate using a longer known distance.")
+        meters_per_unit = {"m": 1.0, "cm": 0.01, "ft": 0.3048, "in": 0.0254}[req.scale.unit]
+        meters_per_pixel = req.scale.distance * meters_per_unit / calibration_pixels
+        pixel_area = 0.0
+        for outline in outlines:
+            polygon = outline.polygon
+            pixel_area += abs(sum(x * polygon[(index + 1) % len(polygon)][1] - polygon[(index + 1) % len(polygon)][0] * y
+                                  for index, (x, y) in enumerate(polygon))) / 2
+        area = pixel_area * meters_per_pixel * meters_per_pixel
+        return Answer(answer=round(area, 1), unit="m²", confidence="low",
+                      explanation=f"Estimated {outlines[0].label.lower()} area from the saved scale and user-accepted outline. Check the highlighted boundary before relying on this area.",
+                      answered_by="template")
     if ANSWERER == "llm":
         from app.answering.agent import answer
 

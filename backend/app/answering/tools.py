@@ -47,6 +47,8 @@ def _kind(it: PlanItem) -> str:
 
 def _row(it: PlanItem) -> dict[str, Any]:
     row: dict[str, Any] = {"id": it.id, "category": it.category, "bbox": [round(v) for v in it.bbox]}
+    if it.user_verified:
+        row["evidence_source"] = "user-reviewed correction"
     if it.cls:
         row["type"] = it.cls
     if it.category == "room":
@@ -93,6 +95,8 @@ class PlanTools:
             "image_size_px": [self.graph.width, self.graph.height],
             "source": "ground-truth labels" if self.graph.source == "svg" else "image analysis (detector, segmentation, OCR)",
             "items_by_kind": dict(sorted(kinds.items())),
+            "user_reviewed_items": sum(it.user_verified for it in self.graph.items),
+            "user_correction_events": self.graph.user_correction_count,
             "note": "No drawing scale is known: real-world lengths and areas (m, m²) cannot be computed.",
         }, ToolTrace()
 
