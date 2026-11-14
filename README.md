@@ -46,3 +46,19 @@ Image uploads are sent directly from the browser to a Supabase Storage bucket. P
 5. Restart the frontend (`docker compose up --build` for Docker, or restart `npm run dev` if running locally). Select or drop an image; the UI reports whether the upload succeeded. Objects appear under **Storage → plans**.
 
 This setup uses the anon key, which is intended to be exposed in browser apps. The Storage policy controls what that key can do. For a production app with user accounts, restrict inserts to authenticated users and their own folder, and set appropriate bucket file-size and MIME-type limits in Supabase.
+
+## Plan records and image associations
+
+The migration in `supabase/migrations/` creates `plans` and `plan_images`. Each uploaded image gets a plan UUID; `plan_images` stores the Supabase bucket and object path, and the plan has a JSONB `metadata` field for future data. The frontend displays the plan UUID after it saves the association.
+
+Apply the migration with the Supabase CLI from the repository root:
+
+```sh
+supabase login
+supabase link --project-ref your-project-ref
+supabase db push
+```
+
+Or paste the migration SQL into Supabase **SQL Editor** and run it. Keep the migration file in source control either way.
+
+Set `SUPABASE_SERVICE_ROLE_KEY` in the root `.env` for Docker Compose, using the service role secret from **Project Settings → API**. This key is only passed to FastAPI and must never use a `NEXT_PUBLIC_` prefix. The backend lookup endpoint is `GET /api/plans/{plan_id}`; it returns the plan and linked image metadata, including each `bucket_id` and `object_path`. It uses the service key to read the RLS-protected tables.

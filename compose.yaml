@@ -21,6 +21,9 @@ services:
     build:
       context: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
     ports:
       - "8000:8000"
     volumes:

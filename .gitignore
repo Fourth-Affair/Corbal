@@ -9,7 +9,9 @@ __pycache__/
 *.py[cod]
 .venv/
 
-# Local environment files
-.env
-.env.*
-!.env.example
+# Local environment files in the repository root and subdirectories
+**/.env
+**/.env.*
+
+# Keep sample environment templates versioned
+!**/.env.example

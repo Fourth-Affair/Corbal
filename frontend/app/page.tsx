@@ -42,7 +42,8 @@ export default function Home() {
     setUploadStatus("Uploading image…");
     const supabase = createClient(supabaseUrl, supabaseAnonKey);
     const safeName = selected.name.replace(/[^a-zA-Z0-9._-]/g, "-");
-    const path = `${crypto.randomUUID()}-${safeName}`;
+    const planId = crypto.randomUUID();
+    const path = `${planId}/${crypto.randomUUID()}-${safeName}`;
     const { error } = await supabase.storage.from(bucket).upload(path, selected, {
       contentType: selected.type,
       upsert: false,
@@ -53,7 +54,24 @@ export default function Home() {
       setUploadError(`Upload failed: ${error.message}`);
       return;
     }
-    setUploadStatus("Image uploaded to Supabase.");
+    const { error: planError } = await supabase.from("plans").insert({ id: planId });
+    if (planError) {
+      setUploadStatus(null);
+      setUploadError(`Image uploaded, but its plan record could not be saved: ${planError.message}`);
+      return;
+    }
+    const { error: imageError } = await supabase.from("plan_images").insert({
+      plan_id: planId,
+      bucket_id: bucket,
+      object_path: path,
+      role: "source",
+    });
+    if (imageError) {
+      setUploadStatus(null);
+      setUploadError(`Plan ${planId} was created, but its image link could not be saved: ${imageError.message}`);
+      return;
+    }
+    setUploadStatus(`Saved to Supabase. Plan ID: ${planId}`);
   };
 
   const handleDrop = (event: DragEvent<HTMLElement>) => {
