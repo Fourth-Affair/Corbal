@@ -45,6 +45,24 @@ def test_rooms_strong_and_unknown(monkeypatch):
     assert geo.openings[0].id in left.connections
 
 
+def test_wall_segments_only_on_the_building(monkeypatch):
+    """A sheet frame and a scale bar around the plan are line work, not walls: no segments there."""
+    cls = np.zeros((300, 400), np.uint8)
+    cls[2:5, 2:398] = cls[295:298, 2:398] = cls[2:298, 2:5] = cls[2:298, 395:398] = 1  # sheet frame
+    cls[270:276, 30:150] = 1  # scale bar
+    cls[100:106, 100:300] = cls[194:200, 100:300] = cls[100:200, 100:106] = cls[100:200, 294:300] = 1  # building
+    cls[100:200, 197:203] = 1
+    monkeypatch.setattr(layers, "wall_classes", lambda rel, path: (cls, "wallseg"))
+    monkeypatch.setattr(layers, "text", lambda rel, path: Layer(image=rel, width=400, height=300, layer="text",
+                                                                 model="test", tokens=[]))
+    monkeypatch.setattr(rooms, "_net_maps", lambda rel, shape: (None, None))
+    geo = rooms.geometry_from_image("uploads/x.png", None)
+    assert len(geo.rooms) == 2 and geo.wall_segments
+    for sg in geo.wall_segments:
+        assert all(90 <= x <= 310 and 90 <= y <= 210 for x, y in (sg.p0, sg.p1)), sg
+    assert [sg.id for sg in geo.wall_segments] == [f"seg-{j + 1}" for j in range(len(geo.wall_segments))]
+
+
 def test_low_confidence_label_gives_no_type(monkeypatch):
     geo = _plan(monkeypatch, [TextToken(text="MH", bbox=(40, 40, 60, 50), score=0.4)])
     assert all(r.tier == "unknown" for r in geo.rooms)

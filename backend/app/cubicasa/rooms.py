@@ -24,7 +24,7 @@ from skimage.measure import find_contours
 
 from app.cubicasa.room_types import Fixture, classify
 from app.cubicasa.rooms_dict import room_purpose
-from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallShape
+from app.models import PlanGeometry, PlanGraph, PlanScale, RoomEvidence, RoomLabel, RoomShape, WallSegment, WallShape
 
 # CubiCasa net classes by index (fuse.ROOM / fuse.ICON order)
 _SEG_NAMES = {1: "outdoor", 3: "kitchen", 4: "living", 5: "bedroom", 6: "bath", 7: "entry", 9: "storage", 10: "garage"}
@@ -201,7 +201,7 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     def to_id(v: int) -> str | None:
         return room_id.get(v) or ("outside" if v in outside else None)
 
-    segments = vectorise(cls, lab, to_id, t, openings)
+    segments = _building_segments(vectorise(cls, lab, to_id, t, openings), cls, lab, keep, t)
     for sg in segments:
         for rid in set(sg.rooms_left) | set(sg.rooms_right):
             if rid in by_id:
@@ -212,6 +212,34 @@ def geometry_from_image(rel: str, path: Path, graph: PlanGraph | None = None) ->
     return PlanGeometry(image=rel, width=W, height=H, model=model, wall_thickness_px=round(t, 1), rooms=rooms,
                         walls=walls, openings=openings, wall_segments=segments, room_cuts=room_cuts,
                         scale=plan_scale(rooms, _dimension_scale(path, text.tokens, sym)), symbol_scale=sym)
+
+
+def _building_segments(segments: list[WallSegment], cls: np.ndarray, lab: np.ndarray, keep: list[int],
+                       t: float) -> list[WallSegment]:
+    """Only the segments of wall components that bound a room. Sheet frames, title blocks, legends, scale bars and
+    dimension lines are line work the wall model also paints, but they are not connected to the building's walls (a
+    shaft too small to be a room still hangs off them, so it stays). Ids are renumbered."""
+    if not keep:
+        return []
+    comp, _ = ndimage.label(cls > 0, structure=np.ones((3, 3)))
+    near_room = ndimage.binary_dilation(np.isin(lab, keep), iterations=max(2, round(t / 2) + 2))
+    good = set(np.unique(comp[near_room & (comp > 0)]).tolist()) - {0}
+    H, W = comp.shape
+    r = max(2, round(t / 2) + 1)
+
+    def component(x: float, y: float) -> set[int]:
+        u, v = int(round(x)), int(round(y))
+        win = comp[max(0, v - r):min(H, v + r + 1), max(0, u - r):min(W, u + r + 1)]
+        return set(np.unique(win).tolist()) - {0}
+
+    out = []
+    for sg in segments:
+        mid = ((sg.p0[0] + sg.p1[0]) / 2, (sg.p0[1] + sg.p1[1]) / 2)
+        if (component(*mid) or component(*sg.p0) | component(*sg.p1)) & good:
+            out.append(sg)
+    for j, sg in enumerate(out):
+        sg.id = f"seg-{j + 1}"
+    return out
 
 
 def _dimension_scale(path: Path, tokens, sym: PlanScale | None) -> PlanScale | None:
