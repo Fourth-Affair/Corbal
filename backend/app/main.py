@@ -15,8 +15,10 @@ from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.requests import Request as HTTPRequest
+from fastapi.responses import FileResponse, JSONResponse, Response
 
+from app.config import MAX_ANALYSIS_PIXELS, pdf_render_scale
 from app.cubicasa.answer import count
 from app.cubicasa.graph import get_graph, resolve_dataset_path
 from app.models import (Answer, AskRequest, Layer, PlanCorrectionRequest, PlanFeedbackRequest, PlanGeometry,
@@ -112,6 +114,13 @@ def _check_path(path: str, pdf_ok: bool = False):
         return p
     kinds = "an image (.png, .jpg)" + (" or a .pdf" if pdf_ok else "")
     raise HTTPException(400, f"Expected {kinds}, got {p.name}.")
+
+
+@app.exception_handler(Exception)
+async def _unhandled(_request: HTTPRequest, error: Exception) -> JSONResponse:
+    """Unhandled errors as JSON: the Next.js proxies parse every backend response as JSON, and a plain-text 500 would
+    reach the user as "Could not reach the backend". Starlette still logs the traceback."""
+    return JSONResponse({"detail": f"Internal error ({type(error).__name__})"}, status_code=500)
 
 
 @app.get("/health")
@@ -541,7 +550,8 @@ def _render_pdf_page(path_or_bytes, scale: float = 2.0):
 
     pdf = pdfium.PdfDocument(path_or_bytes)
     try:
-        return pdf[0].render(scale=scale).to_pil().convert("RGB")
+        page = pdf[0]
+        return page.render(scale=pdf_render_scale(*page.get_size(), scale)).to_pil().convert("RGB")
     finally:
         pdf.close()
 
@@ -619,12 +629,20 @@ def _analyze_plan(plan_id: UUID) -> PlanGraph:
             image = Image.open(io.BytesIO(image_bytes))
             image.verify()
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            if (pixels := image.width * image.height) > MAX_ANALYSIS_PIXELS:
+                s = (MAX_ANALYSIS_PIXELS / pixels) ** 0.5
+                log.info("plan %s: %dx%d image downscaled by %.2f for analysis", plan_id, image.width, image.height, s)
+                image = image.resize((max(1, int(image.width * s)), max(1, int(image.height * s))),
+                                     Image.LANCZOS, reducing_gap=3.0)
             tmp = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp.png")
             try:
                 image.save(tmp, format="PNG")
                 tmp.replace(cache_path)
             finally:
                 tmp.unlink(missing_ok=True)
+        except Image.DecompressionBombError as error:  # > ~179 MP: refuse before decoding
+            raise HTTPException(status_code=413, detail="The uploaded image is too large to analyse. "
+                                "Please upload it at a lower resolution.") from error
         except (UnidentifiedImageError, OSError) as error:
             raise HTTPException(status_code=422, detail="Uploaded source is not a readable image") from error
 
@@ -681,7 +699,10 @@ def _compute_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp.png")
         try:
-            Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB").save(tmp, format="PNG")
+            image = Image.open(io.BytesIO(_download_source(plan_id))).convert("RGB")
+            if image.size != (graph.width, graph.height):  # the analysis downscaled it (MAX_ANALYSIS_PIXELS)
+                image = image.resize((graph.width, graph.height), Image.LANCZOS, reducing_gap=3.0)
+            image.save(tmp, format="PNG")
             tmp.replace(path)
         finally:
             tmp.unlink(missing_ok=True)
@@ -702,7 +723,7 @@ def _store_geometry(plan_id: UUID, geometry: PlanGeometry) -> None:
 def _store_geometry_safely(plan_id: UUID, graph: PlanGraph) -> None:
     """Geometry is an extra layer: a failure here must not fail the analysis (it is retried on first read)."""
     try:
-        _store_geometry(plan_id, _compute_geometry(plan_id, graph))
+        _store_geometry(plan_id, _bounded_analysis(lambda: _compute_geometry(plan_id, graph)))
     except Exception as error:  # noqa: BLE001
         log.warning("plan %s: geometry not stored (%s)", plan_id, error)
 
@@ -743,7 +764,8 @@ def _plan_geometry(plan_id: UUID, graph: PlanGraph) -> PlanGeometry:
             return PlanGeometry.model_validate(stored)
         except ValueError:
             log.warning("plan %s: stored geometry is invalid, recomputing", plan_id)
-    geometry = _compute_geometry(plan_id, graph)
+    # wall segmentation at native resolution: as heavy as an analysis, so it takes one of the same slots
+    geometry = _bounded_analysis(lambda: _compute_geometry(plan_id, graph))
     _store_geometry(plan_id, geometry)
     return geometry
 

@@ -1,156 +1,112 @@
-# Stoa: answering questions about floor plans, with evidence
+# Stoa: answering questions about construction drawings, with evidence
 
-Junction 2026 entry for the Stoa challenge. The backend reads a floor plan image, extracts addressable
-evidence (walls, symbols, text), and answers count questions ("how many windows?", in English or Finnish)
-with citations that point to where on the plan each counted item is.
+Junction 2026 entry for the Stoa challenge. Upload a floor plan (image or PDF) and ask about it in plain language,
+in English, Finnish or Swedish ("how many windows are in the bedroom?", "montako WC-istuinta?"). Every answer
+points to the evidence it came from (a box or outline on the plan, or an IFC `GlobalId`), so you can check it in seconds.
 
-## What the backend can see
+The design rule is **evidence first, LLM second**: deterministic parsers and small vision models turn the drawing into
+addressable evidence (rooms, walls, doors, windows, fixtures, text). The LLM (Gemini) only plans and calls tools that
+count, measure and do the arithmetic in code. Answers it cannot back with tool output are flagged or become "not found".
 
-| Layer | Model | Endpoint | What you get |
-|---|---|---|---|
-| **Walls** | `wallseg.py`: U-Net (ResNet-34) trained on CubiCasa5K walls, native resolution, sliding window. Falls back to the CubiCasa5K network if its weights are missing | `GET /api/walls?path=` | Wall regions and door/window **openings** in walls, as boxes, plus wall pixel stats |
-| **Symbols** | `symdet.py`: YOLO11s detector (ONNX, CPU) for door, window, toilet, sink, double sink, shower, bathtub, sauna stove | `GET /api/symbols?path=` | One box per object, with confidence and per-class counts |
-| **Text** | `ocr.py`: RapidOCR, rotation-aware | `GET /api/text?path=` | Every text token with its box; room labels such as `MH` or `KPH` mapped to a room type |
+## What it handles
 
-Questions go to `POST /api/ask` (`{"path", "question"}`); the answer carries its citations.
-`GET /api/render?path=&layer=walls|symbols|text` (or `&question=...`) returns the plan with that layer drawn on
-top. All coordinates are pixels of the plan image, origin top-left. Interactive docs: http://localhost:8000/docs.
+| Input | Pipeline | How it reads the drawing |
+|---|---|---|
+| Plan **image** (`.png`, `.jpg`, `.webp` upload) | `backend/app/cubicasa/` | Wall segmenter (U-Net), YOLO11s symbol detector (door, window, toilet, sink, shower, bathtub, sauna stove), rotation-aware OCR for room labels, CubiCasa5K network for room classes; rooms from the wall map, typed from labels + fixtures |
+| Vector **PDF** | `backend/app/pdfplan/` | Text with coordinates (rooms, numbers, areas); outlines and symbols from a same-name `.dxf` when present, else the image detector on the rendered page |
+| **IFC** model (API only, not in the web app yet) | `backend/app/ifc/` | ifcopenshell: classes, storeys, types, materials, quantities, spaces measured from their geometry |
 
-Measured on held-out plans (official CubiCasa5K test split):
+Questions go through a Gemini tool loop (`app/answering/agent.py`) over these tools. Without a `GEMINI_API_KEY`, or
+when the API fails or the hourly cap is reached, a deterministic router and per-question-type counters answer instead.
 
-- **Counting:** 77.1% exact answers before the symbol detector (doors 51%, windows 38%). The detector
-  reaches mAP50 0.95 on doors and 0.90 on windows on the validation split; refitting the counting models
-  with it is the next step.
-- **Walls:** the CubiCasa network scores wall F1 0.91 (median plan 0.96, 3 px tolerance). The dedicated
-  segmenter also separates openings from solid wall, which the older network cannot; on sample plans,
-  solid-wall F1 is 0.98–1.00 against 0.82–0.89.
+## Results
 
-Background and next steps: [docs/literature-review.md](docs/literature-review.md).
+Held-out data only; full numbers and history in [CLAUDE.md](CLAUDE.md).
 
-## Teammate setup
+- **Plan images, counting** (official CubiCasa5K test split, 387 plans / 3398 questions): **81.8 %** exact
+  (majority baseline 52.8 %). Strongest: kitchens 95 %, floors 93 %, bathrooms 93 %. Weakest: doors 66 %, windows 44 %.
+  Most window misses are runs of windows behind mullions, which the ground truth itself labels inconsistently.
+- **Vector PDFs** (swiss_dwellings, held-out half): **99.0 %**. All 71 preview PDFs: 88.5 %.
+- **IFC** (preview set): areas 99 %, overall 82 % with 91 % coverage.
+- **Breadth** (questions outside the dataset templates, `app/answering/openq.py`): 59 % on the real pipeline,
+  93 % with perfect perception. The remaining gap is mostly perception, not question understanding.
 
-The `dataset/` folder is gitignored (tens of GB, plus licence terms), so it is set up by hand:
+## The web app
 
-1. **Challenge data.** Download the full Junction dataset (`junction-dataset.zip`) and unzip it into
-   `dataset/` so that `dataset/junction-dataset/questions.jsonl` and `dataset/junction-dataset/data/` exist.
-   If you also have the preview release, unzip it as `dataset/junction-dataset-preview/`: we treat its plans
-   as test data, and the training commands exclude them (`--holdout`).
-2. **Original CubiCasa5K** (only for training and wall evaluation): download `cubicasa5k.zip` from
-   [Zenodo 2613548](https://zenodo.org/records/2613548) (5.5 GB) and unzip it into `dataset/cubicasa5k-original/`.
-   It holds the official train/val/test split and the SVG labels.
-3. **Share bundle.** Get `stoa-share.zip` from the team drive and unzip it in the repo root:
+1. The browser uploads the file through the frontend to a private Supabase Storage bucket and creates a `plans` row.
+2. `POST /api/plans/{id}/analyze`: the backend downloads the file and runs the image pipeline or the PDF parser.
+   It stores the resulting `PlanGraph` in `plan_knowledge` and the room / wall geometry in `plan_geometry`, so each
+   plan is analysed only once.
+3. The plan page shows the drawing with detected rooms and objects. You can ask questions (cited items are
+   highlighted), calibrate the scale with two points, measure distances, review room outlines, and correct
+   detections. Corrections are stored as append-only events, and answers use the corrected plan.
+
+The browser only talks to Next.js. Next.js API routes proxy to FastAPI, and only the backend holds the Supabase
+service-role key.
+
+## Setup
+
+Needs [uv](https://docs.astral.sh/uv/), Docker (for the full stack), and Node 22 (only to run the frontend outside Docker).
+
+1. **Model weights.** Everything except one file is in git under [`models/`](models/) (see `models/MANIFEST.json`).
+   The 208 MB CubiCasa5K network is not: get `stoa-share.zip` from the team drive, unzip it in the repo root, and
+   copy it into place:
 
    ```sh
    unzip stoa-share.zip
+   cp dataset/cubicasa-pretrained/model_best_val_loss_var.pkl models/cubicasa-net.pkl   # optional: the old path also works
    ```
 
-   It adds these files under `dataset/`:
-
-   | Path | What it is |
-   |---|---|
-   | `models/cubicasa-fusion.joblib`, `models/ocr_token_table.json` | Counting models and OCR word table; required by `/api/ask` |
-   | `models/symbol-det.onnx` | Symbol detector; required by `/api/symbols` |
-   | `models/wallseg.pt` | Wall segmenter; `/api/walls` falls back to the CubiCasa network without it |
-   | `cubicasa-pretrained/model_best_val_loss_var.pkl` | CubiCasa5K network weights (CC BY-NC, non-commercial) |
-   | `cache/features_table.jsonl`, `cache/features/*.det.json` | Cached evidence features and detections, so the counting models can be refitted without re-running the networks |
-   | `cache/svg/` | Ground-truth labels parsed from the original CubiCasa SVGs |
-
-4. **Python environment and smoke test** (needs [uv](https://docs.astral.sh/uv/)):
+   The bundle also holds cached features and parsed CubiCasa SVG labels (`dataset/cache/`) for refitting models
+   without rerunning the networks. Its `dataset/models/` copies are older than `models/` and are not used.
+2. **Supabase** (for the web app): create the project, apply `supabase/migrations/` and create the `plans` bucket.
+   See [deploy/README.md](deploy/README.md#2-supabase).
+3. **Environment.** `cp .env.example .env` and fill in `GEMINI_API_KEY` and the Supabase values. `.env` is gitignored.
+4. **Datasets** (only for evaluation and training, not needed to run the app). Everything under `dataset/` is gitignored:
+   - Challenge data: unzip `junction-dataset.zip` into `dataset/junction-dataset/`. The preview release goes in
+     `dataset/junction-dataset-preview/`; it is our test set and is never trained on.
+   - Original CubiCasa5K (training, wall evaluation): unzip `cubicasa5k.zip` from
+     [Zenodo 2613548](https://zenodo.org/records/2613548) into `dataset/cubicasa5k-original/`.
+5. **Smoke test:**
 
    ```sh
    cd backend
    uv sync
    uv run pytest -q
-   uv run python -m app.eval --method model --split test --limit 20
    ```
 
-   The first run on each image takes 3–5 s on CPU (networks + OCR); results are then cached in `dataset/cache/`.
-
-The bundle is a snapshot. Whoever retrains a model rebuilds it from the repo root and re-uploads it:
-
-```sh
-zip -r stoa-share.zip dataset/models/cubicasa-fusion.joblib dataset/models/ocr_token_table.json \
-  dataset/models/symbol-det.onnx dataset/models/wallseg.pt \
-  dataset/cubicasa-pretrained/model_best_val_loss_var.pkl dataset/cache/features_table.jsonl \
-  dataset/cache/features/*.det.json dataset/cache/svg
-```
-
-Training and evaluation commands (symbol detector on a rented Verda GPU, wall segmenter on a local GPU,
-counting-model fits) are in [CLAUDE.md](CLAUDE.md).
-
-## Start the app
+## Run it
 
 ```sh
 docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) for the frontend. The API runs at
-[http://localhost:8000](http://localhost:8000), with interactive docs at [http://localhost:8000/docs](http://localhost:8000/docs).
+Frontend at <http://localhost:3000>. API at <http://localhost:8000>, with interactive docs at
+<http://localhost:8000/docs>. Both containers hot-reload on source changes. Rebuild after changing
+`backend/pyproject.toml` or `frontend/package.json`. The first analysis of a plan takes 10–90 s on CPU, depending
+on its size, because the models are loaded and walls and OCR run at native resolution.
 
-The frontend and backend source folders are mounted into their containers, and both reload when their source
-changes. Rebuild after changing dependencies (`backend/pyproject.toml`, `frontend/package.json`):
+Without Docker: `cd backend && uv run uvicorn app.main:app --reload`, and
+`cd frontend && npm ci && npm run dev` with `BACKEND_URL=http://localhost:8000` and the Supabase values in
+`frontend/.env.local`.
 
-```sh
-docker compose up --build
-```
+The dataset endpoints work without Supabase: `POST /api/ask` with `{"path": "data/...", "question": "..."}` for a
+dataset image, PDF or IFC. `GET /api/render?path=...&question=...` draws the cited evidence on the plan, and
+`/api/walls`, `/api/symbols` and `/api/text` return one perception layer.
 
-Stop the stack with `Ctrl+C`, or run `docker compose down` in another terminal.
+## Production
+
+A single CPU server behind Caddy (HTTPS, per-IP rate limits). Every push to `main` is tested and deployed by GitHub
+Actions. See [deploy/README.md](deploy/README.md) for setup, cost limits and operating notes.
+
+## Evaluation and training
+
+Every pipeline change is checked with the benchmark (`uv run python -m app.bench run --set fast`), and with
+`--kind open` for questions outside the dataset templates. The benchmark is a regression check, not the goal.
+Training the detector on a rented GPU, the wall segmenter, and refitting the counting models: see
+[CLAUDE.md](CLAUDE.md#commands). Background: [docs/literature-review.md](docs/literature-review.md).
 
 ## Licences
 
-CubiCasa5K data and the pretrained CubiCasa network are CC BY-NC(-SA): non-commercial use only. Ultralytics
-(used to train and run the detector) is AGPL-3.0. Fine for the hackathon; revisit before any commercial use.
-## Store uploaded images in Supabase Storage
-
-Plan uploads (images and PDFs) are sent from the frontend to a Supabase Storage bucket. The frontend needs the Supabase project URL and the public anon/publishable key; never put a `service_role` or secret key in frontend environment variables.
-
-1. In the Supabase dashboard, open **Storage** and create a bucket named `plans` (or choose another name). Keep it private unless you specifically want uploaded images to be publicly readable.
-2. Open **Project Settings → API** and copy the project URL and anon/publishable key.
-3. Create `frontend/.env.local` using `frontend/.env.example`, and fill in the values. For Docker Compose, also copy those same three variables into a root `.env` file (next to `compose.yaml`), since Compose passes them to the frontend container.
-4. Allow browser uploads by adding this policy in **SQL Editor**. It allows anonymous users to add objects to this bucket; access to read or delete objects remains restricted.
-
-   ```sql
-   create policy "Allow browser plan uploads to plans"
-   on storage.objects
-   for insert
-   to anon
-   with check (
-     bucket_id = 'plans'
-     and lower(storage.extension(name)) in ('png', 'jpg', 'jpeg', 'webp', 'gif', 'pdf')
-   );
-   ```
-
-   The migration `202611140010_allow_pdf_uploads.sql` replaces the older image-only policy with this one. Without
-   `pdf` in the list, PDF uploads fail with "new row violates row-level security policy". If the bucket has
-   **Allowed MIME types** set, add `application/pdf` there too.
-
-   If you use a different bucket name, change `bucket_id` in the policy and set `NEXT_PUBLIC_SUPABASE_BUCKET` to that name in both env files.
-5. Restart the frontend (`docker compose up --build` for Docker, or restart `npm run dev` if running locally). Select or drop an image; the UI reports whether the upload succeeded. Objects appear under **Storage → plans**.
-
-This setup uses the anon key, which is intended to be exposed in browser apps. The Storage policy controls what that key can do. For a production app with user accounts, restrict inserts to authenticated users and their own folder, and set appropriate bucket file-size and MIME-type limits in Supabase.
-
-## Plan records and image associations
-
-The migrations in `supabase/migrations/` create `plans` and `plan_images`, then add RPCs that create the plan and image-link rows in one database transaction. The frontend calls the RPC before uploading the file, so a missing table or RPC stops the upload. The image row tracks `pending`, `uploaded`, or `failed`. Storage is a separate service, so its upload cannot share the database transaction; the initial RPC ensures the backend has the image path linked to a plan before upload starts. Each uploaded image gets a plan UUID, and `plans.metadata` is JSONB for future plan data.
-
-Apply all migrations with the Supabase CLI from the repository root:
-
-```sh
-supabase login
-supabase link --project-ref your-project-ref
-supabase db push
-```
-
-Or paste the migration SQL files into Supabase **SQL Editor** in timestamp order. Keep the migration files in source control either way. If you already applied the plan and image migrations, apply the remaining migrations in order.
-
-Set `SUPABASE_SERVICE_ROLE_KEY` in the root `.env` for Docker Compose, using the service role secret from **Project Settings → API**. This key is only passed to FastAPI and must never use a `NEXT_PUBLIC_` prefix. The backend lookup endpoint is `GET /api/plans/{plan_id}`; it returns the plan and linked image metadata, including each `bucket_id` and `object_path`. It uses the service key to read the RLS-protected tables.
-
-After saving the plan and its source image association, the frontend calls `POST /api/plans/{plan_id}/analyze`. The backend downloads that source image from private Supabase Storage, runs the image-only plan pipeline, and returns a `PlanGraph` with image dimensions, detected items, and predicted counts. The frontend proxies this request through its `/api/plans/{planId}/analyze` route so the browser does not need direct backend network access. The request is synchronous and may take a while while the models load or analyze a large plan.
-
-The backend also saves that graph in the private `plan_knowledge` table (migration `202611140004_plan_knowledge.sql`). On later visits, the backend reuses the saved graph instead of running the image pipeline again. The plan page enables its chat after analysis finishes; questions are sent to `POST /api/plans/{plan_id}/ask`, which loads the saved graph and passes it to the Gemini agent (or the deterministic template answerer when Gemini is unavailable). The service role key stays in the backend, and the frontend only talks to it through Next.js API routes. Configure `GEMINI_API_KEY` to enable the natural-language agent.
-
-The plan viewer also has a scale tool: select two points on the drawing, enter their known distance and unit, and save the calibration. It is stored per plan in `plan_scales` (migration `202611140005_plan_scales.sql`). **Apply this migration** before using the tool. Once calibrated, choose **Measure distance** and mark two points to read their estimated real-world distance. Calibration assumes the drawing has not been stretched or skewed.
-
-Floor and room contours from the plan segmentation appear as suggested outlines for review. Room-specific area questions (for example, kitchen area) select that room’s contour when available. Users can drag, add, or remove points, accept the boundary, and remove an accepted outline from the drawing; accepted polygons are stored in `plan_outlines` (migration `202611140006_plan_outlines.sql`). **Apply this migration** to enable outline persistence. The viewer calculates estimated area only when a scale is also saved, and the suggested contour should be checked against the drawing before relying on the result.
-
-The plan viewer also lets users review detected rooms and objects, correct their kind or type, remove false detections, and add missing items. These edits are stored as append-only events in `plan_corrections` (migration `202611140007_plan_corrections.sql`); the original analysis remains unchanged, and answers use the corrected effective graph. Answer feedback is recorded in `plan_answer_feedback` (migration `202611140008_plan_answer_feedback.sql`) with the question, response, evidence IDs, and helpful/incorrect/unclear rating. Apply both migrations to enable these features. Corrections are not associated with a named user because this prototype has no user accounts yet.
+CubiCasa5K data and the pretrained CubiCasa network are CC BY-NC(-SA): non-commercial use only. Ultralytics (used to
+train and run the detector) is AGPL-3.0. Fine for the hackathon; revisit before any commercial use.

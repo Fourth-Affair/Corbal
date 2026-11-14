@@ -72,12 +72,15 @@ def raster_symbols(rel: str) -> tuple[Symbol, ...]:
 
     from app.cubicasa import symdet
 
+    from app.config import pdf_render_scale
+
     if not symdet.available():
         return ()
-    k = 2.0
     pdf = pdfium.PdfDocument(str(resolve_pdf(rel)))
     try:
-        img = pdf[0].render(scale=k).to_pil().convert("RGB")
+        page = pdf[0]
+        k = pdf_render_scale(*page.get_size())  # 2x, less for very large pages
+        img = page.render(scale=k).to_pil().convert("RGB")
     finally:
         pdf.close()
     out = []
