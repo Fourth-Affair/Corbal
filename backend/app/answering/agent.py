@@ -223,12 +223,15 @@ def _cache_path(question: str, graph: PlanGraph):
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
 
-def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None) -> Answer | None:
+def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
+           use_cache: bool = True) -> Answer | None:
+    """history = prior chat turns (answers with history are not cached).
+    use_cache=False skips reading the answer cache (fresh Gemini run, e.g. to measure run-to-run noise)."""
     if not os.environ.get("GEMINI_API_KEY"):
         return None
     history = history or []
     cache = _cache_path(question, graph) if not history else None
-    if cache and cache.is_file():
+    if use_cache and cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text())
     tools = PlanTools(graph)
     try:

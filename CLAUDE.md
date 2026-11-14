@@ -59,7 +59,12 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     - API layers: `layers.py` backs `/api/walls`, `/api/symbols`, `/api/text` and `/api/render?layer=` (one
       `Layer` response shape; cached per image and weights).
     - ground truth: `labels_from_svg.py`.
-  - `app/eval.py` — exact-match eval per template.
+  - `app/eval.py` — exact-match eval per template (counting models only, bypasses the agent).
+  - `app/bench.py` — benchmark of the real `/api/ask` path: fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
+    test split EN+FI, paraphrases/traps from `app/answering/paraphrases.py`, samples of every other dataset), runs in
+    `dataset/runs/bench/` (meta: git sha, set hash, graph cache, Gemini model/prompt version), metrics: accuracy with
+    image-bootstrap CI, coverage, precision, calibration per confidence, citation validity, EN/FI consistency,
+    latency. `diff` gives paired deltas with CIs and the flipped questions.
 - `frontend/` — Next.js 15 / React 19 / TypeScript. Calls backend via `BACKEND_URL`.
 - `compose.yaml` — runs both with hot reload; mounts `./dataset` at `/dataset`.
 - `dataset/` (gitignored, never commit) — `junction-dataset/` (full challenge data + `questions.jsonl`),
@@ -85,6 +90,12 @@ uv run python -m app.cubicasa.features --splits val test     # cache net maps + 
 uv run python -m app.cubicasa.fit --test --fit-on train+val          # CV on val, score on test
 uv run python -m app.cubicasa.fit --test --final --fit-on train+val  # + save fusion models -> models/
 uv run python -m app.eval --method model --split test       # end-to-end score through the runtime path
+
+# benchmark (every pipeline change): fast ≈ 390 q (~6 min with the agent, CI ±6 pts), full ≈ 7.4k q
+uv run python -m app.bench build                            # once (deterministic)
+uv run python -m app.bench run --set fast                   # API path: agent + fallback (--answerer template = offline)
+uv run python -m app.bench run --set fast --no-cache --label rerun   # fresh Gemini answers: measures noise
+uv run python -m app.bench diff <runA.jsonl> <runB.jsonl>   # paired delta, 95% CI, broke/fixed questions
 
 # symbol detector on a Verda GPU VM (VERDA_CLIENT_ID/SECRET in .env). The VM downloads CubiCasa5K itself;
 # the challenge preview images (= test) are held out. VM is deleted at the end unless --keep.
