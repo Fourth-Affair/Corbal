@@ -71,11 +71,16 @@ parsing, computer vision, geometry/3D, or small fine-tuned models.
     confidence) and apartment areas say not found. `answer.py`: EN/DE/FR/IT questions -> 12 templates.
     `python -m app.pdfplan.eval [--prefix data/swiss_dwellings/] [--split eval] [--no-dxf]`.
   - `app/eval.py` — exact-match eval per template (counting models only, bypasses the agent).
-  - `app/bench.py` — benchmark of the real `/api/ask` path: fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
+  - `app/bench.py` — benchmark of the `/api/ask` answer path, routed by file type like the API (images -> agent /
+    template counter, PDFs -> `app/pdfplan/`, anything else = unsupported): fixed sets (`dataset/bench/{fast,full}.jsonl`: cubicasa
     test split EN+FI, paraphrases/traps from `app/answering/paraphrases.py`, samples of every other dataset), runs in
     `dataset/runs/bench/` (meta: git sha, set hash, graph cache, Gemini model/prompt version), metrics: accuracy with
     image-bootstrap CI, coverage, precision, calibration per confidence, citation validity, EN/FI consistency,
-    latency. `diff` gives paired deltas with CIs and the flipped questions.
+    latency. Numbers within 2% (`--tol`, the challenge rule). First headline = dataset accuracies weighted by their
+    share of `questions.jsonl`. `diff` gives paired deltas with CIs and the flipped questions.
+  - `app/bench_perception.py` — `bench perception`: deterministic, no questions / router / LLM. Model PlanGraph vs
+    SVG labels on the set's cubicasa test images: symbol boxes (one-to-one IoU matching -> precision/recall/F1 per
+    class), rooms (centre-in-room), fusion counts exact per template, `--walls` wall F1. Seconds on cached graphs.
 - `frontend/` — Next.js 15 / React 19 / TypeScript. Calls backend via `BACKEND_URL`.
 - `compose.yaml` — runs both with hot reload; mounts `./dataset` at `/dataset`.
 - `dataset/` (gitignored, never commit) — `junction-dataset/` (full challenge data + `questions.jsonl`),
@@ -107,6 +112,9 @@ uv run python -m app.bench build                            # once (deterministi
 uv run python -m app.bench run --set fast                   # API path: agent + fallback (--answerer template = offline)
 uv run python -m app.bench run --set fast --no-cache --label rerun   # fresh Gemini answers: measures noise
 uv run python -m app.bench diff <runA.jsonl> <runB.jsonl>   # paired delta, 95% CI, broke/fixed questions
+uv run python -m app.bench run --set fast --answerer template   # no Gemini: router + counters + PDF parser (~10 s)
+uv run python -m app.bench perception --set fast [--walls]  # no questions at all: evidence boxes/rooms/counts vs SVG
+                                                            # labels (diff works on these runs too)
 
 # symbol detector on a Verda GPU VM (VERDA_CLIENT_ID/SECRET in .env). The VM downloads CubiCasa5K itself;
 # the challenge preview images (= test) are held out. VM is deleted at the end unless --keep.

@@ -1,4 +1,4 @@
-"""Benchmark: fixed question sets -> the real /api/ask answer path -> per-question records -> summary and diff.
+"""Benchmark: fixed question sets -> the /api/ask answer path -> per-question records -> summary and diff.
 
   uv run python -m app.bench build                                   # fixed sets -> dataset/bench/{fast,full}.jsonl
   uv run python -m app.bench run --set fast                          # as the API runs (Gemini agent + fallback)
@@ -7,18 +7,24 @@
   uv run python -m app.bench run --set fast --no-cache --label rerun  # fresh Gemini answers (run-to-run noise)
   uv run python -m app.bench report dataset/runs/bench/<run>.jsonl
   uv run python -m app.bench diff <runA>.jsonl <runB>.jsonl --show 20  # paired delta, 95% CI, flipped questions
+  uv run python -m app.bench perception --set fast                   # no questions, no LLM: evidence vs SVG labels
+                                                                     # (app.bench_perception; diff works on its runs too)
 
 Sets (deterministic from --seed; stored under dataset/, never committed):
 - dataset questions: cubicasa5k images of the official *test* split only (both languages, so EN/FI consistency can
-  be checked), plus a sample of every other dataset. Our pipeline only supports cubicasa so far: the other datasets
-  show up as 0% coverage, so the blind spot stays visible.
+  be checked), plus a sample of every other dataset. Plans are routed by file type like the API does: images ->
+  image pipeline (agent or template counter), PDFs -> app.pdfplan (deterministic, whatever --answerer says). File
+  types without a parser (.ifc) show up as 0% coverage, so the blind spot stays visible.
 - paraphrases (app.answering.paraphrases) on test images: unseen wordings and languages. Ground truth = the SVG
   label count for the expected template; trap / out-of-scope questions expect not_found.
 
-Scoring: counts exact, other numbers within --tol relative error (areas, lengths, volumes), short text answers
+Scoring: counts exact, other numbers within --tol relative error (areas, lengths, volumes; default 2%, the
+challenge rule), short text answers
 normalised string match (yes/no in any language), long free-text answers are not scored (coverage only).
 A not_found is never correct unless the expected answer is "not answerable". Accuracy = correct / scored;
 precision = correct / answered, so a tweak that trades honest misses for wrong answers shows up.
+The first headline weights each dataset's accuracy by its share of questions.jsonl (the samples here are not
+proportional: cubicasa is over-represented); datasets with only unscorable free-text answers are left out of it.
 """
 
 import argparse
@@ -215,20 +221,46 @@ def build(seed: int) -> None:
 # ---------------------------------------------------------------------------------------------- run
 
 
+def _dataset_weights() -> dict[str, int]:
+    """Questions per dataset in questions.jsonl: the weights of the overall headline."""
+    c: Counter = Counter()
+    with open(DATASET_DIR / "questions.jsonl", encoding="utf-8") as f:
+        for line in f:
+            m = re.search(r'"path":\s*"data/([^/"]+)/', line)
+            if m:
+                c[m.group(1)] += 1
+    return dict(c)
+
+
 def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dict:
-    from app.main import _template_answer
+    """One question through the same routing as /api/ask: by file type, never by dataset folder."""
+    from app.main import IMAGE_SUFFIXES, _is_pdf, _template_answer
     from app.models import Answer
 
     rec = {"id": item["id"], "fell_back": False, "error": None}
     t0 = time.perf_counter()
-    graph = graphs.get(item["path"])
-    if not item["path"].startswith("data/cubicasa5k/"):
-        res = Answer(answer=None, confidence="not_found", explanation="unsupported dataset")
+    path = item["path"]
+    graph = graphs.get(path)
+    ids = None  # ids a citation may use; None = not checked (PDF answers build their items per question)
+    if _is_pdf(path):
+        from app.pdfplan.answer import answer_question
+
+        try:
+            res = answer_question(path, item["question"])
+        except FileNotFoundError as e:
+            res = Answer(answer=None, confidence="not_found", explanation=f"Parser unavailable: {e}")
+            rec["error"] = "parser"
+        except Exception as e:  # noqa: BLE001  the API would return a 500: count it, keep the run going
+            res = Answer(answer=None, confidence="not_found", explanation=f"{type(e).__name__}: {e}")
+            rec["error"] = "crash"
+    elif Path(path).suffix.lower() not in IMAGE_SUFFIXES:
+        res = Answer(answer=None, confidence="not_found", explanation="unsupported file type")
         rec["error"] = "unsupported"
     elif isinstance(graph, str):
         res = Answer(answer=None, template=route(item["question"]), confidence="not_found", explanation=graph)
         rec["error"] = "parser"
     else:
+        ids = {it.id for it in graph.items}
         res = None
         if answerer in ("llm", "agent"):
             from app.answering import agent
@@ -243,12 +275,12 @@ def _answer_one(item: dict, graphs: dict, answerer: str, use_cache: bool) -> dic
             res = Answer(answer=None, confidence="not_found", explanation="agent failed")
     rec["latency_s"] = round(time.perf_counter() - t0, 3)
 
-    ids = {it.id for it in graph.items} if graph is not None and not isinstance(graph, str) else set()
     num = _num(res.answer)
     rec.update(pred=res.answer, unit=res.unit, template=res.template, confidence=res.confidence,
                answered_by=res.answered_by, n_citations=len(res.citations),
                # cited evidence exists in the plan, and a non-zero count has at least one cited item
-               citations_ok=all(c.id in ids for c in res.citations) and not (num and not res.citations))
+               citations_ok=(ids is None or all(c.id in ids for c in res.citations))
+               and not (num and not res.citations))
     return rec
 
 
@@ -270,7 +302,9 @@ def run(set_name: str, answerer: str, source: str, use_cache: bool, workers: int
               + (", every answer falls back to the template path" if answerer == "llm" else ""))
 
     # graphs first, sequentially (perception may run the nets once per image; cached afterwards)
-    paths = sorted({it["path"] for it in items if it["path"].startswith("data/cubicasa5k/")})
+    from app.main import IMAGE_SUFFIXES, _is_pdf
+
+    paths = sorted({it["path"] for it in items if Path(it["path"]).suffix.lower() in IMAGE_SUFFIXES})
     graphs: dict = {}
     t0 = time.perf_counter()
     for i, p in enumerate(paths, 1):
@@ -284,7 +318,7 @@ def run(set_name: str, answerer: str, source: str, use_cache: bool, workers: int
 
     meta = {"set": set_name, "set_hash": set_hash, "answerer": answerer, "source": source, "use_cache": use_cache,
             "tol": tol, "label": label, "git": _git(), "graph_cache": graph_cache,
-            "started": datetime.now(UTC).isoformat(timespec="seconds")}
+            "started": datetime.now(UTC).isoformat(timespec="seconds"), "dataset_weights": _dataset_weights()}
     if answerer in ("llm", "agent"):
         from app.answering import agent
 
@@ -292,9 +326,13 @@ def run(set_name: str, answerer: str, source: str, use_cache: bool, workers: int
                     prompt_version=agent.PROMPT_VERSION)
 
     t0 = time.perf_counter()
+    # PDFs first, one at a time: pdfium is not thread-safe, and that path makes no network calls anyway
+    pdf_recs = {it["id"]: _answer_one(it, graphs, answerer, use_cache) for it in items if _is_pdf(it["path"])}
+    if pdf_recs:
+        print(f"  answered {len(pdf_recs)} PDF questions ({time.perf_counter() - t0:.0f}s)", flush=True)
     recs, done = [], 0
     with ThreadPoolExecutor(max(1, workers if answerer != "template" else 1)) as pool:
-        for rec in pool.map(lambda it: _answer_one(it, graphs, answerer, use_cache), items):
+        for rec in pool.map(lambda it: pdf_recs.get(it["id"]) or _answer_one(it, graphs, answerer, use_cache), items):
             recs.append(rec)
             done += 1
             if done % 100 == 0 or done == len(items):
@@ -361,10 +399,10 @@ def _row_stats(rs: list[tuple[dict, dict]]) -> dict:
 
 
 def _table(title: str, groups: dict[str, list]) -> None:
-    print(f"\n{title:<16}{'n':>6}{'acc':>8}{'cover':>8}{'prec':>8}")
+    print(f"\n{title:<29}{'n':>6}{'acc':>8}{'cover':>8}{'prec':>8}")
     for k in sorted(groups, key=str):
         s = _row_stats(groups[k])
-        print(f"{str(k):<16}{s['n']:>6}{_pct(s['acc']):>8}{_pct(s['cov']):>8}{_pct(s['prec']):>8}")
+        print(f"{str(k):<29}{s['n']:>6}{_pct(s['acc']):>8}{_pct(s['cov']):>8}{_pct(s['prec']):>8}")
 
 
 def report(path: Path) -> None:
@@ -376,10 +414,25 @@ def report(path: Path) -> None:
           f"graphs={m['graph_cache']}" + (f" model={m.get('gemini_model')} prompt=v{m.get('prompt_version')}"
                                          if m.get("gemini_model") else ""))
 
+    by_ds = defaultdict(list)
+    for it, r in rs:
+        if it["kind"] == "dataset":
+            by_ds[it["dataset"]].append((it, r))
+    weights = m.get("dataset_weights") or {}
+    acc = {ds: _row_stats(g)["acc"] for ds, g in by_ds.items()}
+    used = [ds for ds in acc if acc[ds] == acc[ds] and weights.get(ds)]  # scored here, and weighted
+    if used:
+        total = sum(weights[ds] for ds in used)
+        left_out = sorted(set(by_ds) - set(used))
+        print(f"\nHEADLINE all datasets, weighted by their share of questions.jsonl: acc "
+              f"{sum(weights[ds] * acc[ds] for ds in used) / total:.1%}  (tol {m['tol']:.0%}; "
+              + ", ".join(f"{ds} {weights[ds] / total:.0%}" for ds in sorted(used, key=lambda d: -weights[d]))
+              + (f"; not scorable, left out: {', '.join(left_out)}" if left_out else "") + ")")
+
     cubi = [(it, r) for it, r in rs if it["dataset"] == "cubicasa5k"]
     s = _row_stats(cubi)
     lo, hi = _cluster_ci([(it["path"], 0.0, float(r["correct"])) for it, r in cubi])
-    print(f"\nHEADLINE cubicasa test: acc {s['acc']:.1%} [95% CI {lo:.1%}-{hi:.1%}]  coverage {s['cov']:.1%}  "
+    print(f"HEADLINE cubicasa test: acc {s['acc']:.1%} [95% CI {lo:.1%}-{hi:.1%}]  coverage {s['cov']:.1%}  "
           f"precision {s['prec']:.1%}  (n={s['n']})")
 
     _table("dataset", {k: [x for x in rs if x[0]["dataset"] == k] for k in {it["dataset"] for it, _ in rs}})
@@ -387,6 +440,8 @@ def report(path: Path) -> None:
     for it, r in rs:
         if it["dataset"] in ("cubicasa5k", "paraphrase"):
             tmpl[it["template"] or "(unsupported)"].append((it, r))
+        else:  # other datasets have no expected template: group by the one the parser chose
+            tmpl[f"{it['dataset'][:5]}:{r.get('template') or '(none)'}"[:28]].append((it, r))
     _table("template", tmpl)
     _table("language", {k: [x for x in rs if x[0]["lang"] == k] for k in {it["lang"] for it, _ in rs}})
 
@@ -420,6 +475,10 @@ def report(path: Path) -> None:
 
 
 def diff(path_a: Path, path_b: Path, show: int) -> None:
+    if "kind" in _read_jsonl(Path(path_a))[0]["meta"]:  # perception runs have their own records
+        from app import bench_perception
+
+        return bench_perception.diff(Path(path_a), Path(path_b), show)
     ma, ra, items = _load_run(Path(path_a))
     mb, rb, items_b = _load_run(Path(path_b))
     if ma["set_hash"] != mb["set_hash"]:
@@ -474,9 +533,15 @@ def main() -> None:
     p.add_argument("--source", choices=["model", "svg"], default=os.environ.get("PLAN_SOURCE", "model"))
     p.add_argument("--no-cache", action="store_true", help="ignore cached agent answers")
     p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--tol", type=float, default=0.05, help="relative tolerance for non-count numbers")
+    p.add_argument("--tol", type=float, default=0.02, help="relative tolerance for non-count numbers")
     p.add_argument("--label", default="")
     p.add_argument("--limit", type=int, default=0, help="first N questions only (smoke test)")
+    p = sub.add_parser("perception", help="deterministic: model evidence vs SVG labels (no questions, no LLM)")
+    p.add_argument("--set", default="fast", help="images of this set (cubicasa test split)")
+    p.add_argument("--limit", type=int, default=0, help="first N images only")
+    p.add_argument("--iou", type=float, default=0.3, help="a symbol box matches a label box at this IoU")
+    p.add_argument("--walls", action="store_true", help="also score wall segmentation (runs the net: ~3 s/image)")
+    p.add_argument("--label", default="")
     p = sub.add_parser("report")
     p.add_argument("run")
     p = sub.add_parser("diff")
@@ -488,8 +553,17 @@ def main() -> None:
         build(args.seed)
     elif args.cmd == "run":
         run(args.set, args.answerer, args.source, not args.no_cache, args.workers, args.tol, args.label, args.limit)
+    elif args.cmd == "perception":
+        from app import bench_perception
+
+        bench_perception.run(args.set, args.limit, args.iou, args.walls, args.label)
     elif args.cmd == "report":
-        report(Path(args.run))
+        if "kind" in _read_jsonl(Path(args.run))[0]["meta"]:
+            from app import bench_perception
+
+            bench_perception.report(Path(args.run))
+        else:
+            report(Path(args.run))
     else:
         diff(Path(args.a), Path(args.b), args.show)
 
