@@ -46,6 +46,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .citation-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .citation-overlay.scale-selecting { pointer-events: auto; cursor: crosshair; }
 .citation-overlay.correction-active { pointer-events: auto; cursor: crosshair; }
+.citation-overlay.reference-active { pointer-events: auto; cursor: crosshair; touch-action: none; }
+.drawing-reference-mark rect, .drawing-reference-preview { fill: rgba(69, 139, 91, .16); stroke: #43895b; stroke-width: 3; stroke-dasharray: 8 5; vector-effect: non-scaling-stroke; pointer-events: none; }
+.drawing-reference-mark text { fill: #fff; stroke: #43895b; stroke-width: 5px; paint-order: stroke; font: 700 18px sans-serif; pointer-events: none; }
 .correction-mark { cursor: grab; touch-action: none; }
 .correction-mark:active { cursor: grabbing; }
 .correction-mark .correction-resize-handle { fill: #fff; stroke: #247044; stroke-width: 3; vector-effect: non-scaling-stroke; cursor: nwse-resize; pointer-events: all; }
@@ -115,6 +118,9 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .thinking-message p { display: flex; align-items: center; gap: 9px; color: #385b43; font-weight: 600; }
 .thinking-spinner { width: 15px; height: 15px; flex: none; border: 2px solid #c6dccb; border-top-color: #34764e; border-radius: 50%; animation: spin .8s linear infinite; }
 .composer { margin: 0 14px 14px; padding: 9px; border: 1px solid #e2e8e2; border-radius: 8px; background: #fbfcfb; }
+.reference-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 2px 8px; }
+.reference-chip { display: inline-flex; align-items: center; gap: 7px; border: 1px solid #cfe0d2; border-radius: 999px; padding: 4px 8px; background: #f2f8f3; color: #385b43; font-size: 11px; }
+.reference-chip button { border: 0; padding: 0 2px; color: inherit; background: transparent; cursor: pointer; font-size: 15px; line-height: 1; }
 .composer textarea { width: 100%; min-height: 88px; padding: 5px; resize: vertical; border: 0; outline: 0; background: transparent; color: #536157; font-size: 12px; line-height: 1.5; }
 .composer textarea::placeholder { color: #a0aaa2; }
 .composer textarea:disabled { cursor: not-allowed; }
@@ -226,3 +232,19 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #80ae8f; outli
 .wall-layer line.exterior { stroke: #c0392b; stroke-width: 4; }
 .wall-layer line.interior { stroke: #2e6fb5; stroke-width: 2.5; }
 .room-layer, .wall-layer { pointer-events: none; } /* never take clicks from measuring, outlines or corrections */
+.analysis-animation { pointer-events: none; }
+.analysis-animation .animated-wall { stroke: #2d7650; stroke-width: 5; stroke-linecap: round; vector-effect: non-scaling-stroke; stroke-dasharray: 1; stroke-dashoffset: 0; opacity: .82; animation: wall-reveal .8s ease-out both; }
+.analysis-animation .animated-room { opacity: 0; transform-box: fill-box; transform-origin: center; animation: room-arrive .55s cubic-bezier(.2,.8,.2,1) forwards; }
+.analysis-animation .animated-room polygon { fill-opacity: .24; stroke: #fff; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+.analysis-animation .animated-room text { fill: #243a2b; font: 700 15px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: middle; paint-order: stroke; stroke: #fff; stroke-width: 4px; stroke-linejoin: round; }
+.analysis-animation .animated-evidence { opacity: 0; transform-box: fill-box; transform-origin: center; animation: evidence-pop .4s cubic-bezier(.16,1.4,.6,1) forwards; }
+.analysis-animation .animated-evidence circle { fill: #e28b38; stroke: #fff; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+.analysis-animation .animated-evidence text { fill: #fff; font: 700 11px 'DM Sans', sans-serif; text-anchor: middle; dominant-baseline: central; }
+.analysis-animation-caption { position: absolute; left: 16px; bottom: 16px; z-index: 1; display: flex; flex-direction: column; gap: 3px; padding: 11px 14px; border: 1px solid #dce8df; border-radius: 9px; background: #ffffffed; box-shadow: 0 5px 20px #26392c18; animation: caption-arrive .35s ease-out both; }
+.analysis-animation-caption strong { color: #345b40; font: 700 12px Manrope, sans-serif; }
+.analysis-animation-caption span { color: #7b887e; font-size: 10px; }
+@keyframes wall-reveal { from { opacity: .15; stroke-dasharray: 0 1; } to { opacity: .82; stroke-dasharray: 1 0; } }
+@keyframes room-arrive { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: scale(1); } }
+@keyframes evidence-pop { from { opacity: 0; transform: scale(.2); } to { opacity: 1; transform: scale(1); } }
+@keyframes caption-arrive { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .analysis-animation *, .analysis-animation-caption { animation-duration: .01ms !important; animation-delay: 0ms !important; } }

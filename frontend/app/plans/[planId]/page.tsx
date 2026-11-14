@@ -23,6 +23,7 @@ type PlanCitation = {
 };
 type EvidenceItem = PlanCitation & { category: string; cls: string; text?: string | null; score?: number | null; raw?: string | null; user_verified?: boolean };
 type EvidenceDrag = { id: string; mode: "move" | "resize"; start: [number, number]; bbox: EvidenceItem["bbox"]; polygon: EvidenceItem["polygon"]; moved: boolean };
+type DrawingReference = { bbox: [number, number, number, number]; label: string; item_id?: string };
 type RoomEvidence = { source: string; type: string; weight: number; detail: string; item_id?: string | null };
 type RoomShape = {
   id: string;
@@ -182,6 +183,10 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [analysisStatus, setAnalysisStatus] = useState("Preparing your floor plan…");
   const [ready, setReady] = useState(false);
   const [question, setQuestion] = useState("");
+  const [drawingReferences, setDrawingReferences] = useState<DrawingReference[]>([]);
+  const [referenceMode, setReferenceMode] = useState(false);
+  const [referenceDragStart, setReferenceDragStart] = useState<[number, number] | null>(null);
+  const [referenceDragEnd, setReferenceDragEnd] = useState<[number, number] | null>(null);
   const [sending, setSending] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
@@ -230,9 +235,27 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   const [showRooms, setShowRooms] = useState(false);
   const [showUncertain, setShowUncertain] = useState(false);
   const [showWalls, setShowWalls] = useState(false);
+  const [animationStage, setAnimationStage] = useState<number | null>(null);
+  const [animationRun, setAnimationRun] = useState(0);
+  const animationStarted = useRef(false);
   const conversationRef = useRef<HTMLDivElement>(null);
   const roomBoundaryLinkRef = useRef<Record<string, string>>({});
   const evidenceItemsRef = useRef<EvidenceItem[]>([]);
+
+  useEffect(() => {
+    if (!ready || !geometry || animationStarted.current) return;
+    animationStarted.current = true;
+    setAnimationRun(run => run + 1);
+  }, [ready, geometry]);
+
+  useEffect(() => {
+    if (!animationRun) return;
+    setAnimationStage(0);
+    const timers = [1100, 2200, 3400, 4900].map((delay, index) => window.setTimeout(() => {
+      setAnimationStage(index === 3 ? null : index + 1);
+    }, delay));
+    return () => timers.forEach(window.clearTimeout);
+  }, [animationRun]);
 
   // Room geometry once the analysis is ready; refetched when the scale changes (areas in m² depend on it)
   useEffect(() => {
@@ -491,7 +514,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
     setMessages(current => [...current, { role: "user", text: submitted }]);
     setSending(true);
     try {
-      const requestBody = JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale,
+      const requestBody = JSON.stringify({ question: submitted, history: messages.map(({ role, text }) => ({ role, text })), scale, references: drawingReferences,
         floor_outlines: savedOutlines.filter(outline => outline.scope !== "room" || geometry?.rooms.some(room => room.id === outline.id) || outline.id.endsWith("-user")) });
       let response: Response;
       for (let attempt = 0; ; attempt++) {
@@ -523,6 +546,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       setCitations(Array.isArray(result.citations) ? result.citations : []);
       const provisional = result.confidence === "low";
       setMessages(current => [...current, { role: "assistant", text: provisional ? `Possible answer: ${answer}` : answer, ...(provisional ? { originalText: answer } : {}), evidence_ids: (result.citations ?? []).map((item: PlanCitation) => item.id), evidence: result.citations ?? [], confidence: result.confidence }]);
+      setDrawingReferences([]);
       if (needsScale) {
         setPendingAreaQuestion(submitted);
         startScaleCalibration();
@@ -736,6 +760,38 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
   }
 
   function handlePlanClick(event: React.MouseEvent<SVGSVGElement>) {
+    if (referenceMode && !scaleMode && !measureMode && !outlineMode && !correctionMode) {
+      const point = planPoint(event);
+      if (!point) return;
+      if (referenceDragStart && referenceDragEnd && Math.hypot(referenceDragEnd[0] - referenceDragStart[0], referenceDragEnd[1] - referenceDragStart[1]) > 8) {
+        const [sx, sy] = referenceDragStart;
+        const [ex, ey] = referenceDragEnd;
+        setDrawingReferences(current => [...current, { bbox: [Math.min(sx, ex), Math.min(sy, ey), Math.max(sx, ex), Math.max(sy, ey)], label: "selected area" }]);
+      } else {
+        const hit = evidenceItems
+          .filter(item => ["fixture", "door", "window", "room"].includes(item.category))
+          .map(item => {
+            const [x0, y0, x1, y1] = item.bbox;
+            const inside = point[0] >= x0 && point[0] <= x1 && point[1] >= y0 && point[1] <= y1;
+            const dx = Math.max(x0 - point[0], 0, point[0] - x1);
+            const dy = Math.max(y0 - point[1], 0, point[1] - y1);
+            const near = Math.hypot(dx, dy) <= 10;
+            const area = Math.max(1, (x1 - x0) * (y1 - y0));
+            const priority = item.category === "room" ? 1 : 0;
+            return { item, inside, near, area, priority, distance: Math.hypot(dx, dy) };
+          })
+          .filter(candidate => candidate.inside || candidate.near)
+          .sort((a, b) => a.priority - b.priority || a.area - b.area || a.distance - b.distance)[0]?.item;
+        const radius = 14;
+        setDrawingReferences(current => [...current, hit
+          ? { bbox: hit.bbox, label: `${hit.cls || hit.category} (${hit.category})`, item_id: hit.id }
+          : { bbox: [Math.max(0, point[0] - radius), Math.max(0, point[1] - radius), Math.min(imageSize?.width ?? point[0] + radius, point[0] + radius), Math.min(imageSize?.height ?? point[1] + radius, point[1] + radius)], label: "selected point" }]);
+      }
+      setReferenceMode(false);
+      setReferenceDragStart(null);
+      setReferenceDragEnd(null);
+      return;
+    }
     if (correctionMode && correctionAddMode) {
       const point = planPoint(event);
       if (point && imageSize) {
@@ -916,6 +972,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
         </div>
         <div className="toolbar-actions">
           {geometry && <button className={`toolbar-button${showRooms ? " is-on" : ""}`} type="button" aria-pressed={showRooms} onClick={() => setShowRooms(on => !on)} title="Rooms whose type is backed by a readable label or decisive fixtures">Rooms ({geometry.rooms.filter(room => room.tier === "strong").length})</button>}
+          {ready && geometry && <button className="toolbar-button" type="button" onClick={() => setAnimationRun(run => run + 1)}>↻ Replay analysis</button>}
           {geometry && showRooms && geometry.rooms.some(room => room.tier !== "strong") && <button className={`toolbar-button${showUncertain ? " is-on" : ""}`} type="button" aria-pressed={showUncertain} onClick={() => setShowUncertain(on => !on)} title="Spaces whose type is only a weak guess (dashed) or unknown (grey)">Uncertain spaces ({geometry.rooms.filter(room => room.tier !== "strong").length})</button>}
           {geometry && geometry.wall_segments.length > 0 && <button className={`toolbar-button${showWalls ? " is-on" : ""}`} type="button" aria-pressed={showWalls} onClick={() => setShowWalls(on => !on)} title="Wall centrelines: exterior walls thick">Walls ({geometry.wall_segments.length})</button>}
           {geometryError && <span className="scale-status" title={geometryError}>Rooms unavailable</span>}
@@ -923,6 +980,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
           {ready && scaleLoaded && !scaleMode && <button className={`toolbar-button${scale ? "" : " primary-button"}`} type="button" onClick={startScaleCalibration}>{scale ? "Adjust" : "Set scale"}</button>}
           {ready && scaleLoaded && scaleMode && <button className="toolbar-button" type="button" onClick={cancelScaleCalibration}>Cancel scale setup</button>}
           {ready && !correctionMode && <button className="toolbar-button" type="button" onClick={startCorrectionReview}>Review detections</button>}
+          {ready && !correctionMode && !outlineMode && <button className={`toolbar-button${referenceMode ? " is-on" : ""}`} type="button" aria-pressed={referenceMode} onClick={() => { setReferenceMode(mode => !mode); setReferenceDragStart(null); setReferenceDragEnd(null); }}>{referenceMode ? "Cancel reference" : "Refer to drawing"}</button>}
           {correctionMode && <button className="toolbar-button" type="button" onClick={() => { setCorrectionMode(false); setCorrectionAddMode(false); setSelectedEvidenceId(null); }}>Done reviewing</button>}
           {ready && scaleLoaded && !outlineMode && <button className="toolbar-button" type="button" onClick={() => startOutlineReview()}>{savedOutlines.length ? `Edit ${savedOutlines[0].label?.toLowerCase() ?? "outline"}` : floorOutlines.length ? "Review detected outline" : "Draw outline"}</button>}
           {outlineMode && <button className="toolbar-button" type="button" onClick={() => setOutlineMode(false)}>Cancel outline</button>}
@@ -933,7 +991,14 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
       <div className="work-area">
         <section className={`drawing-panel${scaleMode ? " is-calibrating" : ""}`} aria-label="Plan drawing">
           {error ? <div className="upload-empty-state"><h1>Could not load this plan</h1><p role="alert">{error}</p><Link className="toolbar-button" href="/">Back to upload</Link></div> : (
-            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerMove={event => { if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
+            imageUrl ? <div className="image-frame"><img className="plan-image" src={imageUrl} alt={`Floor plan: ${plan?.metadata?.filename ?? "saved plan"}`} />{imageSize && <svg className={`citation-overlay${scaleMode || measureMode || outlineMode || measurePoints.length === 2 ? " scale-selecting" : ""}${correctionMode ? " correction-active" : ""}${referenceMode ? " reference-active" : ""}`} viewBox={`0 0 ${imageSize.width} ${imageSize.height}`} preserveAspectRatio="xMidYMid meet" onClick={handlePlanClick} onPointerDown={event => { if (referenceMode) { const point = planPoint(event); if (point) { setReferenceDragStart(point); setReferenceDragEnd(point); event.currentTarget.setPointerCapture(event.pointerId); } } }} onPointerMove={event => { if (referenceMode && referenceDragStart) { const point = planPoint(event); if (point) setReferenceDragEnd(point); } else if (draggingEvidence) moveEvidenceBox(event); else if (draggingOutlinePoint !== null) { const point = planPoint(event); if (point) setOutlinePoints(current => current.map((value, index) => index === draggingOutlinePoint ? point : value)); } else if (draggingMeasurePoint !== null) { const point = planPoint(event); if (point) setMeasurePoints(current => current.map((value, index) => index === draggingMeasurePoint ? point : value)); } }} onPointerUp={event => { finishEvidenceBox(event); setDraggingOutlinePoint(null); setDraggingMeasurePoint(null); }} aria-label={referenceMode ? "Click an item or drag to reference an area" : correctionMode ? "Select a detected item to correct" : outlineMode ? "Review and edit suggested floor boundary" : scaleMode || measureMode ? "Select two points" : `Highlighted ${citations.length} supporting items`}>
+              {drawingReferences.map((reference, index) => <g className="drawing-reference-mark" key={`reference-${index}`}><rect x={reference.bbox[0]} y={reference.bbox[1]} width={Math.max(1, reference.bbox[2] - reference.bbox[0])} height={Math.max(1, reference.bbox[3] - reference.bbox[1])} rx="3"/><text x={reference.bbox[0] + 4} y={reference.bbox[1] - 4}>{index + 1}</text></g>)}
+              {animationStage !== null && geometry && <g className={`analysis-animation stage-${animationStage}`} aria-hidden="true">
+                {animationStage >= 0 && geometry.wall_segments.map((segment, index) => <line className="animated-wall" key={segment.id} x1={segment.p0[0]} y1={segment.p0[1]} x2={segment.p1[0]} y2={segment.p1[1]} pathLength="1" style={{ animationDelay: `${Math.min(900, index * 18)}ms` }} />)}
+                {animationStage >= 1 && geometry.rooms.filter(room => room.tier === "strong").map((room, index) => <g className="animated-room" key={room.id} style={{ animationDelay: `${index * 100}ms` }}><polygon points={room.polygon.map(([x, y]) => `${x},${y}`).join(" ")} style={{ fill: ROOM_COLOURS[room.type] ?? "#7a8a80" }} /><text x={(room.bbox[0] + room.bbox[2]) / 2} y={(room.bbox[1] + room.bbox[3]) / 2}>{roomCaption(room)}</text></g>)}
+                {animationStage >= 2 && evidenceItems.filter(item => item.category !== "room").map((item, index) => { const [x0, y0, x1, y1] = item.bbox; return <g className="animated-evidence" key={item.id} style={{ animationDelay: `${Math.min(1000, index * 35)}ms` }}><circle cx={(x0 + x1) / 2} cy={(y0 + y1) / 2} r={Math.max(7, Math.min(16, (x1 - x0 + y1 - y0) / 5))} /><text x={(x0 + x1) / 2} y={(y0 + y1) / 2}>{item.cls === "window" ? "W" : item.category === "door" ? "D" : "•"}</text></g>; })}
+              </g>}
+              {referenceMode && referenceDragStart && referenceDragEnd && <rect className="drawing-reference-preview" x={Math.min(referenceDragStart[0], referenceDragEnd[0])} y={Math.min(referenceDragStart[1], referenceDragEnd[1])} width={Math.abs(referenceDragEnd[0] - referenceDragStart[0])} height={Math.abs(referenceDragEnd[1] - referenceDragStart[1])}/>}
               {correctionMode && evidenceItems.map(item => {
                 const [x0, y0, x1, y1] = item.bbox;
                 const points = item.polygon?.map(([x, y]) => `${x},${y}`).join(" ");
@@ -1017,7 +1082,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
                 </g>;
               })}
               {outlineMode && manualOutlineTarget?.scope !== "room" && outlinePoints.length >= 3 && !displayOutlines.some(outline => outline.id === editingOutlineId) && <g className="floor-outline-mark editing"><polygon points={outlinePoints.map(([x, y]) => `${x},${y}`).join(" ")} />{outlinePoints.map(([x, y], index) => <circle key={index} cx={x} cy={y} r="11" onPointerDown={event => { event.stopPropagation(); event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId); setDraggingOutlinePoint(index); }} onPointerUp={event => { event.stopPropagation(); setDraggingOutlinePoint(null); }} onClick={event => event.stopPropagation()} />)}</g>}
-            </svg>}{(scaleMode || measureMode) && <div className="scale-hint">{scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
+            </svg>}{animationStage !== null && <div className="analysis-animation-caption" aria-live="polite"><strong>{["Tracing the structure", "Finding the rooms", "Spotting doors, windows & fixtures", "Analysis complete"][animationStage]}</strong><span>{["Walls are being mapped", "Rooms are taking shape", "Detected details are appearing", "Your plan is ready to explore"][animationStage]}</span></div>}{referenceMode && <div className="scale-hint">Click a detected item or drag around any area, then ask about it.</div>}{(scaleMode || measureMode) && <div className="scale-hint">{scaleMode ? (scalePoints.length === 0 ? "Step 1 of 2 · Click one end of a printed dimension" : scalePoints.length === 1 ? "Step 2 of 2 · Click the other end of that dimension" : "Step complete · Enter the printed distance below") : (measurePoints.length === 0 ? "Click a start point to measure" : "Click an end point to measure")}</div>}</div> : <div className="loading-state" role="status"><span className="loading-spinner" /><h1>Loading your floor plan</h1><p>Getting your image ready…</p></div>
           )}
         </section>
         <aside className="chat-panel" aria-label="Plan questions">
@@ -1054,7 +1119,7 @@ export default function PlanPage({ params }: { params: Promise<{ planId: string 
             <div><strong>Measure a distance</strong><span>Choose the two points you want measured on the plan.</span></div>
             <button className="toolbar-button primary-button" type="button" onClick={startMeasurement}>Choose points</button>
           </section>}
-          <form className="composer" onSubmit={submitQuestion}><textarea aria-label="Ask a question about the plan" placeholder="Ask about quantities, rooms, or materials…" value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
+          <form className="composer" onSubmit={submitQuestion}>{drawingReferences.length > 0 && <div className="reference-chips" aria-label="Drawing references">{drawingReferences.map((reference, index) => <span className="reference-chip" key={`reference-chip-${index}`}>{index + 1}. {reference.label}<button type="button" aria-label={`Remove reference ${index + 1}`} onClick={() => setDrawingReferences(current => current.filter((_, itemIndex) => itemIndex !== index))}>×</button></span>)}</div>}<textarea aria-label="Ask a question about the plan" placeholder={drawingReferences.length ? "Ask about the selected part…" : "Ask about quantities, rooms, or materials…"} value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} disabled={!ready || sending} /><div className="composer-footer"><span>{sending ? "Thinking…" : ready ? "Answers use the analysis saved for this plan" : "Available when analysis finishes"}</span><button className="send-button" type="submit" disabled={!ready || sending || !question.trim()} aria-label="Send question">↑</button></div></form>
         </aside>
       </div>
     </main>

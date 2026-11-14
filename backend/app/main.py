@@ -788,12 +788,26 @@ def ask_plan(plan_id: UUID, req: PlanQuestionRequest) -> Answer:
                 detail="I couldn't load the saved plan just now. Your question is still in the chat; please try again in a moment.",
             ) from error
         raise
-    question = req.question.casefold()
-    area_question = any(term in question for term in ("area", "size", "how large", "how big", "square metre", "square meter", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter"))
+    original_question = req.question
+    if req.references:
+        refs = []
+        for index, reference in enumerate(req.references, 1):
+            x0, y0, x1, y1 = reference.bbox
+            refs.append(f"reference {index}: {reference.label}" +
+                        (f" (detected item id {reference.item_id})" if reference.item_id else "") +
+                        f", image pixel rectangle x={x0:.0f}..{x1:.0f}, y={y0:.0f}..{y1:.0f}")
+        req.question += "\n\nThe user pointed to these location(s) on the drawing: " + "; ".join(refs) + ". Use them to resolve phrases such as this/these/here and focus the answer on the selected location."
+    question = original_question.casefold()
+    if not req.references and re.search(r"\b(in|inside|within) (this|that|the selected) area\b", question):
+        return Answer(answer=None, confidence="not_found", clarification_needed=True,
+                      explanation="Select the area on the drawing with Refer to drawing, then ask again so I can limit the count to that part of the plan.")
+    area_question = any(term in question for term in ("size", "how large", "how big", "square metre", "square meter", "square foot", "square feet", "m²", "pinta-ala", "pinta ala", "kuinka suuri", "yta", "kvadratmeter", "area estimate", "area of", "calculate area", "what is the area"))
+    if not req.references and re.search(r"\barea\b", question) and not re.search(r"\bhow many\b", question):
+        area_question = True
     # Short follow-ups inherit a room-area context from the most recent user turn.
     # Keep this deliberately narrow so an old topic in a long conversation cannot
     # turn a new, unrelated size question into an area calculation.
-    if not area_question and re.search(r"\b(it|that|this|there|its|their)\b", question):
+    if not area_question and not req.references and re.search(r"\b(it|that|this|there|its|their)\b", question):
         for turn in reversed(req.history):
             if turn.role == "user":
                 earlier = turn.text.casefold()

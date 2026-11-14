@@ -291,6 +291,16 @@ class PlanTools:
                         "Containment uses the container's bounding box (item centre inside), so it is approximate.")}
         return out, ToolTrace(item_ids=[region.id] + [it.id for it in hits[:MAX_LIST]], numbers=[len(hits)])
 
+    def count_items_in_area(self, x0: float, y0: float, x1: float, y1: float,
+                            category: str, type: str | None = None) -> tuple[dict, ToolTrace]:
+        """Count detections whose centres fall within a user-selected image rectangle."""
+        bounds = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        hits = [it for it in self.graph.items if _match(it, category, type) and _inside(it.bbox, bounds)]
+        rows = [_row(it) for it in hits[:MAX_LIST]]
+        return ({"category": category, "type": type, "count": len(hits), "items": rows,
+                 "note": "Items are included when their bounding-box centre falls inside the selected rectangle; this is a spatial estimate."},
+                ToolTrace(item_ids=[it.id for it in hits[:MAX_LIST]], numbers=[len(hits)]))
+
     def _scale_note(self) -> str:
         sc = self.geometry.scale if self.geometry else None
         sym = self.geometry.symbol_scale if self.geometry else None
@@ -434,7 +444,8 @@ class PlanTools:
 
     def _call(self, name: str, args: dict) -> tuple[dict, ToolTrace]:
         fn = {"plan_summary": self.plan_summary, "count_template": self.count_template,
-              "list_items": self.list_items, "items_in": self.items_in, "calculate": self.calculate,
+              "list_items": self.list_items, "items_in": self.items_in,
+              "count_items_in_area": self.count_items_in_area, "calculate": self.calculate,
               **({"list_rooms": self.list_rooms, "room_details": self.room_details, "list_walls": self.list_walls}
                  if self.geometry else {})}.get(name)
         if name == "covering_quantity" and self.geometry:
@@ -482,6 +493,19 @@ DECLARATIONS = [
             "category": {"type": "string", "enum": CATEGORIES},
             "type": {"type": "string", "enum": ROOM_TYPES + FIXTURE_TYPES},
         }, "required": ["container_id", "category"]},
+    },
+    {
+        "name": "count_items_in_area",
+        "description": ("Count detected items whose bounding-box centres fall inside a user-selected image rectangle. "
+                        "Use when a question asks for a count 'in this area' and a drawing rectangle was supplied. "
+                        "Pass the exact rectangle coordinates and the item category/type. This count is from raw plan "
+                        "detections, so disclose uncertainty when detections may be incomplete."),
+        "parameters": {"type": "object", "properties": {
+            "x0": {"type": "number"}, "y0": {"type": "number"},
+            "x1": {"type": "number"}, "y1": {"type": "number"},
+            "category": {"type": "string", "enum": CATEGORIES},
+            "type": {"type": "string", "enum": ROOM_TYPES + FIXTURE_TYPES},
+        }, "required": ["x0", "y0", "x1", "y1", "category"]},
     },
     {
         "name": "calculate",
