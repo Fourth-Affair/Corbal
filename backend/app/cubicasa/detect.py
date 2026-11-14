@@ -14,13 +14,15 @@ import joblib
 import numpy as np
 from PIL import Image
 from scipy import ndimage
+from shapely.geometry import Polygon
+from skimage.measure import find_contours
 
 from app.cubicasa import symdet
 from app.cubicasa.features import compute, feature_paths
 from app.cubicasa.fit import FEATURE_VERSION, FUSION_PATH, _predict
 from app.cubicasa.fuse import ICON, ROOM, components, image_features
 from app.cubicasa.rooms_dict import room_type
-from app.models import PlanGraph, PlanItem
+from app.models import PlanGraph, PlanItem, PlanOutline
 
 ICON_ITEMS = {"window": ("window", ""), "door": ("door", ""), "toilet": ("fixture", "toilet"),
               "sink": ("fixture", "sink"), "bathtub": ("fixture", "bathtub"), "sauna_bench": ("fixture", "sauna_bench")}
@@ -87,15 +89,54 @@ def _evidence(rel: str, dets: list[dict] | None = None) -> list[PlanItem]:
         if t and t != "other":
             items.append(PlanItem(id=f"label-{k}", category="room", cls=t, text=tok["text"],
                                   score=tok["score"], bbox=tuple(tok["bbox"]), raw="ocr"))
-    # storeys: large building blobs
-    fg = ndimage.binary_closing(rooms != ROOM["background"], iterations=max(2, int(0.01 * max(H, W))))
-    _, sizes, _, boxes = components(fg)
-    for k, (sz, sl) in enumerate(zip(sizes, boxes)):
-        if sz >= 0.03 * H * W:
-            ys, xs = sl
-            items.append(PlanItem(id=f"floor-{k}", category="floor",
-                                  bbox=(float(xs.start), float(ys.start), float(xs.stop), float(ys.stop))))
     return items
+
+
+def _floor_outline_candidates(rooms: np.ndarray, confidence: np.ndarray) -> list[PlanOutline]:
+    """Create reviewable outer contours from the model's closed building-region segmentation."""
+    H, W = rooms.shape
+    fg = ndimage.binary_closing(rooms != ROOM["background"], iterations=max(2, int(0.01 * max(H, W))))
+    labels, sizes, confidences, boxes = components(fg, confidence)
+    outlines: list[PlanOutline] = []
+    for label, size, score, bounds in zip(range(1, len(sizes) + 1), sizes, confidences, boxes):
+        if size < 0.03 * H * W:
+            continue
+        ys, xs = bounds
+        region = (labels[ys, xs] == label).astype(np.uint8)
+        contours = find_contours(region, 0.5)
+        polygons = []
+        for contour in contours:
+            polygon = Polygon([(float(x + xs.start), float(y + ys.start)) for y, x in contour])
+            if polygon.is_valid and polygon.area > 0:
+                polygons.append(polygon)
+        if not polygons:
+            continue
+        # Use the exterior contour; tiny interior islands/holes in a semantic mask are not useful
+        # as an initial floor boundary and can be added as exclusions during editing later.
+        polygon = max(polygons, key=lambda candidate: candidate.area).simplify(max(H, W) * 0.002, preserve_topology=True)
+        if not polygon.is_valid or len(polygon.exterior.coords) < 4:
+            continue
+        coords = list(polygon.exterior.coords)[:-1]
+        if len(coords) > 500:
+            stride = (len(coords) + 498) // 499
+            coords = coords[::stride]
+        if len(coords) < 3:
+            continue
+        outlines.append(PlanOutline(
+            id=f"floor-{label - 1}",
+            polygon=[(round(x, 2), round(y, 2)) for x, y in coords],
+            score=round(float(score), 3),
+        ))
+    return outlines
+
+
+def floor_outline_candidates(rel: str) -> list[PlanOutline]:
+    """Get contours from cached segmentation, including older saved graphs that only have floor boxes."""
+    npz, _ = feature_paths(rel)
+    if not npz.is_file():
+        return []
+    with np.load(npz) as z:
+        return _floor_outline_candidates(z["rooms"], z["rooms_conf"])
 
 
 def graph_from_image(rel: str, path) -> PlanGraph:
@@ -111,5 +152,18 @@ def graph_from_image(rel: str, path) -> PlanGraph:
     for t, spec in _fusion().items():
         X = np.array([[f.get(k, 0.0) for k in spec["keys"]]], dtype=np.float64)
         counts[t] = int(_predict(spec["model"], spec["kind"], X)[0])
-    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=_evidence(rel, dets),
-                     counts=counts)
+    with np.load(feature_paths(rel)[0]) as z:
+        floor_outlines = _floor_outline_candidates(z["rooms"], z["rooms_conf"])
+    floor_items = []
+    for outline in floor_outlines:
+        xs, ys = zip(*outline.polygon)
+        floor_items.append(PlanItem(
+            id=outline.id,
+            category="floor",
+            bbox=(min(xs), min(ys), max(xs), max(ys)),
+            polygon=outline.polygon,
+            score=outline.score,
+        ))
+    items = _evidence(rel, dets) + floor_items
+    return PlanGraph(image=rel, width=img.width, height=img.height, source="model", items=items,
+                     counts=counts, floor_outlines=floor_outlines)

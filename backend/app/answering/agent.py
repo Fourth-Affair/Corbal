@@ -19,7 +19,7 @@ import time
 
 from app.answering.tools import DECLARATIONS, PlanTools, ToolTrace
 from app.config import CACHE_DIR
-from app.models import Answer, ChatTurn, PlanGraph
+from app.models import Answer, ChatTurn, PlanGraph, PlanScaleCalibration
 from app.router import route
 
 log = logging.getLogger(__name__)
@@ -28,10 +28,10 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "30"))
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "LOW")  # MINIMAL | LOW | MEDIUM | HIGH; "" = model default
 MAX_STEPS = 8
-PROMPT_VERSION = "8"  # bump when prompt or tools change, so cached answers are not reused
+PROMPT_VERSION = "10"  # bump when prompt or tools change, so cached answers are not reused
 
-SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools are your only source of
-facts about the plan; you cannot see the drawing.
+SYSTEM = """You answer questions about one floor plan drawing for site engineers. The tools and explicitly supplied user
+calibration are your only sources of facts about the plan; you cannot see the drawing.
 
 Use the prior conversation to resolve follow-up references (for example, "what about the kitchen?"). Treat the
 latest question as the request to answer. Prior assistant replies are context only; verify plan facts with tools.
@@ -52,9 +52,11 @@ Rules:
   the question. If evidence supports only part of the request, give that part and clearly say what could not be
   established. State a brief assumption when one reasonable interpretation lets you answer safely; ask one focused
   follow-up when a missing detail would change the answer. Do not ask questions whose answer is already in the tools.
-- Never fill gaps with a plausible-sounding guess. For real-world sizes or areas (no scale is known), objects or text
-  not detected, or combinations the tools do not compute, explain the specific limitation and say what information
+- Never fill gaps with a plausible-sounding guess. For real-world sizes or areas that the analysis cannot compute,
+  objects or text not detected, or unsupported combinations, explain the specific limitation and say what information
   would make progress possible. Be direct about uncertainty; do not describe an estimate or weak detection as certain.
+- If a user calibration is supplied with the latest question, treat the drawing scale as known and never say it is
+  missing. A scale can support measurements, but it does not by itself establish room boundaries or floor area.
 - Finish by calling final_answer exactly once:
   value = the number (omit for yes/no or text answers and use text instead);
   cited_ids = ids of the items that support the answer, taken from tool results (for count_template: its
@@ -92,7 +94,8 @@ def _get_client():
     return _client
 
 
-def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = None) -> tuple[dict, list[ToolTrace]]:
+def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = None,
+             scale: PlanScaleCalibration | None = None) -> tuple[dict, list[ToolTrace]]:
     """Gemini tool loop -> (final_answer args, traces of the tool calls). Raises on API problems / no answer."""
     from google.genai import types
 
@@ -110,7 +113,12 @@ def run_loop(question: str, tools: PlanTools, history: list[ChatTurn] | None = N
     history = history or []
     contents = [types.Content(role="model" if turn.role == "assistant" else "user", parts=[types.Part(text=turn.text)])
                 for turn in history]
-    prompt = f"Latest question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}"
+    scale_context = (
+        f"A user calibration is saved: {scale.distance} {scale.unit} across two selected points. "
+        "The drawing scale is known. This alone does not establish a room boundary or floor area."
+        if scale else "No user scale calibration is saved for this drawing."
+    )
+    prompt = f"Latest question (answer in its language): {question}\n\nPlan summary: {json.dumps(summary, ensure_ascii=False)}\n\nDrawing scale: {scale_context}"
     contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
     traces: list[ToolTrace] = []
     for step in range(MAX_STEPS):
@@ -233,22 +241,24 @@ def validate(question: str, final: dict, traces: list[ToolTrace], tools: PlanToo
                   citations=cited, answered_by="llm")
 
 
-def _cache_path(question: str, graph: PlanGraph):
-    blob = json.dumps([GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question, graph.model_dump(mode="json")],
+def _cache_path(question: str, graph: PlanGraph, scale: PlanScaleCalibration | None):
+    blob = json.dumps([GEMINI_MODEL, GEMINI_THINKING, PROMPT_VERSION, SYSTEM, DECLARATIONS, question,
+                       graph.model_dump(mode="json"), scale.model_dump(mode="json") if scale else None],
                       sort_keys=True, ensure_ascii=False)
     return CACHE_DIR / "agent" / f"{hashlib.sha256(blob.encode()).hexdigest()}.json"
 
 
-def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None) -> Answer | None:
+def answer(question: str, graph: PlanGraph, history: list[ChatTurn] | None = None,
+           scale: PlanScaleCalibration | None = None) -> Answer | None:
     if not os.environ.get("GEMINI_API_KEY"):
         return None
     history = history or []
-    cache = _cache_path(question, graph) if not history else None
+    cache = _cache_path(question, graph, scale) if not history else None
     if cache and cache.is_file():
         return Answer.model_validate_json(cache.read_text())
     tools = PlanTools(graph)
     try:
-        final, traces = run_loop(question, tools, history)
+        final, traces = run_loop(question, tools, history, scale)
     except Exception as error:  # network, quota, timeout, malformed output: caller falls back
         log.warning("Gemini agent failed: %s", error)
         return None
