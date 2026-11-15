@@ -126,7 +126,7 @@ def test_room_tools(monkeypatch):
     assert geo.scale.source == "calibration" and geo.wall_segments and geo.wall_segments[0].length_m
     graph = PlanGraph(image="uploads/x.png", width=200, height=100, source="model")
     tools = PlanTools(graph, geo)
-    assert [d["name"] for d in tools.declarations()][-3:] == ["list_rooms", "room_details", "list_walls"]
+    assert [d["name"] for d in tools.declarations()][-4:] == ["list_rooms", "room_details", "list_walls", "outline_areas"]
     out, trace = tools.list_rooms()
     assert out["strong_rooms"] == 1 and out["unknown_spaces"] == 1
     (row,) = out["rooms"]
