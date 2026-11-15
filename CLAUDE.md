@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Junction 2026 hackathon entry for the **Stoa** challenge: answer natural-language questions about
+**Corbal**, our Junction 2026 hackathon entry for the **Stoa** challenge: answer natural-language questions about
 construction drawings and BIM models **accurately and verifiably**.
 
 ## The challenge in one paragraph

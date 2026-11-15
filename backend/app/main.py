@@ -63,7 +63,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Junc API", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(title="Corbal API", version="0.1.0", lifespan=_lifespan)
 
 # "model" = image-only pipeline (default). "svg" = original CubiCasa labels, for demos/debugging only.
 PLAN_SOURCE = os.environ.get("PLAN_SOURCE", "model")

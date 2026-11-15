@@ -48,7 +48,7 @@ export default function UploadStart() {
   return (
     <main className="workspace">
       <input ref={inputRef} className="visually-hidden" type="file" multiple accept="application/pdf,image/png,image/jpeg,image/webp" onChange={event => { void startUpload(event.target.files ?? undefined); event.target.value = ""; }} />
-      <header className="toolbar"><div className="plan-title"><span className="plan-title-icon" aria-hidden="true">▤</span><span>Floor plan</span></div><div className="toolbar-actions"><button className="toolbar-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading…" : "Choose floor plan"}</button></div></header>
+      <header className="toolbar"><div className="plan-title"><span className="plan-title-icon" aria-hidden="true">▤</span><span>Corbal</span></div><div className="toolbar-actions"><button className="toolbar-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading…" : "Choose floor plan"}</button></div></header>
       <div className="work-area">
         <section className={`drawing-panel ${dragging ? "is-dragging" : ""}`} aria-label="Plan drawing" onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={drop}>
           <div className="upload-empty-state"><div className="upload-icon" aria-hidden="true">↑</div><h1>Open a floor plan</h1><p>View the drawing, explore detected rooms, and ask questions about this floor.</p><button className="toolbar-button primary-button" disabled={uploading} onClick={() => inputRef.current?.click()}>{uploading ? "Uploading…" : "Choose floor plan"}</button><span>PDF, PNG, JPG, or WebP · you can add other floors later</span></div>

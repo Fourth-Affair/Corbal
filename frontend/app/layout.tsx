@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Plans",
-  description: "Upload a construction plan.",
+  title: "Corbal",
+  description: "Corbal: ask questions about construction drawings and get answers that point to the evidence.",
 };
 
 export default function RootLayout({

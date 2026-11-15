@@ -1,6 +1,6 @@
-# Stoa: answering questions about construction drawings, with evidence
+# Corbal: answering questions about construction drawings, with evidence
 
-Junction 2026 entry for the Stoa challenge. Upload a floor plan (image or PDF) and ask about it in plain language,
+Corbal is our Junction 2026 entry for the Stoa challenge. Upload a floor plan (image or PDF) and ask about it in plain language,
 in English, Finnish or Swedish ("how many windows are in the bedroom?", "montako WC-istuinta?"). Every answer
 points to the evidence it came from (a box or outline on the plan, or an IFC `GlobalId`), so you can check it in seconds.
 
